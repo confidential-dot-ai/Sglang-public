@@ -125,6 +125,12 @@ def parser():
         help="Decode polls KV-transfer state every this many scheduler steps",
     )
     p.add_argument(
+        "--decode-radix-cache",
+        action="store_true",
+        help="Decode keeps each conversation's KV in its own prefix cache, so "
+        "prefill sends only the pages past the prefix decode already holds",
+    )
+    p.add_argument(
         "--tokenizer-workers",
         type=int,
         default=1,
@@ -850,6 +856,8 @@ def build_plan(args):
                 "--disaggregation-decode-polling-interval",
                 str(args.decode_polling_interval),
             ]
+        if role == "decode" and args.decode_radix_cache:
+            command += ["--disaggregation-decode-enable-radix-cache"]
         if role == "prefill" and args.prefill_swa_prefix_tails is not None:
             command += ["--swa-prefix-tails", str(args.prefill_swa_prefix_tails)]
         if role == "prefill" and (

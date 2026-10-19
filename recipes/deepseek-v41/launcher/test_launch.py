@@ -798,6 +798,16 @@ class TestLaunch(unittest.TestCase):
             with self.assertRaises(ValueError):
                 launch.build_plan(self.args("--prefill-env", bad))
 
+    def test_decode_radix_cache_is_decode_only(self):
+        flag = "--disaggregation-decode-enable-radix-cache"
+        prefill, decode = launch.build_plan(self.args())["workers"]
+        self.assertNotIn(flag, decode["command"])
+        prefill, decode = launch.build_plan(self.args("--decode-radix-cache"))[
+            "workers"
+        ]
+        self.assertIn(flag, decode["command"])
+        self.assertNotIn(flag, prefill["command"])
+
     def test_decode_graph_extra_bs_and_polling_interval_are_decode_only(self):
         plan = launch.build_plan(
             self.args(
