@@ -59,6 +59,7 @@ class _MiniForwardBatch:
     mamba_track_seqlens: Optional[torch.Tensor] = None
     forward_mode: Optional[str] = None
     spec_info: Optional[object] = None
+    dp_padding_mode: Optional[object] = None
 
 
 @dataclasses.dataclass
@@ -140,6 +141,47 @@ class TestRegistryRegister(unittest.TestCase):
 class TestFillFromAndExtract(unittest.TestCase):
     """End-to-end exercise: register a representative slot set, fill from
     a mini FB, then extract a FB view and assert all field-views match."""
+
+    def test_copy_from_registry_promotes_only_padded_extent(self):
+        source = _make_registry(max_bs=4, max_num_tokens=8)
+        target = _make_registry(max_bs=4, max_num_tokens=8)
+        for registry in (source, target):
+            registry.register_slot(
+                GraphSlot(
+                    "input_ids",
+                    lambda _bs, mt: (mt,),
+                    torch.int64,
+                    axis="tokens",
+                )
+            )
+            registry.register_slot(
+                GraphSlot(
+                    "seq_lens_cpu",
+                    lambda bs, _mt: (bs,),
+                    torch.int64,
+                    axis="bs",
+                    device=torch.device("cpu"),
+                )
+            )
+        source.get_slot("input_ids").buffer.copy_(torch.arange(8))
+        source.get_slot("seq_lens_cpu").buffer.copy_(torch.arange(4) + 10)
+        target.get_slot("input_ids").buffer.fill_(-1)
+        target.get_slot("seq_lens_cpu").buffer.fill_(-1)
+
+        target.copy_from_registry(source, padded_bs=2, padded_num_tokens=6)
+
+        self.assertTrue(
+            torch.equal(
+                target.get_slot("input_ids").buffer,
+                torch.tensor([0, 1, 2, 3, 4, 5, -1, -1]),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                target.get_slot("seq_lens_cpu").buffer,
+                torch.tensor([10, 11, -1, -1]),
+            )
+        )
 
     def _build_registry(self):
         r = _make_registry(max_bs=4, max_num_tokens=8)
@@ -1511,6 +1553,81 @@ class TestComputedSlots(unittest.TestCase):
             torch.equal(
                 reg.get_slot("global_num_tokens_gpu").buffer,
                 torch.tensor([4], dtype=torch.int32),
+            )
+        )
+
+    def test_global_num_tokens_copies_real_distribution_on_sum_capture_path(self):
+        """TODO.md J14c Milestone 1: when dspark_dp_verify_sum_capture_enabled
+        and the replay's own dp_padding_mode is SUM_LEN, the real per-rank
+        distribution (fb.global_num_tokens_gpu) must be copied into the
+        slot, not collapsed to a uniform padded_num_tokens fill -- collapsing
+        it would silently re-impose the exact MAX_LEN padding tax this
+        capture path exists to remove, without ever raising an error."""
+        from sglang.srt.layers.dp_attention import DpPaddingMode
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            build_decode_registry,
+        )
+
+        reg = build_decode_registry(
+            device=torch.device("cpu"),
+            max_bs=4,
+            max_num_token=8,
+            seq_len_fill_value=5,
+            cache_loc_dtype=torch.int64,
+            require_gathered_buffer=True,
+            require_mlp_tp_gather=True,
+            dp_size=4,
+            dspark_dp_verify_sum_capture_enabled=True,
+        )
+        fb = _MiniForwardBatch(
+            batch_size=2,
+            dp_padding_mode=DpPaddingMode.SUM_LEN,
+            global_num_tokens_gpu=torch.tensor([3, 5, 2, 4], dtype=torch.int64),
+        )
+        reg.fill_from(fb, raw_bs=2, padded_bs=4, raw_num_tokens=2, padded_num_tokens=4)
+        self.assertTrue(
+            torch.equal(
+                reg.get_slot("global_num_tokens_gpu").buffer,
+                torch.tensor([3, 5, 2, 4], dtype=torch.int32),
+            )
+        )
+
+    def test_global_num_tokens_still_uniform_fills_max_len_replay_on_sum_capture_runner(
+        self,
+    ):
+        """Companion negative case: a runner with the sum-capture path
+        enabled must still uniform-fill for any replay whose OWN
+        dp_padding_mode is MAX_LEN (or unset) -- the real-distribution copy
+        is gated on both the runner-level flag AND this specific replay's
+        mode, so ordinary MAX_LEN-captured shapes on the same runner are
+        unaffected. A regression that drops the is_sum_len() check would
+        pass the case above but silently corrupt this one."""
+        from sglang.srt.layers.dp_attention import DpPaddingMode
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            build_decode_registry,
+        )
+
+        reg = build_decode_registry(
+            device=torch.device("cpu"),
+            max_bs=4,
+            max_num_token=8,
+            seq_len_fill_value=5,
+            cache_loc_dtype=torch.int64,
+            require_gathered_buffer=True,
+            require_mlp_tp_gather=True,
+            dp_size=4,
+            dspark_dp_verify_sum_capture_enabled=True,
+        )
+        fb = _MiniForwardBatch(
+            batch_size=2,
+            dp_padding_mode=DpPaddingMode.MAX_LEN,
+            global_num_tokens_gpu=torch.tensor([3, 5, 2, 4], dtype=torch.int64),
+        )
+        reg.fill_from(fb, raw_bs=2, padded_bs=4, raw_num_tokens=2, padded_num_tokens=4)
+        self.assertTrue(
+            torch.equal(
+                reg.get_slot("global_num_tokens_gpu").buffer,
+                torch.tensor([4, 4, 4, 4], dtype=torch.int32),
             )
         )
 

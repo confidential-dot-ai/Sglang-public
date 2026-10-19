@@ -11,11 +11,15 @@ it. CPU-only.
 """
 
 import unittest
+from unittest.mock import Mock
 
 import torch
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -108,6 +112,39 @@ class TestTboFilterBatchMarker(CustomTestCase):
                 child = _filter(parent, lo=0, hi=4)
                 self.assertEqual(child.defer_logits_to_eager, deferred)
 
+    def test_preplanned_parent_explicitly_plans_fresh_children(self):
+        parent = _make_target_verify_batch(4)
+        parent.forward_mode = ForwardMode.DECODE
+        parent.global_forward_mode = ForwardMode.DECODE
+        parent.tbo_split_seq_index = 2
+        parent.mark_forward_metadata_ready()
+
+        primary = AttentionBackend()
+        primary.token_to_kv_pool = object()
+        primary.req_to_token_pool = object()
+        children = [AttentionBackend(), AttentionBackend()]
+        for child in children:
+            child.init_forward_metadata = Mock()
+        tbo_backend = TboAttnBackend(primary=primary, children=children)
+
+        with get_context().override_server_args(
+            attention_backend="fa3", moe_dense_tp_size=None
+        ), get_parallel().override(attn_tp_size=1), forward_context(
+            ForwardContext(attn_backend=tbo_backend)
+        ):
+            TboForwardBatchPreparer.prepare_raw(
+                parent,
+                tbo_children_num_token_non_padded=torch.tensor(
+                    [2, 2], dtype=torch.int32
+                ),
+            )
+
+        self.assertEqual(len(parent.tbo_children), 2)
+        for backend, child in zip(children, parent.tbo_children, strict=True):
+            backend.init_forward_metadata.assert_called_once_with(child)
+            self.assertTrue(child.forward_metadata_ready)
+            self.assertEqual(child.forward_metadata_planned_bs, 2)
+            self.assertEqual(child.forward_metadata_planned_num_tokens, 2)
     def test_filter_batch_drops_aux_hidden_states_buffer(self):
         """Decode graph capture sets the shared aux output on the parent before
         the TBO split; children must not inherit it."""

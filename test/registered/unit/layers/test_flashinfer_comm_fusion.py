@@ -1,11 +1,12 @@
 import contextlib
+import types
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import torch
-
 from sglang.srt.layers import flashinfer_comm_fusion as fusion
-from sglang.srt.runtime_context import get_parallel, override_platform
+from sglang.srt.layers import layernorm as layernorm_module
+from sglang.srt.runtime_context import get_context, get_parallel, override_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -18,10 +19,14 @@ class _FakeWorkspace:
     def __init__(self, backend, world_size, dtype=torch.bfloat16):
         self.backend = backend
         self.world_size = world_size
+        self.destroy_count = 0
         self.metadata = {"use_fp32_lamport": dtype == torch.float32}
 
     def is_buffer_size_sufficient(self, **_kwargs):
         return True
+
+    def destroy(self):
+        self.destroy_count += 1
 
 
 class _FakeFlashInferComm:
@@ -90,6 +95,27 @@ def _torch_allreduce_residual_rmsnorm_baseline(
     return norm_out, residual_out
 
 
+def _fake_coordinator(unique_name):
+    return types.SimpleNamespace(
+        unique_name=unique_name,
+        world_size=2,
+        rank_in_group=0,
+        device_group=object(),
+        cpu_group=object(),
+    )
+
+
+class _NormProbe:
+    variance_epsilon = 1e-6
+
+    def __init__(self):
+        self.calls = []
+
+    def forward(self, x, residual, post_residual_addition):
+        self.calls.append((x.clone(), residual.clone(), post_residual_addition))
+        return x, residual
+
+
 class TestFlashInferCommFusion(CustomTestCase):
     """The arch dispatch is `_resolve_backend(backend, is_multi_node)`.
 
@@ -97,6 +123,275 @@ class TestFlashInferCommFusion(CustomTestCase):
     `exec.comm.flashinfer_allreduce_fusion_backend` and `parallel.nnodes` off the
     published bags -- so the cases here drive the dispatch directly.
     """
+
+    @staticmethod
+    def _save_workspace_buffers():
+        from sglang.srt.runtime_context import get_resources
+
+        buffers = get_resources().buffers
+        saved = {
+            key: value
+            for key, value in buffers.items()
+            if isinstance(key, str)
+            and key.startswith(fusion._FLASHINFER_FUSION_WORKSPACE_PREFIX)
+        }
+        for key in saved:
+            buffers.pop(key)
+        return buffers, saved
+
+    def test_workspace_coordinator_follows_scoped_topology(self):
+        """A scoped duplicate must own the fusion workspace's peer buffers."""
+        primary = _fake_coordinator("tp:primary")
+        duplicate = _fake_coordinator("tp:duplicate")
+        single = _fake_coordinator("ep:single")
+        single.world_size = 1
+        with get_context().override_server_args(tp_size=2), get_parallel().override(
+            attn_tp_group=primary,
+            moe_ep_group=single,
+            moe_tp_group=primary,
+        ):
+            self.assertIs(fusion._resolve_workspace_coordinator(True), primary)
+            self.assertIs(fusion._resolve_workspace_coordinator(False), primary)
+            with get_parallel().override(
+                attn_tp_group=duplicate, moe_tp_group=duplicate
+            ):
+                self.assertIs(fusion._resolve_workspace_coordinator(True), duplicate)
+                self.assertIs(fusion._resolve_workspace_coordinator(False), duplicate)
+            with get_parallel().override(
+                moe_ep_group=duplicate,
+                moe_ep_size=2,
+                moe_tp_group=single,
+                moe_tp_size=1,
+            ):
+                self.assertIs(fusion._resolve_workspace_coordinator(False), duplicate)
+
+    def test_merged_moe_lookup_reuses_initialized_workspace(self):
+        buffers, saved = self._save_workspace_buffers()
+        merged = _fake_coordinator("tp:merged")
+        merged.world_size = 4
+        ep = _fake_coordinator("ep:2")
+        tp = _fake_coordinator("moe_tp:2")
+        try:
+            with get_context().override_server_args(
+                tp_size=4, ep_size=2
+            ), get_parallel().override(
+                tp_group=merged, moe_ep_group=ep, moe_tp_group=tp
+            ):
+                size, rank, coordinator = fusion.resolve_fusion_group(
+                    use_attn_tp_group=False
+                )
+                self.assertEqual(size, 4)
+                self.assertIs(coordinator, merged)
+                initialized = fusion._get_workspace_manager(False, coordinator)
+                self.assertIs(fusion._get_workspace_manager(False), initialized)
+        finally:
+            fusion.cleanup_flashinfer_workspace()
+            buffers.update(saved)
+
+    def test_workspace_managers_are_scoped_by_role_and_coordinator(self):
+        buffers, saved = self._save_workspace_buffers()
+        primary = _fake_coordinator("tp:primary")
+        duplicate = _fake_coordinator("tp:duplicate")
+        try:
+            primary_attn = fusion._get_workspace_manager(True, primary)
+            self.assertIs(primary_attn, fusion._get_workspace_manager(True, primary))
+            self.assertIsNot(
+                primary_attn, fusion._get_workspace_manager(True, duplicate)
+            )
+            self.assertIsNot(
+                primary_attn, fusion._get_workspace_manager(False, primary)
+            )
+            self.assertEqual(
+                sum(
+                    isinstance(key, str)
+                    and key.startswith(fusion._FLASHINFER_FUSION_WORKSPACE_PREFIX)
+                    for key in buffers
+                ),
+                3,
+            )
+        finally:
+            fusion.cleanup_flashinfer_workspace()
+            buffers.update(saved)
+
+    def test_unavailable_fusion_falls_back_to_the_requested_collective(self):
+        import sglang.srt.distributed as distributed
+
+        x = torch.ones(2, 4)
+        residual = torch.full_like(x, 2)
+        weight = torch.ones(4)
+
+        attn_norm = _NormProbe()
+        with (
+            get_context().override_server_args(tp_size=2),
+            patch.object(layernorm_module, "_use_aiter", False),
+            patch.object(
+                fusion,
+                "flashinfer_allreduce_residual_rmsnorm",
+                return_value=(None, None),
+            ),
+            patch.object(
+                distributed,
+                "attention_tensor_model_parallel_all_reduce",
+                side_effect=lambda value: value + 3,
+            ) as attn_reduce,
+            get_parallel().override(attn_tp_size=2),
+        ):
+            attn_out, _ = layernorm_module._forward_with_allreduce_fusion(
+                attn_norm,
+                x,
+                residual,
+                None,
+                weight,
+                use_attn_tp_group=True,
+            )
+        attn_reduce.assert_called_once()
+        torch.testing.assert_close(attn_out, x + 3)
+
+        moe_norm = _NormProbe()
+        merged = _fake_coordinator("tp:merged-fallback")
+        merged.world_size = 4
+        merged.all_reduce = Mock(side_effect=lambda value: value * 4)
+        with (
+            get_context().override_server_args(tp_size=4, ep_size=2),
+            patch.object(layernorm_module, "_use_aiter", False),
+            patch.object(
+                fusion,
+                "flashinfer_allreduce_residual_rmsnorm",
+                return_value=(None, None),
+            ),
+            get_parallel().override(tp_group=merged),
+        ):
+            moe_out, _ = layernorm_module._forward_with_allreduce_fusion(
+                moe_norm,
+                x,
+                residual,
+                None,
+                weight,
+                use_attn_tp_group=False,
+            )
+        merged.all_reduce.assert_called_once()
+        torch.testing.assert_close(moe_out, x * 4)
+
+    def test_workspace_manager_rejects_live_communicator_rebind(self):
+        primary = _fake_coordinator("tp:primary")
+        duplicate = _fake_coordinator("tp:duplicate")
+        manager = fusion.FlashInferWorkspaceManager("test-workspace")
+        manager.workspace = _FakeWorkspace("trtllm", 2)
+        manager.initialized = True
+        manager.world_size = 2
+        manager.rank = 0
+        manager.group = (primary.device_group, primary.cpu_group)
+        manager.backend = "trtllm"
+        manager.max_token_num = 8
+        manager.hidden_dim = 16
+        manager.dtype = torch.bfloat16
+
+        with self.assertRaisesRegex(RuntimeError, "cannot be rebound"):
+            manager.initialize(
+                world_size=2,
+                rank=0,
+                max_token_num=8,
+                hidden_dim=16,
+                backend="trtllm",
+                dtype=torch.bfloat16,
+                device_group=duplicate.device_group,
+                cpu_group=duplicate.cpu_group,
+            )
+
+    def test_ensure_workspace_initializes_duplicate_communicators_separately(self):
+        buffers, saved = self._save_workspace_buffers()
+        primary = _fake_coordinator("tp:primary")
+        duplicate = _fake_coordinator("tp:duplicate")
+        fake_comm = _FakeFlashInferComm()
+        try:
+            common_patches = (
+                patch.object(fusion, "_flashinfer_comm", fake_comm),
+                patch.object(
+                    fusion,
+                    "_create_allreduce_fusion_workspace",
+                    fake_comm.create_allreduce_fusion_workspace,
+                ),
+                patch.object(fusion, "_flashinfer_allreduce_unavailable", False),
+                patch.object(
+                    fusion, "_flashinfer_create_workspace_supports_group", True
+                ),
+                patch.object(fusion, "_TorchDistBackend", None),
+                patch.object(fusion, "_mnnvl_comm_backend", None),
+                patch.object(fusion, "is_flashinfer_available", return_value=True),
+                override_platform(is_sm100=True),
+                get_context().override_server_args(
+                    flashinfer_allreduce_fusion_backend="trtllm", nnodes=1, tp_size=2
+                ),
+                patch.object(
+                    fusion, "_preflight_check_workspace_memory", return_value=True
+                ),
+                patch.object(fusion, "in_the_same_node_as", return_value=[True, True]),
+                patch.object(fusion, "_sync_allreduce_unavailable_across_tp"),
+            )
+            with contextlib.ExitStack() as stack:
+                for patcher in common_patches:
+                    stack.enter_context(patcher)
+                with get_parallel().override(attn_tp_group=primary, attn_tp_rank=0):
+                    self.assertTrue(
+                        fusion.ensure_workspace_initialized(
+                            max_token_num=8,
+                            hidden_dim=16,
+                            dtype=torch.bfloat16,
+                            use_attn_tp_group=True,
+                        )
+                    )
+                    # Exact-owner lookup is idempotent.
+                    self.assertTrue(
+                        fusion.ensure_workspace_initialized(
+                            max_token_num=8,
+                            hidden_dim=16,
+                            dtype=torch.bfloat16,
+                            use_attn_tp_group=True,
+                        )
+                    )
+                with get_parallel().override(attn_tp_group=duplicate, attn_tp_rank=0):
+                    self.assertTrue(
+                        fusion.ensure_workspace_initialized(
+                            max_token_num=8,
+                            hidden_dim=16,
+                            dtype=torch.bfloat16,
+                            use_attn_tp_group=True,
+                        )
+                    )
+
+            self.assertEqual(len(fake_comm.calls), 2)
+            self.assertIs(fake_comm.calls[0]["group"], primary.device_group)
+            self.assertIs(fake_comm.calls[1]["group"], duplicate.device_group)
+        finally:
+            fusion.cleanup_flashinfer_workspace()
+            buffers.update(saved)
+
+    def test_cleanup_removes_every_communicator_workspace(self):
+        buffers, saved = self._save_workspace_buffers()
+        primary = _fake_coordinator("tp:primary")
+        duplicate = _fake_coordinator("tp:duplicate")
+        workspaces = []
+        try:
+            for coordinator in (primary, duplicate):
+                manager = fusion._get_workspace_manager(True, coordinator)
+                workspace = _FakeWorkspace("trtllm", 2)
+                workspaces.append(workspace)
+                manager.workspace = workspace
+                manager.initialized = True
+            fusion.cleanup_flashinfer_workspace()
+            self.assertFalse(
+                any(
+                    isinstance(key, str)
+                    and key.startswith(fusion._FLASHINFER_FUSION_WORKSPACE_PREFIX)
+                    for key in buffers
+                )
+            )
+            self.assertEqual(
+                [workspace.destroy_count for workspace in workspaces], [1, 1]
+            )
+        finally:
+            fusion.cleanup_flashinfer_workspace()
+            buffers.update(saved)
 
     def test_auto_backend_resolves_by_arch(self):
         single_node = ("auto", False)
@@ -190,7 +485,9 @@ class TestFlashInferCommFusion(CustomTestCase):
         from sglang.srt.runtime_context import get_resources
 
         buffers = get_resources().buffers
-        manager_key = "flashinfer_fusion_attn_tp_workspace"
+        coordinator = _fake_coordinator("test_attn_tp:0")
+        coordinator.world_size = 4
+        manager_key = fusion._workspace_resource_key(True, coordinator)
         original_manager = buffers.get(manager_key)
         try:
             fusion._flashinfer_comm = fake_comm
@@ -202,7 +499,7 @@ class TestFlashInferCommFusion(CustomTestCase):
             for backend in ("trtllm", "mnnvl"):
                 with self.subTest(backend=backend):
                     world_size = 4
-                    manager = fusion.FlashInferWorkspaceManager()
+                    manager = fusion.FlashInferWorkspaceManager(manager_key)
                     manager.workspace = _FakeWorkspace(backend, world_size)
                     manager.backend = backend
                     manager.initialized = True
@@ -230,6 +527,7 @@ class TestFlashInferCommFusion(CustomTestCase):
                         patch.object(
                             fusion, "ensure_workspace_initialized", return_value=True
                         ),
+                        get_parallel().override(attn_tp_group=coordinator),
                     ):
                         norm_out, residual_out = (
                             fusion.flashinfer_allreduce_residual_rmsnorm(
@@ -243,10 +541,7 @@ class TestFlashInferCommFusion(CustomTestCase):
 
                     torch.testing.assert_close(norm_out, expected_norm)
                     torch.testing.assert_close(residual_out, expected_residual)
-                    self.assertEqual(
-                        fake_comm.fusion_kwargs.get("fp32_acc", False),
-                        backend == "trtllm",
-                    )
+                    self.assertTrue(fake_comm.fusion_kwargs["fp32_acc"])
         finally:
             fusion._flashinfer_comm = original_comm
             fusion._create_allreduce_fusion_workspace = original_create
@@ -280,7 +575,9 @@ class TestFlashInferAllReduceOnly(CustomTestCase):
         from sglang.srt.runtime_context import get_resources
 
         buffers = get_resources().buffers
-        manager_key = "flashinfer_fusion_attn_tp_workspace"
+        coordinator = _fake_coordinator("test_attn_tp:allreduce")
+        coordinator.world_size = 4
+        manager_key = fusion._workspace_resource_key(True, coordinator)
         original_manager = buffers.get(manager_key)
         original_comm = fusion._flashinfer_comm
         original_unavailable = fusion._flashinfer_allreduce_unavailable
@@ -290,7 +587,8 @@ class TestFlashInferAllReduceOnly(CustomTestCase):
         fusion._flashinfer_comm = fake_comm
         fusion._flashinfer_allreduce_unavailable = False
         try:
-            yield fake_comm
+            with get_parallel().override(attn_tp_group=coordinator):
+                yield fake_comm
         finally:
             fusion._flashinfer_comm = original_comm
             fusion._flashinfer_allreduce_unavailable = original_unavailable
