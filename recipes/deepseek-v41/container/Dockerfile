@@ -11,10 +11,11 @@ FROM ${CUDA_IMAGE}
 ENV DEBIAN_FRONTEND=noninteractive
 # Mooncake links ibverbs/mlx5, libnl, numa and curl even for intra-node NVLink.
 # FFmpeg 6.1 matches the host; without it torchcodec logs load failures at import.
+# OpenSSL headers: the HiCache storage hash extension JIT-builds against them.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         python3.12 python3.12-dev python3.12-venv \
-        build-essential ca-certificates curl git procps \
+        build-essential ca-certificates curl git procps libssl-dev \
         ibverbs-providers libibverbs1 libnuma1 libcurl4t64 libnl-3-200 libnl-route-3-200 \
         libavcodec60 libavdevice60 libavfilter9 libavformat60 libavutil58 libswresample4 libswscale7 \
     && rm -rf /var/lib/apt/lists/*
