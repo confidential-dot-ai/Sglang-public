@@ -206,6 +206,32 @@ class TestLaunch(unittest.TestCase):
         self.assertEqual(prefill_graphs["prefill"]["max_seq_len"], 8192)
         self.assertNotIn(eager_env, prefill["env"])
 
+    def test_prefill_graph_max_seq_len_defaults_to_the_context_length(self):
+        eager_env = "SGLANG_OPT_DSV41_PREFILL_GRAPH_EAGER_INDEXER"
+
+        def prefill_graph(*extra):
+            prefill, _ = launch.build_plan(
+                self.args("--cpu-engram-staging", "--split-cuda-graphs", *extra)
+            )["workers"]
+            command = prefill["command"]
+            config = json.loads(command[command.index("--cuda-graph-config") + 1])
+            return config["prefill"], prefill["env"]
+
+        long_context = ("--context-length", "1048576", "--max-total-tokens", "1572864")
+        graph, env = prefill_graph(*long_context)
+        self.assertEqual(graph["max_seq_len"], 1048576)
+        self.assertEqual(env[eager_env], "1")
+
+        # An explicit cap still wins, including the server's own.
+        graph, env = prefill_graph(*long_context, "--prefill-graph-max-seq-len", "16384")
+        self.assertEqual(graph["max_seq_len"], 16384)
+        self.assertNotIn(eager_env, env)
+
+        # Bounded replay is not validated past the captured indexer's window.
+        graph, env = prefill_graph(*long_context, "--prefill-bounded-replay")
+        self.assertNotIn("max_seq_len", graph)
+        self.assertNotIn(eager_env, env)
+
     def test_prefill_graph_max_seq_len_rejects_unsupported_plans(self):
         for extra, reason in (
             (("--prefill-graph-max-seq-len", "32768"), "requires --split-cuda-graphs"),

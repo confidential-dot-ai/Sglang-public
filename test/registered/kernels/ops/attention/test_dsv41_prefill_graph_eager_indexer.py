@@ -53,6 +53,9 @@ GRAPH_BUCKET = 128
 # runs, so its picks match to a few ulps of the floor, not bit for bit.
 MIN_SOURCE_OVERLAP = 0.99
 MIN_CONSUMER_OVERLAP = 0.95
+# Past 64K the floor's ties move more: a consumer's own eager reruns matched as low
+# as 0.955 per row at 256K (mean 0.988), so long contexts bound the mean instead.
+MIN_LONG_CONSUMER_ROW_OVERLAP = 0.9
 
 
 class Selection(NamedTuple):
@@ -287,11 +290,21 @@ def picks(selection: Selection, row: int) -> set:
     return set(selection.raw_indices[row].tolist()) - {-1}
 
 
-def assert_overlap(test, got: Selection, want: Selection, minimum: float):
+def assert_overlap(
+    test, got: Selection, want: Selection, minimum: float, row_minimum=None
+):
+    """Every row overlaps by `minimum`; with `row_minimum`, every row by that and
+    the rows on average by `minimum`."""
+    shares = []
     for row in range(got.raw_indices.shape[0]):
         g, w = picks(got, row), picks(want, row)
         test.assertEqual(len(g), len(w), row)
-        test.assertGreaterEqual(len(g & w), minimum * len(w), row)
+        test.assertGreaterEqual(
+            len(g & w), (minimum if row_minimum is None else row_minimum) * len(w), row
+        )
+        shares.append(len(g & w) / max(len(w), 1))
+    if row_minimum is not None:
+        test.assertGreaterEqual(sum(shares) / len(shares), minimum)
 
 
 class StaticBatch:
@@ -505,6 +518,21 @@ class TestPrefillGraphIndexerBreak(CustomTestCase):
         """A prefill graph captured once replays other batches past the window with
         the live rows scored by the eager source and consumer layers, the candidate
         blocks carried between the breaks, and the padding rows left unselected."""
+        self._assert_replay_matches_eager([32768, 20000], [30000, 24576])
+
+    @torch.inference_mode()
+    def test_replay_past_the_old_64k_cap_selects_what_the_eager_path_selects(self):
+        """The same past the 64K cap the recipe used to set: the graph replays
+        256K- and 100K-token contexts, so a long conversation's chunks keep it."""
+        self._assert_replay_matches_eager(
+            [262144, 100000],
+            [196608, 70000],
+            consumer_row_minimum=MIN_LONG_CONSUMER_ROW_OVERLAP,
+        )
+
+    def _assert_replay_matches_eager(
+        self, contexts, other_contexts, consumer_row_minimum=None
+    ):
         from sglang.srt.layers.attention import deepseek_v4_backend as module
         from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
             BreakableCUDAGraph,
@@ -514,8 +542,8 @@ class TestPrefillGraphIndexerBreak(CustomTestCase):
             set_tc_piecewise_forward_context,
         )
 
-        base = make_batch([32768, 20000], [48, 30], seed=4)
-        batches = [base, make_batch([30000, 24576], [20, 15], seed=4, like=base)]
+        base = make_batch(contexts, [48, 30], seed=4)
+        batches = [base, make_batch(other_contexts, [20, 15], seed=4, like=base)]
         static = StaticBatch(base)
         backend = make_backend(base, static, eager_indexer=True)
         layers = [
@@ -582,10 +610,15 @@ class TestPrefillGraphIndexerBreak(CustomTestCase):
                     forward_batch,
                 )
                 wants.append(Selection(None, static.raw_indices[:rows].clone()))
-            for snapshot, want, tolerance in zip(
-                after_layer, wants, (MIN_SOURCE_OVERLAP, MIN_CONSUMER_OVERLAP)
+            for snapshot, want, tolerance, row_minimum in zip(
+                after_layer,
+                wants,
+                (MIN_SOURCE_OVERLAP, MIN_CONSUMER_OVERLAP),
+                (None, consumer_row_minimum),
             ):
-                assert_overlap(self, Selection(None, snapshot[:rows]), want, tolerance)
+                assert_overlap(
+                    self, Selection(None, snapshot[:rows]), want, tolerance, row_minimum
+                )
                 self.assertTrue((snapshot[rows:] == -1).all(), "padding rows selected")
 
 

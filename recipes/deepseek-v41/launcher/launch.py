@@ -140,11 +140,12 @@ def parser():
         type=int,
         metavar="N",
         help="Longest context (cached prefix plus new tokens) the split prefill graphs "
-        f"replay; default is the server's {CAPTURED_INDEXER_MAX_SEQ_LEN} cap. Above it "
-        "the prefill ratio-1/2 index layers run as eager breaks "
-        "(SGLANG_OPT_DSV41_PREFILL_GRAPH_EAGER_INDEXER); longer contexts prefill "
-        "eagerly. Needs --split-cuda-graphs; not validated with "
-        "--prefill-bounded-replay",
+        "replay; longer contexts prefill the whole step eagerly. Default: "
+        f"--context-length when it exceeds the server's {CAPTURED_INDEXER_MAX_SEQ_LEN} "
+        "cap (without --prefill-bounded-replay), so every allowed context replays; "
+        "otherwise the server's cap. Above that cap the prefill ratio-1/2 index "
+        "layers run as eager breaks (SGLANG_OPT_DSV41_PREFILL_GRAPH_EAGER_INDEXER). "
+        "Needs --split-cuda-graphs; not validated with --prefill-bounded-replay",
     )
     p.add_argument(
         "--prefill-swa-prefix-tails",
@@ -395,6 +396,23 @@ def validate(args):
     return gpus, ports
 
 
+def prefill_graph_max_seq_len(args):
+    """The prefill graph cap: the explicit one, else the whole context once it is
+    past the captured indexer's window. A capped step past the cap runs every layer
+    eagerly, and under CC that host time dwarfs the GPU work, while the eager index
+    layers make a longer cap cost no static graph memory (their scoring is sized by
+    the live rows, and the page table is rebuilt per replay)."""
+    if args.prefill_graph_max_seq_len is not None:
+        return args.prefill_graph_max_seq_len
+    if (
+        args.split_cuda_graphs
+        and not args.prefill_bounded_replay
+        and args.context_length > CAPTURED_INDEXER_MAX_SEQ_LEN
+    ):
+        return args.context_length
+    return None
+
+
 def prefill_parallelism(command, *, pp):
     if pp == 1:
         return command
@@ -555,7 +573,7 @@ def build_plan(args):
             env["SGLANG_ENABLE_HICACHE_SWA_TOMBSTONE_BACKUP"] = "0"
         if (
             role == "prefill"
-            and (args.prefill_graph_max_seq_len or 0) > CAPTURED_INDEXER_MAX_SEQ_LEN
+            and (prefill_graph_max_seq_len(args) or 0) > CAPTURED_INDEXER_MAX_SEQ_LEN
         ):
             env["SGLANG_OPT_DSV41_PREFILL_GRAPH_EAGER_INDEXER"] = "1"
         if role == "prefill" and args.prefill_pp > 1:
@@ -642,8 +660,9 @@ def build_plan(args):
                 | {requests}
             )
             prefill_graph = {"backend": "breakable", "bs": prefill_buckets}
-            if args.prefill_graph_max_seq_len is not None:
-                prefill_graph["max_seq_len"] = args.prefill_graph_max_seq_len
+            max_seq_len = prefill_graph_max_seq_len(args)
+            if max_seq_len is not None:
+                prefill_graph["max_seq_len"] = max_seq_len
             graph_config = {
                 "prefill": (
                     prefill_graph if role == "prefill" else {"backend": "disabled"}
