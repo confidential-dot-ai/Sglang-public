@@ -265,17 +265,21 @@ def main():
                 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
                     BreakableCudaGraphBackend,
                 )
+                from sglang.srt.runtime_context import get_parallel
 
-                backend = BreakableCudaGraphBackend(
-                    SimpleNamespace(
-                        device_module=torch.cuda,
-                        cuda_graph_output_capacity_rows=lambda output: None,
-                        cuda_graph_output_rows=lambda output: None,
-                        model_runner=SimpleNamespace(
-                            tp_group=SimpleNamespace(barrier=lambda: None)
-                        ),
+                # A single-process probe has no TP group; the backend reads it
+                # from the runtime context, so state a barrier-only one there.
+                with get_parallel().override(
+                    tp_group=SimpleNamespace(barrier=lambda: None)
+                ):
+                    backend = BreakableCudaGraphBackend(
+                        SimpleNamespace(
+                            device_module=torch.cuda,
+                            cuda_graph_output_capacity_rows=lambda output: None,
+                            cuda_graph_output_rows=lambda output: None,
+                            model_runner=SimpleNamespace(),
+                        )
                     )
-                )
                 keys = [ShapeKey(size=2), ShapeKey(size=1)]
                 with backend.capture_session(stream):
                     for key in keys:
