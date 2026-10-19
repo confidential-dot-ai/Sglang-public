@@ -194,5 +194,71 @@ def test_deep_gemm_fp4_paged_logits_do_not_depend_on_row_position_at_1m():
     assert torch.equal(full[-short:], tail)
 
 
+def _relocated_flash_mla(*, relocate_main: bool, relocate_extra: bool):
+    """Sparse FlashMLA decode read from the first pages of two caches, and from
+    the same bytes copied to pages past 2^31 bytes into each cache."""
+    import sgl_kernel.flash_mla as flash_mla
+
+    heads, d_qk, d_v, bytes_per_token, page = 64, 512, 512, 584, 288
+    page_bytes = page * bytes_per_token
+    big_pages = (1 << 31) // page_bytes + 64  # the last pages sit past 2^31 bytes
+    low_pages, b, topk = 32, 4, 2048
+    g = torch.Generator(device="cuda").manual_seed(11)
+
+    def cache(pages):
+        # Bytes below 0x40 keep every e4m3 / bf16 / ue8m0 field small and finite.
+        kv = torch.zeros((pages, page, 1, bytes_per_token), dtype=torch.uint8, device="cuda")
+        kv[:low_pages] = torch.randint(
+            0, 0x40, kv[:low_pages].shape, dtype=torch.uint8, device="cuda", generator=g
+        )
+        kv[-low_pages:] = kv[:low_pages]
+        return kv
+
+    main = cache(big_pages if relocate_main else 2 * low_pages)
+    extra = cache(big_pages if relocate_extra else 2 * low_pages)
+    q = torch.randn((b, 1, heads, d_qk), generator=g, device="cuda").bfloat16()
+    sink = torch.randn((heads,), generator=g, device="cuda")
+    low = low_pages * page
+    indices = torch.randint(0, low, (b, 1, topk), dtype=torch.int32, device="cuda", generator=g)
+    extra_indices = torch.randint(
+        0, low, (b, 1, topk), dtype=torch.int32, device="cuda", generator=g
+    )
+    lengths = torch.full((b,), topk, dtype=torch.int32, device="cuda")
+
+    def run(main_idx, extra_idx):
+        out, _ = flash_mla.flash_mla_with_kvcache(
+            q, main, None, None, d_v, flash_mla.FlashMLASchedMeta(),
+            indices=main_idx, is_fp8_kvcache=True, softmax_scale=0.1, causal=False,
+            topk_length=lengths, attn_sink=sink, extra_k_cache=extra,
+            extra_indices_in_kvcache=extra_idx, extra_topk_length=lengths,
+        )
+        torch.cuda.synchronize()
+        return out
+
+    def shift(idx, kv):
+        return idx + (kv.shape[0] - low_pages) * page
+
+    base = run(indices, extra_indices)
+    moved = run(
+        shift(indices, main) if relocate_main else indices,
+        shift(extra_indices, extra) if relocate_extra else extra_indices,
+    )
+    assert torch.isfinite(base.float()).all()
+    return base, moved
+
+
+@pytest.mark.parametrize(
+    "relocate_main,relocate_extra", [(True, False), (False, True)], ids=["main", "extra"]
+)
+@torch.inference_mode()
+def test_flash_mla_sparse_decode_reads_slots_past_2gib(relocate_main, relocate_extra):
+    """B300 pools put a layer's KV past 2^31 bytes: reading a slot there must
+    give exactly what the same bytes give at the bottom of the cache."""
+    base, moved = _relocated_flash_mla(
+        relocate_main=relocate_main, relocate_extra=relocate_extra
+    )
+    assert torch.equal(base, moved)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
