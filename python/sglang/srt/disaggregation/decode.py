@@ -2685,10 +2685,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         if ced_boundary_enabled() and self.metadata_buffers.ced_boundary is not None:
             # Copy the handed-off window state out before the slot is freed.
             decode_req.req.ced_boundary_state = take_ced_boundary_slot(
-                decode_req.req,
-                self.metadata_buffers.ced_boundary,
-                idx,
-                self.metadata_buffers.ced_boundary_layout,
+                req=decode_req.req,
+                slots=self.metadata_buffers.ced_boundary,
+                idx=idx,
+                layout=self.metadata_buffers.ced_boundary_layout,
             )
 
         # Validate bootstrap_room to detect context corruption
@@ -3368,6 +3368,8 @@ class SchedulerDisaggregationDecodeMixin:
         last_batch = self.last_batch
         if last_batch is None or not last_batch.forward_mode.is_extend():
             return running_batch
+        # The replay ran; a promoted tail batch must not replay from it again.
+        last_batch.ced_boundary_injection = None
         last_batch.filter_batch()
         if last_batch.is_empty():
             return running_batch
@@ -3432,7 +3434,7 @@ class SchedulerDisaggregationDecodeMixin:
         batch.prepare_for_extend(preallocated=True)
         if ced_boundary_enabled():
             batch.ced_boundary_injection = build_ced_boundary_injection(
-                reqs, batch.device
+                reqs=reqs, device=batch.device
             )
         if envs.SGLANG_DSV41_CED_TAIL_TIMING.get():
             batch.ced_tail_prepare_ms = (

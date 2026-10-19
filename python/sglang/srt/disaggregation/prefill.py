@@ -939,10 +939,10 @@ class SchedulerDisaggregationPrefillMixin:
             (metadata_buffers := self.disagg_metadata_buffers).ced_boundary is not None
         ):
             write_ced_boundary_slots(
-                result.ced_boundary,
-                batch.reqs,
-                metadata_buffers.ced_boundary,
-                metadata_buffers.ced_boundary_layout,
+                capture=result.ced_boundary,
+                reqs=batch.reqs,
+                slots=metadata_buffers.ced_boundary,
+                layout=metadata_buffers.ced_boundary_layout,
             )
         auxiliary_output_starts = (
             self.batch_result_processor.snapshot_auxiliary_output_starts(batch, result)

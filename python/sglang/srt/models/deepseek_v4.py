@@ -3986,9 +3986,7 @@ class DeepseekV4Model(nn.Module):
         residual.index_copy_(0, rows, injection.residual.to(residual.dtype))
         pre = None
         if injection.pre is not None:
-            pre = injection.pre.new_zeros(
-                (residual.shape[0], injection.pre.shape[1])
-            )
+            pre = injection.pre.new_zeros((residual.shape[0], injection.pre.shape[1]))
             pre.index_copy_(0, rows, injection.pre)
         return mhc.HcState(residual, pre)
 
@@ -4089,7 +4087,7 @@ class DeepseekV4Model(nn.Module):
         )
         # CED boundary handoff: a tail replay starts at the last kv_source layer
         # from prefill's state, so the encoder (and its Engram) does not run.
-        boundary = getattr(forward_batch, "ced_boundary", None)
+        boundary = forward_batch.ced_boundary if ced_boundary_enabled() else None
         injection = boundary if isinstance(boundary, CedBoundaryInjection) else None
         replay_from_boundary = injection is not None and not injection.check
         if self.engram_hasher is not None and not replay_from_boundary:

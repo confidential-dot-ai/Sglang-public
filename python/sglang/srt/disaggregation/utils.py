@@ -557,12 +557,15 @@ class MetadataBuffers:
         )
 
     def set_buf(self, req: Req):
-        if getattr(self, "ced_boundary", None) is not None:
-            from sglang.srt.disaggregation.ced_boundary import (
-                finalize_ced_boundary_slot,
-            )
+        from sglang.srt.disaggregation.ced_boundary import (
+            ced_boundary_enabled,
+            finalize_ced_boundary_slot,
+        )
 
-            finalize_ced_boundary_slot(req, self.ced_boundary, self.ced_boundary_layout)
+        if ced_boundary_enabled() and self.ced_boundary is not None:
+            finalize_ced_boundary_slot(
+                req=req, slots=self.ced_boundary, layout=self.ced_boundary_layout
+            )
 
         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
         # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token

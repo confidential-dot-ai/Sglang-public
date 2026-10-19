@@ -1488,6 +1488,9 @@ class Req(ReqDllmMixin):
         # first prefill batch; the cached-prefix early-send never goes past it.
         self.early_send_prefix_end: Optional[int] = None
         self.metadata_buffer_index: int = -1
+        # CED boundary handoff (decode): prefill's last-window state, held on the
+        # host from transfer commit until the request's tail replay.
+        self.ced_boundary_state: Optional[Any] = None
         self.expected_kv_checksum: int = 0
         # Used in overlap sequence to signal that an optimistic request should
         # abort chunking. Set in create_sender, consumed in process_batch_result.
@@ -2619,6 +2622,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     can_run_dp_prefill_cuda_graph: bool = False
     dp_prefill_cuda_graph_max_prefix_len: int = 0
     tbo_split_seq_index: Optional[int] = None
+    # CED boundary handoff (decode): the tail replay's handed-off state, cleared
+    # once the tail batch merges into the running batch.
+    ced_boundary_injection: Optional[Any] = None
     # Rank-consistent forward mode for the recv skipper, derived from the MLP
     # sync all-gather (the TBO-only `global_forward_mode` is None without TBO).
     recv_skipper_forward_mode: Optional[ForwardMode] = None

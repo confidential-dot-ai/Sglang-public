@@ -1374,7 +1374,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         if ced_boundary_enabled():
             ret.ced_boundary = ced_boundary_for_forward(
-                batch, ret, model_runner.sliding_window_size, device
+                batch=batch,
+                forward_batch=ret,
+                window=model_runner.sliding_window_size,
+                device=device,
             )
 
         return ret
