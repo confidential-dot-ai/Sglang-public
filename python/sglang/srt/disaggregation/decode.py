@@ -166,6 +166,23 @@ def _bootstrap_addr(req: Req) -> str:
     return NetworkAddress(req.bootstrap_host, req.bootstrap_port).to_host_port_str()
 
 
+def decode_radix_max_prefix(
+    prompt_len: int, page_size: int, sliding_window_size: Optional[int]
+) -> int:
+    """Longest decode-radix prefix a prompt may reuse, page aligned.
+
+    Never the whole prompt: a full match leaves an empty transfer and an empty
+    extend. Under SWA it also ends before the window prefill sends fresh, which
+    under the CED split covers the tail decode replays through every layer, so
+    the replay never writes a page the tree owns.
+    """
+    max_prefix = (prompt_len - 1) // page_size * page_size
+    if sliding_window_size:
+        fresh = disagg_swa_transfer_window(sliding_window_size, page_size)
+        max_prefix = min(max_prefix, max(0, prompt_len - fresh) // page_size * page_size)
+    return max(max_prefix, 0)
+
+
 def _bind_root_prefix(req: Req, tree_cache: BasePrefixCache) -> None:
     """Start a decode-radix request that owns its whole KV row at the root."""
     req.prefix_len = 0
@@ -1544,7 +1561,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 # to the last page boundary strictly below the prompt length,
                 # mirroring the aggregated scheduler's last-token rule.
                 page = self.token_to_kv_pool_allocator.page_size
-                max_prefix = ((origin_input_len - 1) // page) * page
+                max_prefix = decode_radix_max_prefix(
+                    origin_input_len,
+                    page,
+                    self.scheduler.sliding_window_size
+                    or getattr(
+                        self.token_to_kv_pool_allocator.get_kvcache(),
+                        "sliding_window",
+                        None,
+                    ),
+                )
                 if total_prefix_len > max_prefix:
                     total_prefix_len = max_prefix
                 if prefix_len > max_prefix:
@@ -3364,8 +3390,16 @@ class SchedulerDisaggregationDecodeMixin:
         set_time_batch(reqs, "set_forward_entry_time")
 
         page_size = self.token_to_kv_pool_allocator.page_size
+        # A decode-radix request keeps the prefix its admission matched and
+        # locked; matching again here would move last_node and the protected
+        # length off the KV row the transfer filled.
+        tree_cache = (
+            None
+            if get_disagg().disaggregation_decode_enable_radix_cache
+            else self.tree_cache
+        )
         for req in reqs:
-            req.init_next_round_input(self.tree_cache)
+            req.init_next_round_input(tree_cache)
             seq_len = len(req.origin_input_ids)
             tail_start = ced_tail_start(seq_len, self.sliding_window_size, page_size)
             req.prefix_len = tail_start
