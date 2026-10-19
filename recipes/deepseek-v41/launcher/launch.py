@@ -47,6 +47,19 @@ KV_BYTES_PER_TOKEN = 1938
 SWA_RING_BYTES = int(10.5 * 2**20)
 DECODE_GRAPH_GIB = 1.75
 POOL_ROUND_TOKENS = 65536
+# A CED-split PP2 prefill stage holds only its encoder layers, every expert at
+# TP1/EP1, and no DSpark draft. Weights are checkpoint tensor bytes (6.88-7.04
+# GiB per layer; the B200 TP2 rank measures 0.998x half the checkpoint), plus
+# embedding and vision tower on stage 0 and the LM head on stage 1. KV per token
+# counts each stage's compressed owners: a 584 B latent slot (448 fp8 + 64x2
+# bf16 rope + 8) and a 68 B FP4 index slot, one per two tokens at ratio 2.
+# Layers 0-7 own kv/index source 2; layers 8-20 own sources 8, 14 (ratio 2)
+# and 20 (ratio 1). All 40 layers give 1902 B, 1938 B with the DSpark draft
+# (measured). Estimates; only the default 8,13 partition is modelled.
+CED_PP2_STAGES = (
+    dict(layers="0-7", weights_gib=57.33, kv_bytes=326, ring_share=8 / 40),
+    dict(layers="8-20", weights_gib=90.69, kv_bytes=1304, ring_share=13 / 40),
+)
 
 
 def pool_size(text):
@@ -367,15 +380,11 @@ def swa_rings(args, role):
     return args.prefill_requests * (5 if tails is None else 1) + (tails or 0)
 
 
-def pool_estimate(args, role, tp, tokens=None):
-    """Per-rank HBM budget of one worker under --memory-profile, in GiB.
-
-    pool_tokens is the largest KV pool (rounded down) that leaves the role's
-    transient reserve free and stays within --mem-fraction of HBM for weights
-    plus pools. With `tokens`, the estimate is for that configured pool.
-    """
+def rank_budget(args, role, *, weights, kv_bytes, ring_share=1.0, tokens=None):
+    """One rank's HBM budget in GiB; pool_tokens is the largest KV pool (rounded
+    down) that leaves the role's transient reserve free and keeps weights plus
+    pools within --mem-fraction of HBM. With `tokens`, it reports that pool."""
     hbm = GPU_PROFILES[args.memory_profile]["hbm_gib"]
-    weights = weights_gib(tp)
     graphs = 0.0
     if args.split_cuda_graphs:
         # Linear in the largest prefill bucket: 12.68 GiB at 12288, 15.28 at 16384.
@@ -385,41 +394,96 @@ def pool_estimate(args, role, tp, tokens=None):
             else DECODE_GRAPH_GIB
         )
     transient = getattr(args, f"{role}_transient_reserve_gib")
-    rings_gib = swa_rings(args, role) * SWA_RING_BYTES / GIB
+    rings_gib = swa_rings(args, role) * SWA_RING_BYTES * ring_share / GIB
     room = min(
         hbm - CONTEXT_OVERHEAD_GIB - weights - graphs - transient,
         hbm * args.mem_fraction - weights,
     )
-    pool_tokens = (
-        max(0, int((room - rings_gib) * GIB // KV_BYTES_PER_TOKEN))
+    max_tokens = (
+        max(0, int((room - rings_gib) * GIB // kv_bytes))
         // POOL_ROUND_TOKENS
         * POOL_ROUND_TOKENS
     )
-    tokens = pool_tokens if tokens is None else tokens
-    pool_gib = tokens * KV_BYTES_PER_TOKEN / GIB + rings_gib
+    tokens = max_tokens if tokens is None else tokens
+    pool_gib = tokens * kv_bytes / GIB + rings_gib
     return dict(
         hbm_gib=round(hbm, 2),
         weights_gib=round(weights, 2),
         graphs_gib=round(graphs, 2),
         transient_reserve_gib=transient,
+        kv_bytes_per_token=kv_bytes,
         pool_tokens=tokens,
         pool_gib=round(pool_gib, 2),
-        max_pool_tokens=pool_tokens,
-        free_gib=round(
-            hbm - CONTEXT_OVERHEAD_GIB - weights - graphs - pool_gib, 2
-        ),
+        max_pool_tokens=max_tokens,
+        free_gib=round(hbm - CONTEXT_OVERHEAD_GIB - weights - graphs - pool_gib, 2),
         contexts_resident=tokens // args.context_length,
+    )
+
+
+def pool_estimate(args, role, tp, tokens=None):
+    """Per-rank HBM budget of one worker under --memory-profile.
+
+    A PP2 CED prefill is budgeted per stage; both stages share one token pool,
+    so the tighter stage sets max_pool_tokens.
+    """
+    if role == "prefill" and args.prefill_pp > 1:
+        if not args.ced_split or args.prefill_pp_partition not in (None, "8,13"):
+            raise ValueError(
+                "--memory-profile models PP prefill only as a CED split with the "
+                "default 8,13 partition"
+            )
+
+        def stage_budget(stage, stage_tokens):
+            return dict(
+                layers=stage["layers"],
+                **rank_budget(
+                    args,
+                    role,
+                    weights=stage["weights_gib"],
+                    kv_bytes=stage["kv_bytes"],
+                    ring_share=stage["ring_share"],
+                    tokens=stage_tokens,
+                ),
+            )
+
+        max_tokens = min(
+            stage_budget(stage, None)["max_pool_tokens"] for stage in CED_PP2_STAGES
+        )
+        stages = [
+            stage_budget(stage, max_tokens if tokens is None else tokens)
+            for stage in CED_PP2_STAGES
+        ]
+        return dict(
+            pool_tokens=stages[0]["pool_tokens"],
+            max_pool_tokens=max_tokens,
+            contexts_resident=stages[0]["contexts_resident"],
+            stages=stages,
+            estimated="per-stage weights, KV bytes, graphs and SWA share",
+        )
+    return rank_budget(
+        args, role, weights=weights_gib(tp), kv_bytes=KV_BYTES_PER_TOKEN, tokens=tokens
     )
 
 
 def hicache_host_bytes(args, tp, tokens):
     """Host RAM of one prefill worker's HiCache pools (all ranks); 0 if off."""
+    ranks = args.prefill_pp if args.prefill_pp > 1 else tp
     if args.prefill_hicache_size_gib is not None:
-        return args.prefill_hicache_size_gib * GIB * tp
+        return args.prefill_hicache_size_gib * GIB * ranks
     if args.prefill_hicache_ratio is None:
         return 0
-    device = tokens * KV_BYTES_PER_TOKEN + swa_rings(args, "prefill") * SWA_RING_BYTES
-    return int(args.prefill_hicache_ratio * device) * tp
+    rings = swa_rings(args, "prefill") * SWA_RING_BYTES
+    if args.prefill_pp > 1 and args.ced_split:
+        # Each stage mirrors only its own layers' device pool.
+        return sum(
+            int(
+                args.prefill_hicache_ratio
+                * (tokens * stage["kv_bytes"] + rings * stage["ring_share"])
+            )
+            for stage in CED_PP2_STAGES
+        )
+    device = tokens * KV_BYTES_PER_TOKEN + rings
+    return int(args.prefill_hicache_ratio * device) * ranks
 
 
 def resolve_pool_sizes(args):
@@ -864,10 +928,15 @@ def build_plan(args):
         workers.append(worker)
     router = build_router(args=args, workers=workers)
     n, m, ptp, dtp = args.num_prefill, args.num_decode, args.prefill_tp, args.decode_tp
-    if n == m == 1 and ptp == dtp == 2:
+    prefill = (
+        f"PP{args.prefill_pp}xTP1{' CED' if args.ced_split else ''} prefill"
+        if args.prefill_pp > 1
+        else f"TP{ptp} prefill"
+    )
+    if n == m == 1 and ptp == dtp == 2 and args.prefill_pp == 1:
         topology = "1x(TP2 prefill + TP2 decode)"
     else:
-        topology = f"{n}x(TP{ptp} prefill) + {m}x(TP{dtp} decode)"
+        topology = f"{n}x({prefill}) + {m}x(TP{dtp} decode)"
     plan = dict(
         revision=revision,
         status="unqualified",

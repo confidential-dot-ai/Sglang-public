@@ -487,6 +487,80 @@ class TestLaunch(unittest.TestCase):
         # Without a profile the plan carries no estimate (today's plans unchanged).
         self.assertNotIn("memory", launch.build_plan(self.args()))
 
+    def test_two_ced_pp2_prefills_two_tp2_decodes_with_stage_memory(self):
+        args = self.args(
+            "--cpu-engram-staging",
+            "--split-cuda-graphs",
+            "--ced-split",
+            "--prefill-pp",
+            "2",
+            "--num-prefill",
+            "2",
+            "--num-decode",
+            "2",
+            "--chunk-size",
+            "12288",
+            "--prefill-requests",
+            "16",
+            "--prefill-swa-prefix-tails",
+            "256",
+            "--decode-requests",
+            "64",
+            "--context-length",
+            "1048576",
+            "--mem-fraction",
+            "0.92",
+            "--memory-profile",
+            "B300",
+            "--max-total-tokens",
+            "auto",
+            "--decode-max-total-tokens",
+            "auto",
+            "--prefill-hicache-size-gib",
+            "32",
+        )
+        plan = launch.build_plan(args)
+        workers = plan["workers"]
+        self.assertEqual(
+            [w["env"]["CUDA_VISIBLE_DEVICES"] for w in workers],
+            ["0,1", "2,3", "4,5", "6,7"],
+        )
+        self.assertTrue(
+            plan["topology"].startswith("2x(PP2xTP1 CED prefill) + 2x(TP2 decode)")
+        )
+
+        def flag(worker, name):
+            command = worker["command"]
+            return command[command.index(name) + 1] if name in command else None
+
+        for prefill in workers[:2]:
+            self.assertEqual(flag(prefill, "--pp-size"), "2")
+            self.assertEqual(flag(prefill, "--tp-size"), "1")
+            self.assertEqual(prefill["env"]["SGLANG_PP_LAYER_PARTITION"], "8,13")
+            self.assertIsNone(flag(prefill, "--speculative-algorithm"))
+        for decode in workers[2:]:
+            self.assertEqual(flag(decode, "--tp-size"), "2")
+            self.assertEqual(flag(decode, "--speculative-algorithm"), "DSPARK")
+        for worker in workers:
+            self.assertEqual(worker["env"]["SGLANG_OPT_DSV41_CED_SPLIT"], "1")
+        router = plan["router"]["command"]
+        self.assertEqual(router[router.index("--prefill-policy") + 1], "manual")
+        self.assertEqual(router[router.index("--decode-policy") + 1], "manual")
+        # Both encoder stages share one pool; the heavier 8-20 stage sets it.
+        prefill = plan["memory"]["per_rank"]["prefill"]
+        stages = prefill["stages"]
+        self.assertEqual([s["layers"] for s in stages], ["0-7", "8-20"])
+        self.assertEqual(prefill["max_pool_tokens"], stages[1]["max_pool_tokens"])
+        self.assertLess(stages[1]["free_gib"], stages[0]["free_gib"])
+        self.assertEqual(
+            flag(workers[0], "--max-total-tokens"), str(prefill["max_pool_tokens"])
+        )
+        # 32 GiB per stage rank, two stages, two workers.
+        self.assertEqual(plan["memory"]["hicache_host_gib_all_prefill"], 128.0)
+        args.prefill_pp_partition = "14,7"
+        with self.assertRaisesRegex(ValueError, "default 8,13 partition"):
+            launch.pool_estimate(args, "prefill", 2)
+
     def test_hicache_size_replaces_the_ratio_and_counts_against_host_ram(self):
         plan = launch.build_plan(self.args("--prefill-hicache-size-gib", "96"))
         command = plan["workers"][0]["command"]
