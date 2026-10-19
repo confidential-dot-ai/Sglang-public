@@ -648,27 +648,6 @@ class TestMergeBatch(CustomTestCase):
         self.assertTrue(info1.has_custom_logit_processor)
         self.assertEqual(len(info1.custom_params), 2)
 
-    def test_merge_tolerates_none_penalizer_orchestrator(self):
-        """copy_for_forward() copies always carry penalizer_orchestrator=None
-        (deliberately dropped, penalties pre-accumulated) -- merging two such
-        forward copies inside run_batch's _forward_isolation must not
-        dereference the None, same tolerance idiom as filter_batch/apply."""
-        info1 = _make_info(batch_size=1, penalizer_orchestrator=None)
-        info2 = _make_info(batch_size=1, penalizer_orchestrator=None)
-        info1.merge_batch(info2)  # must not raise
-        self.assertEqual(len(info1), 2)
-        self.assertIsNone(info1.penalizer_orchestrator)
-
-    def test_merge_with_orchestrators_still_merges_them(self):
-        """The guard must not silently skip the merge when both sides DO
-        carry orchestrators (the scheduler-side lifecycle)."""
-        info1 = _make_info(batch_size=1)
-        info2 = _make_info(batch_size=1)
-        info1.merge_batch(info2)
-        info1.penalizer_orchestrator.merge.assert_called_once_with(
-            info2.penalizer_orchestrator
-        )
-
     def test_merge_with_none_sampling_seed(self):
         """Test that merge preserves None when both sampling_seeds are None."""
         info1 = _make_info(batch_size=1)

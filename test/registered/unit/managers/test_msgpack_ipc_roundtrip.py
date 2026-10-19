@@ -124,7 +124,6 @@ REGISTRY_TYPE_INSTANCES = {
         server_args={
             "pp_max_micro_batch_size": 4,
             "speculative_accept_threshold_acc": 0.5,
-            "ced_tail_options": {"batch_size": 8, "late_graph": True},
         }
     ),
     "SetInternalStateReqOutput": SetInternalStateReqOutput(updated=True),
@@ -153,29 +152,6 @@ NARROWED_BACKUP_KEYS = ("name", "shape", "numel", "dtype", "element_size")
 
 
 class TestMsgpackIpcRoundtrip(CustomTestCase):
-    def test_extension_payload_survives_single_list_and_rebuilt_decoders(self):
-        """List IPC must preserve extension-typed fields after custom registration."""
-        from array import array
-        from typing import Any
-
-        class ExtensionRequest(msgspec.Struct, tag=True, array_like=True):
-            payload: Any
-
-        original_types = io_struct._all_types
-        try:
-            io_struct.hook_custom_types(ExtensionRequest)
-            for rebuild in (False, True):
-                if rebuild:
-                    io_struct.hook_custom_types(ExtensionRequest)
-                request = ExtensionRequest(array("q", [1, 2**40, -3]))
-                single = io_struct.msgpack_decode(io_struct.msgpack_encode(request))
-                batched = io_struct.msgpack_decode_list(io_struct.msgpack_encode_list([request]))
-                self.assertEqual(single.payload, request.payload)
-                self.assertEqual(batched[0].payload, request.payload)
-        finally:
-            io_struct._all_types = original_types
-            io_struct.hook_custom_types()
-
     def test_registry_is_empty(self):
         # `getattr(..., ())` is deliberate: the acceptance criterion for Task 4 is
         # that the symbol is *deleted*, so this asserts its absence rather than

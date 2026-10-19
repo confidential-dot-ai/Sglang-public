@@ -4,6 +4,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 import torch
+
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.layers.logits_processor import (
     LogitsProcessorOutput,
@@ -279,7 +280,6 @@ def test_sampling_clears_stale_device_output_when_observer_produces_no_state():
     )
     forward_batch = SimpleNamespace(
         sampling_info=object(),
-        forced_token_lookup=None,
         return_logprob=False,
         top_logprobs_nums=None,
         token_ids_logprobs=None,
@@ -316,7 +316,6 @@ def test_sampling_publishes_observer_output_for_the_sampled_tokens():
     logits_output = LogitsProcessorOutput(next_token_logits=torch.zeros(1, 4))
     forward_batch = SimpleNamespace(
         sampling_info=object(),
-        forced_token_lookup=None,
         return_logprob=False,
         top_logprobs_nums=None,
         token_ids_logprobs=None,
@@ -391,7 +390,6 @@ def test_sampling_without_active_observer_preserves_preprocess_override(
     logits_output = LogitsProcessorOutput(next_token_logits=torch.zeros(1, 4))
     forward_batch = SimpleNamespace(
         sampling_info=object(),
-        forced_token_lookup=None,
         return_logprob=False,
         top_logprobs_nums=None,
         token_ids_logprobs=None,
@@ -544,7 +542,6 @@ def test_pdmux_split_prefill_schedules_auxiliary_output_copy():
         split_index=0,
         reqs=[],
         req_pool_indices=torch.tensor([3]),
-        req_pool_indices_cpu=torch.tensor([3]),
         input_ids=torch.tensor([5]),
         extend_num_tokens=1,
         return_logprob=False,
@@ -601,7 +598,6 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
         side_effect=SchedulerBatchResultProcessor.snapshot_auxiliary_output_starts
     )
     processor = SimpleNamespace(
-        _wait_result_copy=SchedulerBatchResultProcessor._wait_result_copy,
         move_logprobs_to_cpu=Mock(),
         consume_auxiliary_output=Mock(),
         snapshot_auxiliary_output_starts=snapshot_auxiliary_output_starts,
@@ -643,7 +639,6 @@ def test_logprob_only_reuses_preprocessing_without_observer_lifecycle():
     sampling_info = object()
     forward_batch = SimpleNamespace(
         sampling_info=sampling_info,
-        forced_token_lookup=None,
         top_logprobs_nums=None,
         token_ids_logprobs=[1],
     )
@@ -682,7 +677,6 @@ def test_pipeline_parallel_auxiliary_output_round_trip():
         spec_algorithm=SpeculativeAlgorithm.NONE,
         return_logprob=False,
         req_pool_indices=torch.tensor([3]),
-        req_pool_indices_cpu=torch.tensor([3]),
         input_ids=torch.tensor([5]),
     )
 
@@ -729,7 +723,6 @@ def test_pipeline_parallel_dsa_seed_round_trip(dsa_topk_indices):
         spec_algorithm=SpeculativeAlgorithm.EAGLE3,
         return_logprob=False,
         req_pool_indices=torch.tensor([3]),
-        req_pool_indices_cpu=torch.tensor([3]),
         input_ids=torch.tensor([5]),
         spec_info=None,
     )
@@ -771,7 +764,6 @@ def test_pipeline_parallel_auxiliary_output_stays_packed_before_first_rank():
         spec_algorithm=SpeculativeAlgorithm.NONE,
         return_logprob=False,
         req_pool_indices=torch.tensor([3]),
-        req_pool_indices_cpu=torch.tensor([3]),
         input_ids=torch.tensor([5]),
     )
     tensors = Scheduler._pp_prepare_tensor_dict(

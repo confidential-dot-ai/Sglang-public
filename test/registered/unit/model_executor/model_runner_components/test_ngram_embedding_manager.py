@@ -12,7 +12,6 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.model_executor.model_runner_components.ngram_embedding_manager import (  # noqa: E402
-    NgramEmbeddingManager,
     update_ngram_token_table_after_sampling,
 )
 
@@ -123,44 +122,6 @@ class TestNgramTokenTableUpdate(CustomTestCase):
             torch.equal(info.out_req_lens, torch.ones(3, dtype=torch.int32))
         )
         self.assertIsNone(kwargs["ignore_tokens"])
-
-
-class TestEngramPDHistory(CustomTestCase):
-    def test_pd_handoff_seeds_predecessors_without_sampled_anchor(self):
-        # A decode instance never ran EXTEND; stale slot contents must be replaced
-        # using the prompt and the outputs carried across the PD boundary.
-        history = torch.full((4, 3), -99, dtype=torch.int32)
-        manager = NgramEmbeddingManager(
-            enabled=False,
-            table=None,
-            n=0,
-            engram_hasher=SimpleNamespace(max_ngram_size=4, history=history),
-        )
-        requests = [
-            SimpleNamespace(
-                origin_input_ids=[10, 11, 12, 13],
-                output_ids=[14],
-                kv=SimpleNamespace(req_pool_idx=2),
-            ),
-            SimpleNamespace(
-                origin_input_ids=[20],
-                output_ids=[21],
-                kv=SimpleNamespace(req_pool_idx=0),
-            ),
-        ]
-        batch = SimpleNamespace(
-            forward_mode=SimpleNamespace(is_prebuilt=lambda: True), reqs=requests
-        )
-        manager.prepare_for_forward(batch, chunked_req=None)
-        self.assertEqual(history[2].tolist(), [11, 12, 13])
-        self.assertEqual(history[0].tolist(), [0, 0, 20])
-        self.assertEqual(history[1].tolist(), [-99, -99, -99])
-
-        # Rebootstrap after retraction must include prior generated tokens, but
-        # still exclude the new boundary token that will be fed into decode.
-        requests[0].output_ids = [14, 15, 16]
-        manager.prepare_for_forward(batch, chunked_req=None)
-        self.assertEqual(history[2].tolist(), [13, 14, 15])
 
 
 if __name__ == "__main__":

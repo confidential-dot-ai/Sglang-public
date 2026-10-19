@@ -248,59 +248,6 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
             hidden_only_proxy["hidden_states"],
         )
 
-    def test_single_pass_mhc_coefficients_survive_pp_graph_replay(self):
-        """Later PP stages must consume the preceding stage's mixing coefficients."""
-        buffers = PrefillInputBuffers.create(
-            device=torch.device("cpu"),
-            max_bs=1,
-            max_num_tokens=4,
-            cache_loc_dtype=torch.int64,
-            is_multimodal=False,
-            hidden_size=8,
-            dtype=torch.bfloat16,
-            enable_mamba_track=False,
-            pp_size=2,
-            hc_hidden_size=32,
-            pp_prev_pre_size=4,
-        )
-        registry = build_prefill_registry(
-            device=torch.device("cpu"),
-            max_bs=1,
-            max_num_token=4,
-            cache_loc_dtype=torch.int64,
-            share_pool=False,
-            source=buffers,
-        )
-        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
-        runner.buffers = buffers
-        runner.model_runner = SimpleNamespace(
-            pp_group=SimpleNamespace(is_first_rank=False)
-        )
-        captured = runner._capture_pp_proxy_tensors(4)
-        values = torch.arange(3)
-        for offset in (1.0, 2.0):
-            coefficients = torch.arange(12, dtype=torch.float32).reshape(3, 4) + offset
-            proxy = PPProxyTensors(
-                {
-                    "hidden_states": torch.ones(3, 32, dtype=torch.bfloat16),
-                    "prev_pre": coefficients,
-                }
-            )
-            registry.fill_from(
-                SimpleNamespace(
-                    input_ids=values, positions=values, out_cache_loc=values
-                ),
-                raw_bs=1,
-                padded_bs=1,
-                raw_num_tokens=3,
-                padded_num_tokens=4,
-                pp_proxy_tensors=proxy,
-            )
-            torch.testing.assert_close(captured["prev_pre"][:3], coefficients)
-            self.assertEqual(captured["prev_pre"][3].count_nonzero().item(), 0)
-            self.assertEqual(captured["hidden_states"].shape, (4, 32))
-            self.assertEqual(captured["prev_pre"].dtype, torch.float32)
-
     def test_layer_model_kwargs_bind_optional_inputs_by_signature(self):
         def proxy_before_embeds(a, b, c, pp_proxy_tensors=None, inputs_embeds=None):
             pass

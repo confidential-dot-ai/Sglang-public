@@ -3,23 +3,18 @@ import io
 import sys
 import unittest
 from array import array
-from types import SimpleNamespace
 from unittest import mock
-from unittest.mock import MagicMock, patch
 
 import torch
 from PIL import Image
 
 from sglang.srt.utils.common import (
     _get_device_sm_via_nvml,
-    _gpu_proc_affinity_cpu_ids,
     _load_image,
-    _set_process_thread_cpu_affinity,
     flatten_arrays_to_int64_tensor,
     freeze_gc,
     get_device_sm_nvidia_smi,
     get_nvidia_driver_version_str,
-    set_gpu_proc_affinity,
 )
 from sglang.test.ci.ci_register import (
     register_amd_ci,
@@ -31,128 +26,6 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=5, stage="stage-b", runner_config="1-gpu-small-amd")
-
-
-class TestGpuProcessAffinity(unittest.TestCase):
-    def test_process_binding_reads_runtime_topology(self):
-        process = MagicMock()
-        with (
-            patch(
-                "sglang.srt.utils.common.get_parallel",
-                return_value=SimpleNamespace(
-                    pp_size=1,
-                    tp_size=4,
-                    nnodes=1,
-                ),
-            ),
-            patch("sglang.srt.utils.common.psutil.Process", return_value=process),
-            patch("sglang.srt.utils.common.psutil.cpu_count", return_value=96),
-            patch.dict(
-                "os.environ",
-                {
-                    "SGLANG_CPU_AFFINITY_MODE": "contiguous",
-                    "SGLANG_CPU_AFFINITY_ALL_THREADS": "0",
-                    "SGLANG_CPU_AFFINITY_WORLD_SIZE": "0",
-                    "SGLANG_CPU_AFFINITY_RANK_OFFSET": "0",
-                },
-            ),
-        ):
-            set_gpu_proc_affinity(2)
-        self.assertEqual(
-            process.cpu_affinity.call_args_list[0], mock.call(list(range(48, 72)))
-        )
-
-    def test_contiguous_mode_preserves_existing_layout(self):
-        cpu_ids = _gpu_proc_affinity_cpu_ids(
-            pp_size=1,
-            tp_size=4,
-            nnodes=1,
-            gpu_id=2,
-            total_pcores=96,
-            logical_cpus=96,
-            mode="contiguous",
-        )
-        self.assertEqual(cpu_ids, list(range(48, 72)))
-
-    def test_strided_mode_spans_all_cores(self):
-        cpu_ids = _gpu_proc_affinity_cpu_ids(
-            pp_size=1,
-            tp_size=4,
-            nnodes=1,
-            gpu_id=2,
-            total_pcores=96,
-            logical_cpus=96,
-            mode="strided",
-        )
-        self.assertEqual(cpu_ids, list(range(2, 96, 4)))
-
-    def test_strided_mode_supports_multiple_server_processes(self):
-        cpu_ids = _gpu_proc_affinity_cpu_ids(
-            pp_size=1,
-            tp_size=4,
-            nnodes=1,
-            gpu_id=2,
-            total_pcores=96,
-            logical_cpus=96,
-            mode="strided",
-            affinity_world_size=8,
-            rank_offset=4,
-        )
-        self.assertEqual(cpu_ids, list(range(6, 96, 8)))
-
-    def test_strided_mode_includes_hyperthreads(self):
-        cpu_ids = _gpu_proc_affinity_cpu_ids(
-            pp_size=1,
-            tp_size=4,
-            nnodes=1,
-            gpu_id=1,
-            total_pcores=48,
-            logical_cpus=96,
-            mode="strided",
-        )
-        lower = list(range(1, 48, 4))
-        self.assertEqual(cpu_ids, lower + [cpu_id + 48 for cpu_id in lower])
-
-    def test_unknown_mode_is_rejected(self):
-        with self.assertRaisesRegex(
-            ValueError, "expected 'contiguous' or 'strided'"
-        ):
-            _gpu_proc_affinity_cpu_ids(
-                pp_size=1,
-                tp_size=4,
-                nnodes=1,
-                gpu_id=0,
-                total_pcores=96,
-                logical_cpus=96,
-                mode="typo",
-            )
-
-    def test_all_thread_mode_sets_every_tid(self):
-        process = MagicMock()
-        process.threads.return_value = [
-            SimpleNamespace(id=101),
-            SimpleNamespace(id=102),
-            SimpleNamespace(id=103),
-        ]
-        observed = {}
-
-        def set_affinity(thread_id, cpu_ids):
-            observed[thread_id] = set(cpu_ids)
-
-        def get_affinity(thread_id):
-            return observed.get(thread_id, set())
-
-        with (
-            patch("os.sched_setaffinity", side_effect=set_affinity),
-            patch("os.sched_getaffinity", side_effect=get_affinity),
-        ):
-            count = _set_process_thread_cpu_affinity(process, [1, 5, 9])
-
-        self.assertEqual(count, 3)
-        self.assertEqual(
-            observed,
-            {101: {1, 5, 9}, 102: {1, 5, 9}, 103: {1, 5, 9}},
-        )
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")

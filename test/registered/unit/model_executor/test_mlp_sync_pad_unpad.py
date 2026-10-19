@@ -192,36 +192,6 @@ class TestMlpSyncPadUnpad(CustomTestCase):
             pad_tensor_to_size(torch.tensor([1]), 2), torch.tensor([1, 0])
         )
 
-    def test_compact_sum_token_bucket_does_not_shrink_request_batch(self):
-        spec_info = SimpleNamespace(
-            num_tokens_per_req=9,
-            ragged_verify_layout=SimpleNamespace(graph_num_tokens=18),
-            is_draft_input=lambda: False,
-        )
-        fb = ForwardBatch(
-            forward_mode=ForwardMode.TARGET_VERIFY,
-            batch_size=8,
-            input_ids=torch.arange(18),
-            req_pool_indices=torch.arange(8),
-            seq_lens=torch.arange(8),
-            out_cache_loc=torch.arange(18),
-            seq_lens_sum=28,
-            positions=torch.arange(18),
-            seq_lens_cpu=torch.arange(8),
-            spec_info=spec_info,
-        )
-
-        # 18 // static_width would be 2 and make request-metadata padding use
-        # a negative length. Ragged layout cardinality remains the real 8.
-        bs = fb._spec_mlp_sync_batch_size(num_tokens=18)
-        self.assertEqual(bs, 8)
-        fb._pad_inputs_to_size(_mock_model_runner(), num_tokens=18, bs=bs)
-        self.assertEqual(fb.req_pool_indices.shape[0], 8)
-        self.assertEqual(fb.seq_lens.shape[0], 8)
-
-        spec_info.ragged_verify_layout = None
-        self.assertEqual(fb._spec_mlp_sync_batch_size(num_tokens=18), 2)
-
     def test_dp_cuda_graph_batch_size_uses_raw_request_counts(self):
         fb = SimpleNamespace(original_global_num_tokens_cpu=[3, 11, 7])
         self.assertEqual(DecodeCudaGraphRunner._max_dp_batch_size(fb), 11)

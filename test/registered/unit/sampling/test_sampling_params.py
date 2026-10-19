@@ -361,42 +361,6 @@ class TestSamplingParamsVerify(CustomTestCase):
             with self.subTest(grammar=grammar):
                 self._make(**{grammar: value}).verify(self.VOCAB_SIZE)
 
-    # --- forced_token_ids (oracle mode) ---
-    def test_forced_token_ids_valid_passes(self):
-        """Test that a forced_token_ids list within vocab and max_new_tokens is accepted."""
-        sp = self._make(forced_token_ids=[1, 2, 3], max_new_tokens=10)
-        sp.verify(self.VOCAB_SIZE)
-
-    def test_forced_token_ids_empty_list_raises(self):
-        """Test that an empty forced_token_ids list is rejected (use None to disable)."""
-        sp = self._make(forced_token_ids=[], max_new_tokens=10)
-        with self.assertRaises(ValueError):
-            sp.verify(self.VOCAB_SIZE)
-
-    def test_forced_token_ids_out_of_vocab_raises(self):
-        """Test that a forced token id >= vocab_size is rejected."""
-        sp = self._make(forced_token_ids=[self.VOCAB_SIZE], max_new_tokens=10)
-        with self.assertRaises(ValueError):
-            sp.verify(self.VOCAB_SIZE)
-
-    def test_forced_token_ids_negative_raises(self):
-        """Test that a negative forced token id is rejected."""
-        sp = self._make(forced_token_ids=[-1], max_new_tokens=10)
-        with self.assertRaises(ValueError):
-            sp.verify(self.VOCAB_SIZE)
-
-    def test_forced_token_ids_exceeds_max_new_tokens_raises(self):
-        """Test that forced_token_ids longer than max_new_tokens is rejected --
-        the forced sequence must fully fit within the requested generation length."""
-        sp = self._make(forced_token_ids=[1, 2, 3], max_new_tokens=2)
-        with self.assertRaises(ValueError):
-            sp.verify(self.VOCAB_SIZE)
-
-    def test_forced_token_ids_equals_max_new_tokens_valid(self):
-        """Test that forced_token_ids exactly filling max_new_tokens is accepted."""
-        sp = self._make(forced_token_ids=[1, 2, 3], max_new_tokens=3)
-        sp.verify(self.VOCAB_SIZE)
-
 
 class TestSamplingParamsNormalize(CustomTestCase):
     def _mock_tokenizer(self, encode_map=None):

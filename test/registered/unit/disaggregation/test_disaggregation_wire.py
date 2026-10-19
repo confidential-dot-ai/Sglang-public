@@ -1,7 +1,6 @@
 import concurrent.futures
 import struct
 import threading
-from array import array
 import unittest
 from collections import defaultdict
 from types import SimpleNamespace
@@ -29,11 +28,7 @@ from sglang.srt.disaggregation.common.utils import (
     unpack_int_lists,
     unpack_list_of_buffers,
 )
-from sglang.srt.disaggregation.decode import (
-    DecodeRequest,
-    DecodeTransferQueue,
-    SchedulerDisaggregationDecodeMixin,
-)
+from sglang.srt.disaggregation.decode import DecodeRequest, DecodeTransferQueue
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
@@ -69,7 +64,6 @@ from sglang.srt.mem_cache.qsa_kv_pool import (
     QSA_ROPE_STATE_LAYER_ID,
     QSATokenToKVPool,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_mask import SamplingMaskRows
 from sglang.srt.speculative.eagle_disaggregation import (
@@ -706,104 +700,6 @@ class TestDisaggregationWire(unittest.TestCase):
         self.assertEqual(batch.extend_num_tokens, 3)
         self.assertTrue(torch.equal(batch.out_cache_loc, torch.tensor([2, 3, 4])))
         req.get_fill_ids.assert_not_called()
-
-    def test_draft_kv_recompute_forwards_the_prebuilt_prompt_tokens(self):
-        """The DFlash/DSpark draft-KV recompute runs a PREBUILT batch as an EXTEND;
-        it crashed on the first PD request once PREBUILT stopped carrying input_ids."""
-        req = SimpleNamespace(
-            prefix_indices=[0, 1],
-            get_fill_ids=lambda: array("q", [10, 11, 12, 13, 14]),
-        )
-        batch = SimpleNamespace(
-            reqs=[req, req],
-            extend_lens=[3, 3],
-            device="cpu",
-            forward_mode=ForwardMode.PREBUILT,
-            input_ids=None,
-        )
-        seen = []
-
-        def forward(forward_batch):
-            seen.append((forward_batch.forward_mode, forward_batch.input_ids))
-
-        scheduler = SimpleNamespace(
-            model_worker=SimpleNamespace(forward_batch_generation=forward)
-        )
-        with patch.object(torch.cuda, "synchronize"):
-            SchedulerDisaggregationDecodeMixin._recompute_dflash_draft_kv_inplace(
-                scheduler, batch
-            )
-
-        [(mode, input_ids)] = seen
-        self.assertEqual(mode, ForwardMode.EXTEND)
-        self.assertEqual(input_ids.tolist(), [12, 13, 14, 12, 13, 14])
-        # Decode merge keeps rebuilding a PREBUILT batch's input_ids from the relay.
-        self.assertEqual(batch.forward_mode, ForwardMode.PREBUILT)
-        self.assertIsNone(batch.input_ids)
-
-    def test_dsv41_dspark_decode_keeps_the_transferred_kv(self):
-        """V4.1 DSpark PD must not rerun the prompt on decode: that overwrote the
-        transferred KV and broke retrieval beyond the sliding window."""
-        for is_dsv41_dspark, recomputed in ((True, False), (False, True)):
-            batch = Mock(reqs=[Mock()])
-            batch.is_empty.return_value = False
-            scheduler = SimpleNamespace(
-                _get_new_prebuilt_batch=lambda running_batch: batch,
-                _verify_kv_checksums=Mock(),
-                ngram_embedding_manager=Mock(),
-                chunked_req=None,
-                spec_algorithm=SimpleNamespace(
-                    is_dflash_family=lambda: True, is_dspark=lambda: True
-                ),
-                server_args=SimpleNamespace(enable_dp_attention=False),
-                token_to_kv_pool_allocator=Mock(),
-                _materialize_dflash_draft_kv_for_prebuilt=Mock(),
-                future_map=Mock(),
-            )
-            with patch(
-                "sglang.srt.disaggregation.decode.dsv4_needs_rebootstrap",
-                return_value=is_dsv41_dspark,
-            ):
-                out = SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch(
-                    scheduler, running_batch=Mock()
-                )
-            self.assertIs(out, batch)
-            self.assertEqual(
-                scheduler._materialize_dflash_draft_kv_for_prebuilt.called, recomputed
-            )
-            batch.process_prebuilt.assert_called_once_with(scheduler.future_map)
-
-    def test_oracle_forced_requests_skip_the_draft_kv_recompute(self):
-        """Forced requests commit oracle tokens regardless of the draft, so their
-        full-prompt recompute is skipped (it OOMed decode under concurrent long
-        prompts); unforced requests in the same batch are still recomputed."""
-
-        def req(forced):
-            return SimpleNamespace(
-                sampling_params=SimpleNamespace(forced_token_ids=forced)
-            )
-
-        forced, unforced = req([1, 2]), req(None)
-        scheduler = SimpleNamespace(
-            scheduler_stage_metrics=None,
-            _recompute_dflash_draft_kv_inplace=Mock(),
-            _recompute_dflash_draft_kv_for_reqs=Mock(),
-        )
-        materialize = (
-            SchedulerDisaggregationDecodeMixin._materialize_dflash_draft_kv_for_prebuilt
-        )
-        with envs.SGLANG_ORACLE_FIXED_COMMIT_LEN.override(6):
-            materialize(scheduler, SimpleNamespace(reqs=[forced, forced]))
-            scheduler._recompute_dflash_draft_kv_for_reqs.assert_not_called()
-            materialize(scheduler, SimpleNamespace(reqs=[forced, unforced]))
-            scheduler._recompute_dflash_draft_kv_for_reqs.assert_called_once_with(
-                [unforced]
-            )
-            scheduler._recompute_dflash_draft_kv_inplace.assert_not_called()
-        # Without oracle commits every request keeps its draft KV.
-        batch = SimpleNamespace(reqs=[forced, unforced])
-        materialize(scheduler, batch)
-        scheduler._recompute_dflash_draft_kv_inplace.assert_called_once_with(batch)
 
     def test_list_of_buffers_roundtrip(self):
         bufs = [b"abc", b"", b"de", b"x" * 17]
@@ -2407,7 +2303,6 @@ def _make_dsv4_target(*, unified, mapping=None):
     pool.unified_swa_ring_size = 131
     pool.unified_swa_pages = 524
     pool.get_state_buf_infos = lambda: _buf_infos(11)
-    pool.get_state_layer_ids = lambda: [0]
     pool.get_unified_swa_ring_buf_infos = lambda: (
         _buf_infos(12) if unified else ([], [], [])
     )

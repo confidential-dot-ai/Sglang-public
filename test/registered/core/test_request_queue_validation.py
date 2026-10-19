@@ -70,9 +70,7 @@ class TestMaxQueuedRequests(CustomTestCase):
         )
         self.assertLessEqual(status_codes.count(200), 2)
 
-        # Shed requests answer 429, not 503: queue-full is rate limiting, and
-        # the provider API contract requires the client to be told so.
-        # expected_status_codes = [200, 200, 429, 429, 429, 429, 429, 429, 429, 429]
+        # expected_status_codes = [200, 200, 503, 503, 503, 503, 503, 503, 503, 503]
         # self.assertEqual(status_codes, expected_status_codes)
 
     def test_max_running_requests_and_max_queued_request_validation(self):

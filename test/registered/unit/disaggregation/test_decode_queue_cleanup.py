@@ -132,10 +132,6 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.queue = [decode_req]
         queue.pending_reqs = []
         queue.retracted_queue = []
-        # num_tokens_pre_allocated (read inside pop_preallocated's admission
-        # loop) sums extend_range.length over transfer_queue.queue -- empty
-        # here since these tests exercise prealloc-queue abort, not transfer.
-        queue.transfer_queue = SimpleNamespace(queue=[])
         queue._resolve_pending_reqs = MagicMock()
         queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
         # `_uses_swa_reservation` consults the allocator once tail prealloc is
@@ -195,10 +191,6 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.queue = [decode_req]
         queue.pending_reqs = [decode_req]  # same object, dual ownership
         queue.retracted_queue = []
-        # num_tokens_pre_allocated (read inside pop_preallocated's admission
-        # loop) sums extend_range.length over transfer_queue.queue -- empty
-        # here since these tests exercise prealloc-queue abort, not transfer.
-        queue.transfer_queue = SimpleNamespace(queue=[])
         queue._resolve_pending_reqs = MagicMock()
         queue._update_handshake_waiters = MagicMock()
         queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
@@ -248,7 +240,6 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.pp_size = 1
         queue.queue = [decode_req]
         queue.pending_reqs = [decode_req]
-        queue.transfer_queue = SimpleNamespace(queue=[])
         queue.retracted_queue = []
         queue.num_reserved_decode_tokens = 0
         queue._resolve_pending_reqs = MagicMock()
@@ -282,7 +273,6 @@ class TestDecodeQueueCleanup(CustomTestCase):
 
         scheduler = MagicMock()
         scheduler.running_batch.reqs = []
-        scheduler.max_total_num_tokens = 1024
         scheduler.enable_priority_scheduling = False
         scheduler.enable_hisparse = False
         scheduler.enable_lora = False

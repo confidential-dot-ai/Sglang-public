@@ -38,7 +38,6 @@ from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
     topk_transform_packed_v2,
     topk_transform_paged_v2,
-    topk_transform_paged_v2_with_histogram,
     topk_transform_ragged_v2,
 )
 from sglang.srt.utils import is_hip
@@ -208,72 +207,6 @@ def _run_dual(scores, seq_lens, page_table, inv_cpu, k):
     transformed_raw = [_invert(out_cpu[i], inv_cpu[i]) for i in range(batch)]
     direct_raw = [[v for v in raw_cpu[i] if v != -1] for i in range(batch)]
     return transformed_raw, direct_raw
-
-
-def _coarse_histogram_10(scores: torch.Tensor, seq_lens: torch.Tensor) -> torch.Tensor:
-    """Torch construction of extract_coarse_bin<10> for producer ABI tests."""
-    bits = scores.half().view(torch.int16).to(torch.int32) & 0xFFFF
-    ordered = torch.where(
-        (bits & 0x8000) != 0,
-        (~bits) & 0xFFFF,
-        bits | 0x8000,
-    )
-    bins = ordered >> 6
-    valid = torch.arange(scores.shape[1], device=scores.device)[None, :] < seq_lens[
-        :, None
-    ]
-    hist = torch.zeros(scores.shape[0], 1024, dtype=torch.int32, device=scores.device)
-    hist.scatter_add_(1, bins, valid.to(torch.int32))
-    return hist
-
-
-@pytest.mark.parametrize(
-    "batch,seq", [(4, 1024), (8, 16385), (4, 131072), (64, 131072)]
-)
-@torch.inference_mode()
-def test_topk_v2_precomputed_histogram(batch: int, seq: int) -> None:
-    """Producer histogram skips phase 1 without changing exact selected sets."""
-    k = 2048
-    torch.manual_seed(batch * 1009 + seq)
-    device = "cuda"
-    scores = torch.randn(batch, (seq + 3) // 4 * 4, dtype=torch.float32, device=device)[:, :seq]
-    # Exercise forced-token infinities and ragged histogram counts.
-    scores[:, :4] = float("inf")
-    seq_lens = torch.linspace(seq // 2, seq, batch, device=device).to(torch.int32)
-    page_table, _ = _make_page_table(
-        batch, (seq + PAGE_SIZE - 1) // PAGE_SIZE, "identity", device
-    )
-    histogram = _coarse_histogram_10(scores, seq_lens)
-    assert torch.equal(histogram.sum(1), seq_lens)
-
-    plan = plan_topk_v2(seq_lens)
-    raw_control = torch.full((batch, k), -1, dtype=torch.int32, device=device)
-    raw_fused = torch.full_like(raw_control, -1)
-    out_control = torch.full_like(raw_control, -1)
-    out_fused = torch.full_like(raw_control, -1)
-    topk_transform_paged_v2(
-        scores, seq_lens, page_table, out_control, PAGE_SIZE, plan, raw_control
-    )
-    with pytest.raises(RuntimeError, match="precomputed histogram requires a page table"):
-        topk_transform_paged_v2_with_histogram(
-            scores, histogram, seq_lens, None, out_fused, PAGE_SIZE, plan
-        )
-    topk_transform_paged_v2_with_histogram(
-        scores,
-        histogram,
-        seq_lens,
-        page_table,
-        out_fused,
-        PAGE_SIZE,
-        plan,
-        raw_fused,
-    )
-    torch.cuda.synchronize()
-    for control, fused in zip(raw_control.cpu().tolist(), raw_fused.cpu().tolist()):
-        assert set(control) == set(fused)
-    torch.testing.assert_close(out_control, raw_control)
-    torch.testing.assert_close(out_fused, raw_fused)
-    assert torch.count_nonzero(histogram).item() == 0
 
 
 @pytest.mark.parametrize("page_mode", ["identity", "perm"])
