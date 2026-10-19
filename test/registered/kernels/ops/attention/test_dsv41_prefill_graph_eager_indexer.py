@@ -12,6 +12,7 @@ import msgspec
 import torch
 
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import quantize_fp4_indexer_tensor
+from sglang.srt.layers.attention.dsv4.dsv41_sparse import DeepseekV41Indexer
 from sglang.srt.layers.attention.dsv4.metadata import (
     PagedIndexerMetadata,
     expand_index_page_table,
@@ -34,7 +35,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
-HEADS, DIM, TOPK = 32, 128, 512
+HEADS, DIM, ROPE, TOPK = 32, 128, 64, 512
 KV_PAGE = 256  # the KV page size of the ratio-1 layers
 PAGE = 128  # the index-K pool page size under DeepGEMM's paged sparse logits
 TOPK_BLOCKS, BLOCK = 2048, 8  # the 16384-position candidate window
@@ -88,30 +89,37 @@ class IndexPool:
 
 
 class Indexer:
-    """Projections as lookups of the row ids that x and q_lora carry, so the
-    precomputed and the in-indexer projection are the same values."""
+    """DeepseekV41Indexer's own queries and head weights over lookup projections:
+    wq_b and weights_proj return the rows the row ids in q_lora and x carry, so
+    the scorer's fused projection and the prefill break's see the same operands."""
 
     n_heads = n_local_heads = HEADS
+    index_head_dim, rope_head_dim = DIM, ROPE
+    head_weight_scale = DIM**-0.5 * HEADS**-0.5
     index_topk = TOPK
     is_candidate_source = False
     uses_candidates = False
+    queries = DeepseekV41Indexer.queries
+    head_weights = DeepseekV41Indexer.head_weights
 
     def __init__(self, rows: int):
-        self.q = torch.randn(rows, HEADS, DIM, device="cuda", dtype=torch.bfloat16)
-        self.w = torch.rand(rows, HEADS, device="cuda").to(torch.bfloat16) * 0.1
+        self.q_raw = torch.randn(rows, HEADS * DIM, device="cuda").to(torch.bfloat16)
+        self.w_raw = torch.rand(rows, HEADS, device="cuda").to(torch.bfloat16)
         self.ids = torch.arange(rows, device="cuda")[:, None]
+        # The base batch's roped queries and head weights, set by make_batch.
+        self.q = self.w = None
+
+    def wq_b(self, q_lora):
+        return self.q_raw[q_lora[:, 0]], None
+
+    def head_weights_raw(self, x):
+        return self.w_raw[x[:, 0]]
 
     def as_layer(self, *, source: bool):
         """The same projections as the candidate source or as a consumer."""
         layer = copy.copy(self)
         layer.is_candidate_source, layer.uses_candidates = source, not source
         return layer
-
-    def queries(self, q_lora, freqs):
-        return self.q[q_lora[:, 0]]
-
-    def head_weights(self, x):
-        return self.w[x[:, 0]]
 
 
 class Batch(NamedTuple):
@@ -144,6 +152,14 @@ def make_batch(contexts, rows_per_request, seed, like=None) -> Batch:
             for ctx, n in zip(contexts, rows_per_request)
         ]
     )
+    # A shared indexer also shares the RoPE table its layers were built with.
+    if like:
+        freqs_cis = like.inputs.freqs_cis
+    else:
+        angles = torch.rand(stride, ROPE // 2, device=dev) * 2 * torch.pi
+        freqs_cis = torch.polar(torch.ones_like(angles), angles)
+        indexer.q = indexer.queries(indexer.ids[:rows], freqs_cis[positions])
+        indexer.w = indexer.head_weights(indexer.ids[:rows])
     rows_device = torch.tensor(rows_per_request, dtype=torch.int32, device=dev)
     req_rows = torch.repeat_interleave(
         torch.arange(len(contexts), device=dev), rows_device.to(torch.int64)
@@ -153,7 +169,7 @@ def make_batch(contexts, rows_per_request, seed, like=None) -> Batch:
         indexer=indexer,
         layer_id=0,
         compress_ratio=1,
-        freqs_cis=torch.zeros(stride, 1, device=dev),
+        freqs_cis=freqs_cis,
         x=indexer.ids[:rows],
         q_lora=indexer.ids[:rows],
         positions=positions,
@@ -175,7 +191,7 @@ def with_projection(batch: Batch) -> PrefillInputs:
     inputs = batch.inputs
     return msgspec.structs.replace(
         inputs,
-        q=batch.indexer.queries(inputs.q_lora, None),
+        q=batch.indexer.queries(inputs.q_lora, inputs.freqs_cis[inputs.positions]),
         weights=batch.indexer.head_weights(inputs.x),
     )
 
@@ -249,6 +265,14 @@ def captured_layer(batch: Batch) -> Selection:
         ),
     )
     return out
+
+
+def fp4_values(packed: torch.Tensor) -> torch.Tensor:
+    """Two e2m1 codes per byte as values: -0 (code 8) folds into +0, which the
+    fused projection and quantize_index_q produce for the same zero element."""
+    codes = packed.view(torch.uint8)
+    codes = torch.stack((codes & 15, codes >> 4), dim=-1)
+    return torch.where(codes == 8, 0, codes)
 
 
 def picks(selection: Selection, row: int) -> set:
@@ -368,7 +392,9 @@ class TestPrefillGraphEagerIndexer(CustomTestCase):
         handed_over = get_deep_gemm_prefill_data(inputs, batch.req_to_token)
         for name in DeepGEMMPrefillData.__struct_fields__:
             got, want = getattr(handed_over, name), getattr(projected, name)
-            if isinstance(want, torch.Tensor):
+            if name == "q_fp4":
+                self.assertTrue(torch.equal(fp4_values(got), fp4_values(want)), name)
+            elif isinstance(want, torch.Tensor):
                 self.assertTrue(torch.equal(got, want), name)
             else:
                 self.assertEqual(got, want, name)
