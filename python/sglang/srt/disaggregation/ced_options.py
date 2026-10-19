@@ -13,6 +13,10 @@ def validate_ced_options(options):
         "late_graph": ("SGLANG_DSV41_CED_TAIL_LATE_GRAPH", bool, 0, 1),
         "graph_check_every": ("SGLANG_DSV41_CED_TAIL_GRAPH_CHECK_EVERY", bool, 0, 1),
         "graph_check": ("SGLANG_DSV41_CED_TAIL_GRAPH_CHECK", bool, 0, 1),
+        # Decode's use of the boundary handoff; both workers must start with it on
+        # so the metadata slots carry the state.
+        "boundary_handoff": ("SGLANG_OPT_DSV41_CED_BOUNDARY_HANDOFF", bool, 0, 1),
+        "boundary_check": ("SGLANG_DSV41_CED_BOUNDARY_CHECK", bool, 0, 1),
     }
     result = {}
     for key, value in options.items():
