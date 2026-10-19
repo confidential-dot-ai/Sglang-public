@@ -1711,6 +1711,12 @@ class Envs:
     # Shorter prompts use the single-call encode; below this the gain is eaten
     # by rayon dispatch and the id merge.
     SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS = EnvInt(32768)
+    # Reuse a cached chat prompt's ids for the prefix a new prompt shares with it.
+    SGLANG_OPT_PREFIX_PROMPT_ENCODE = EnvBool(False)
+    # Per tokenizer process; one entry per active conversation (~0.5 MB at 38K tokens).
+    SGLANG_PREFIX_PROMPT_ENCODE_CACHE_MB = EnvInt(256)
+    # Also run the full encode and fall back to it on any difference.
+    SGLANG_DEBUG_PREFIX_PROMPT_ENCODE_VERIFY = EnvBool(False)
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
     SGLANG_DEFAULT_THINKING = EnvBool(False)
 

@@ -49,6 +49,9 @@ from sglang.srt.entrypoints.openai import (
 from sglang.srt.entrypoints.openai.parallel_prompt_encode import (
     parallel_prompt_encode,
 )
+from sglang.srt.entrypoints.openai.prefix_prompt_encode import (
+    maybe_create_prefix_prompt_encoder,
+)
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageContentTextPart,
     ChatCompletionMessageContentVideoPart,
@@ -398,6 +401,20 @@ class OpenAIServingChat(OpenAIServingBase):
         self._prompt_text_round_trip_is_lossy = self._probe_prompt_text_round_trip()
         self._chat_template_cache: OrderedDict[bytes, tuple[tuple[int, ...], str]] = (
             OrderedDict()
+        )
+        self._prefix_prompt_encoder = maybe_create_prefix_prompt_encoder(
+            self.tokenizer_manager.tokenizer
+        )
+
+    def _encode_rendered_prompt(
+        self, text: str, encode_kwargs: Optional[dict] = None
+    ) -> List[int]:
+        if self._prefix_prompt_encoder is not None:
+            return self._prefix_prompt_encoder.encode(text, encode_kwargs)
+        if encode_kwargs is None:
+            return self.tokenizer_manager.tokenizer.encode(text)
+        return parallel_prompt_encode(
+            self.tokenizer_manager.tokenizer, text, encode_kwargs
         )
 
     def _probe_prompt_text_round_trip(self) -> bool:
@@ -1755,7 +1772,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     reasoning_effort=v4_reasoning_effort,
                     reasoning_effort_profile=reasoning_effort_profile,
                 )
-                prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
+                prompt_ids = self._encode_rendered_prompt(real_input)
             elif is_dsv41:
                 if request.task is not None:
                     encoding_dsv41.attach_task_to_last_user_message(
@@ -1782,12 +1799,12 @@ class OpenAIServingChat(OpenAIServingBase):
                             self.tokenizer_manager.image_token_id
                         ),
                     )
-                prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
+                prompt_ids = self._encode_rendered_prompt(real_input)
             else:
                 real_input = encoding_dsv32.encode_messages(
                     messages, thinking_mode=thinking_mode
                 )
-                prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
+                prompt_ids = self._encode_rendered_prompt(real_input)
 
             # Append assistant prefix if continue_final_message is enabled
             if assistant_prefix:
@@ -1965,9 +1982,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 return_dict=False,
                 **template_kwargs,
             )
-            prompt_ids = parallel_prompt_encode(
-                self.tokenizer_manager.tokenizer, rendered_prompt, encode_kwargs
-            )
+            prompt_ids = self._encode_rendered_prompt(rendered_prompt, encode_kwargs)
         decoded_prompt = (
             self.tokenizer_manager.tokenizer.decode(prompt_ids)
             if cache_key is not None

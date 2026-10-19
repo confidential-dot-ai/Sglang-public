@@ -150,6 +150,8 @@ def _build_plan(tokenizer):
         from transformers import PreTrainedTokenizerBase
     except ImportError:
         return None
+    if not isinstance(tokenizer, PreTrainedTokenizerBase):
+        return None
     backend = getattr(tokenizer, "_tokenizer", None)
     if not getattr(tokenizer, "is_fast", False) or backend is None:
         return None
@@ -243,6 +245,26 @@ def split_prompt(text, pattern, npattern, intra=None, max_chunks=_MAX_CHUNKS):
     return chunks
 
 
+def split_safe_plan(tokenizer, encode_kwargs):
+    """The plan under which ``tokenizer.encode(text, **encode_kwargs)`` equals
+    the concatenated encodes of text cut at added-token ends, or None."""
+    if set(encode_kwargs) - {"add_special_tokens"}:
+        return None
+    plan = _plan_for(tokenizer)
+    if plan is None:
+        return None
+    backend, specials_added, _, _, _ = plan
+    if encode_kwargs.get("add_special_tokens", True) and specials_added:
+        return None
+    if (
+        backend.truncation is not None
+        or backend.padding is not None
+        or backend.encode_special_tokens
+    ):
+        return None
+    return plan
+
+
 def parallel_prompt_encode(tokenizer, text, encode_kwargs=None):
     """Drop-in for ``tokenizer.encode(text, **encode_kwargs)``."""
     global _parallel_ok, _parallel_pid
@@ -256,21 +278,12 @@ def parallel_prompt_encode(tokenizer, text, encode_kwargs=None):
         or not envs.SGLANG_PARALLEL_PROMPT_ENCODE.get()
         or not isinstance(text, str)
         or len(text) < envs.SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS.get()
-        or set(encode_kwargs) - {"add_special_tokens"}
     ):
         return tokenizer.encode(text, **encode_kwargs)
-    plan = _plan_for(tokenizer)
+    plan = split_safe_plan(tokenizer, encode_kwargs)
     if plan is None:
         return tokenizer.encode(text, **encode_kwargs)
-    backend, specials_added, pattern, npattern, intra = plan
-    if encode_kwargs.get("add_special_tokens", True) and specials_added:
-        return tokenizer.encode(text, **encode_kwargs)
-    if (
-        backend.truncation is not None
-        or backend.padding is not None
-        or backend.encode_special_tokens
-    ):
-        return tokenizer.encode(text, **encode_kwargs)
+    backend, _, pattern, npattern, intra = plan
     chunks = split_prompt(text, pattern, npattern, intra)
     if len(chunks) < 2:
         return tokenizer.encode(text, **encode_kwargs)
