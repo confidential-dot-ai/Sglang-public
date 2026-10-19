@@ -16,9 +16,11 @@ this test would have caught the original bug.
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
+from sglang.srt.models import deepseek_v4
 from sglang.srt.models.deepseek_v4 import DeepseekV4Model
 from sglang.srt.models.deepseek_v4_mhc import HcState
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -78,6 +80,11 @@ def _bare_model(start_layer: int, end_layer: int) -> DeepseekV4Model:
 
 
 class TestPrevPreHandoff(CustomTestCase):
+    def setUp(self):
+        # The fake layers stand in for the per-layer loop; on a CUDA host the
+        # model instead drives its layers through the residual-stream boundary.
+        self.enterContext(patch.object(deepseek_v4, "_is_cuda", False))
+
     def _run(self, model: DeepseekV4Model, hidden_states, prev_pre_in):
         return model._forward_layers_hc_pre_from_prev(
             positions=None,

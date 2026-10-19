@@ -5,11 +5,11 @@ Regression: those modes computed the attention sublayer's mHC coefficients on a
 side stream forked before the attention's eager graph break, so the coefficient
 kernels escaped the capture and replay mixed the residual streams with stale
 values: garbage prefill for every prompt padded into the 4096-token bucket, and
-decode that could not copy from context beyond the sliding window.
+decode that could not copy from context beyond the sliding window. The guard is
+`deepseek_v4_mhc.use_stats_stream`, consulted by the CUDA boundary's mHC read.
 """
 
 import unittest
-from contextlib import nullcontext
 from types import SimpleNamespace
 
 import torch
@@ -24,17 +24,10 @@ HC, HIDDEN = 4, 5120
 
 
 def _bare_layer(device):
-    """The mHC state of one V4.1 decoder layer; attention and MoE are stubbed."""
+    """The mHC state of one V4.1 decoder layer, as its CUDA boundary reads and
+    updates it; attention and MoE are stubbed."""
     from sglang.srt.layers.layernorm import RMSNorm
-    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
-        eager_on_graph,
-    )
-    from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer
-
-    @eager_on_graph(True)
-    def attention_break(x):
-        # The prefill attention runs as an eager break of the graph.
-        return x * 0.5 + 0.25
+    from sglang.srt.models import deepseek_v4_mhc as mhc
 
     gen = torch.Generator(device=device).manual_seed(0)
 
@@ -42,45 +35,63 @@ def _bare_layer(device):
         value = torch.randn(*shape, device=device, generator=gen) * scale + shift
         return nn.Parameter(value, requires_grad=False)
 
-    layer = DeepseekV4DecoderLayer.__new__(DeepseekV4DecoderLayer)
-    nn.Module.__init__(layer)
-    layer.config = SimpleNamespace(model_type="deepseek_v41")
-    layer.hc_mult = HC
-    layer.hc_sinkhorn_iters = 20
-    layer.rms_norm_eps = 1e-20
-    layer.hc_eps = 1e-6
-    layer.dsa_enable_prefill_cp = False
-    layer.hc_pre_from_prev_sublayer = True
-    layer.hc_stats_stream = torch.cuda.Stream(device)
-    for name in ("attn", "ffn"):
-        setattr(layer, f"hc_{name}_fn", param(24, HC * HIDDEN, scale=1e-2))
-        setattr(layer, f"hc_{name}_scale", param(3, scale=0.1, shift=1.0))
-        setattr(layer, f"hc_{name}_base", param(24, scale=0.1))
-        setattr(layer, f"_hc_{name}_tf32_parts", None)
-        setattr(layer, f"_hc_{name}_bf16_parts", None)
-    for name in ("input_layernorm", "post_attention_layernorm"):
+    cfg = mhc.HcConfig(
+        mult=HC,
+        sinkhorn_iters=20,
+        eps=1e-6,
+        rms_eps=1e-20,
+        hidden=HIDDEN,
+        pre_from_prev=True,
+        cp_prefill=False,
+    )
+
+    def sublayer():
         norm = RMSNorm(HIDDEN, eps=1e-20).to(device=device, dtype=torch.bfloat16)
         noise = torch.randn(HIDDEN, device=device, generator=gen)
         norm.weight.data.copy_(1 + 0.1 * noise)
-        setattr(layer, name, norm)
+        return mhc.HcSubLayer(
+            cfg,
+            param(24, HC * HIDDEN, scale=1e-2),
+            param(3, scale=0.1, shift=1.0),
+            param(24, scale=0.1),
+            norm,
+        )
 
-    class _Attention:
-        wo_b = SimpleNamespace(reduce_results=True)
-        attn_tp_size = 1
+    return SimpleNamespace(
+        boundary_pre_from_prev=True,
+        boundary_mhc_fusions=False,
+        hc_cfg=cfg,
+        hc_stats_stream=torch.cuda.Stream(device),
+        attn_hc=sublayer(),
+        ffn_hc=sublayer(),
+        self_attn=SimpleNamespace(
+            attn_tp_size=1, accepts_mxfp8_swizzled_input=lambda: False
+        ),
+        mlp=SimpleNamespace(tp_size=1),
+    )
 
-        def accepts_mxfp8_swizzled_input(self):
-            return False
 
-        def maybe_use_decode_attn_tp(self, forward_batch):
-            return nullcontext()
+def _layer_forward(layer, hidden, prev_pre, forward_batch):
+    """Both sublayers through the boundary's mHC read and update, the attention
+    as an eager break of the graph; the residual and the FFN's pre out."""
+    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+        eager_on_graph,
+    )
+    from sglang.srt.models import deepseek_v4_boundary as boundary
+    from sglang.srt.models import deepseek_v4_mhc as mhc
 
-        def __call__(self, x, positions, forward_batch, x_quant=None):
-            return attention_break(x)
+    @eager_on_graph(True)
+    def attention_break(x):
+        # The prefill attention runs as an eager break of the graph.
+        return x * 0.5 + 0.25
 
-    layer.self_attn = _Attention()
-    layer.mlp = SimpleNamespace(_shared_expert_tp1=False, tp_size=1)
-    layer._run_moe_ffn_dp_sync = lambda x, forward_batch, **_: x * 0.75
-    return layer
+    call = boundary.LayerCall()
+    state = mhc.HcState(hidden, prev_pre)
+    for attention, sublayer in ((True, attention_break), (False, lambda x: x * 0.75)):
+        read = boundary.HcRead(layer, attention).bind(forward_batch, call)
+        x, read_state = read.read(state, None)
+        state = boundary.HcUpdate(layer, attention).post(sublayer(x), read_state)
+    return state.residual, state.pre
 
 
 @unittest.skipUnless(
@@ -129,14 +140,7 @@ class TestBreakablePrefillHcStats(CustomTestCase):
             prev_pre.copy_(torch.rand(prev_pre.shape, device=device, generator=gen))
 
         def forward():
-            return layer.forward_hc_pre_from_prev(
-                positions=None,
-                hidden_states=hidden,
-                input_ids=None,
-                forward_batch=forward_batch,
-                input_ids_global=None,
-                prev_pre=prev_pre,
-            )
+            return _layer_forward(layer, hidden, prev_pre, forward_batch)
 
         load(0)
         graph = BreakableCUDAGraph()

@@ -15,6 +15,14 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 
+def setUpModule():
+    # These cover the multicast workspace; on a Confidential Computing host NVML
+    # reports CC on and ensure_workspace_initialized takes the CC IPC branch.
+    patcher = patch.object(fusion, "_cc_ipc_fusion_enabled", return_value=False)
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
+
+
 class _FakeWorkspace:
     def __init__(self, backend, world_size, dtype=torch.bfloat16):
         self.backend = backend

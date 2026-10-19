@@ -30,7 +30,6 @@ from sglang.srt.utils import get_device, is_xpu
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.deepseek_v4.common import (
     ceil_ue8m0_exp_ref,
-    fp4_e2m1_code_ref,
     make_legacy_context,
     make_state_pool,
     to_seq_extend,
@@ -53,6 +52,42 @@ PAGE_SIZE = 64
 E2M1_MAX = 6.0
 
 
+def _fp4_e2m1_code_rne_ref(x: torch.Tensor) -> torch.Tensor:
+    """E2M1 nibble of ``x`` under round-to-nearest-even, the dsv41 default:
+    midpoints round toward the even code, so every other threshold is inclusive."""
+    ax = torch.minimum(x.abs(), torch.tensor(E2M1_MAX, device=x.device))
+    idx = torch.zeros_like(ax, dtype=torch.uint8)
+    for threshold, inclusive in (
+        (0.25, False),
+        (0.75, True),
+        (1.25, False),
+        (1.75, True),
+        (2.5, False),
+        (3.5, True),
+        (5.0, False),
+    ):
+        comparison = ax >= threshold if inclusive else ax > threshold
+        idx += comparison.to(torch.uint8)
+    sign = ((x < 0) & (idx != 0)).to(torch.uint8) * 8
+    return idx | sign
+
+
+def _fold_negative_zero(packed: torch.Tensor) -> torch.Tensor:
+    """Packed e2m1 bytes with -0 (code 8) written as +0. Native PTX cvt keeps the
+    sign of a value that rounds to zero and the software path drops it; both are 0."""
+    packed = packed.view(torch.uint8)
+    lo, hi = packed & 0x0F, packed & 0xF0
+    return torch.where(lo == 0x08, 0, lo) | torch.where(hi == 0x80, 0, hi)
+
+
+def _fold_cache_negative_zero(cache: torch.Tensor) -> torch.Tensor:
+    """An index-K cache with -0 folded in the fp4 payload; scale bytes kept as is."""
+    folded = cache.clone()
+    payload = folded[:, : PAGE_SIZE * FP4_DIM]
+    payload.copy_(_fold_negative_zero(payload))
+    return folded
+
+
 def _ref_quantize_fp4_indexer(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     x = x.contiguous().view(-1, HEAD_DIM).float()
     groups = x.view(-1, SCALE_GROUPS, GROUP_SIZE)
@@ -61,7 +96,7 @@ def _ref_quantize_fp4_indexer(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tens
     scale = (scale_exp << 23).contiguous().view(torch.float32)
 
     scaled = (groups / scale.unsqueeze(-1)).view(-1, HEAD_DIM)
-    code = fp4_e2m1_code_ref(scaled)
+    code = _fp4_e2m1_code_rne_ref(scaled)
     packed = (code[:, 0::2].to(torch.int16) | (code[:, 1::2].to(torch.int16) << 4)).to(
         torch.uint8
     )
@@ -110,7 +145,7 @@ def test_quantize_fp4_indexer_tensor(num_tokens: int) -> None:
     x_fp4, x_sf = quantize_fp4_indexer_tensor(x)
     ref_fp4, ref_sf = _ref_quantize_fp4_indexer(x)
 
-    torch.testing.assert_close(x_fp4.view(torch.uint8), ref_fp4)
+    torch.testing.assert_close(_fold_negative_zero(x_fp4), ref_fp4)
     torch.testing.assert_close(x_sf, ref_sf)
 
 
@@ -210,7 +245,7 @@ def test_quantize_fp4_indexer_rounds_midpoints_to_even() -> None:
     x_fp4, x_sf = quantize_fp4_indexer_tensor(values)
     ref_fp4, ref_sf = _ref_quantize_fp4_indexer(values)
 
-    torch.testing.assert_close(x_fp4.view(torch.uint8), ref_fp4)
+    torch.testing.assert_close(_fold_negative_zero(x_fp4), ref_fp4)
     torch.testing.assert_close(x_sf, ref_sf)
 
 
@@ -233,7 +268,7 @@ def test_fp4_index_cache_store_layout(num_tokens: int) -> None:
 
     ref_fp4, ref_sf = _ref_quantize_fp4_indexer(x)
     expected = _ref_store_fp4_index_cache(ref_fp4, ref_sf, loc, num_pages)
-    torch.testing.assert_close(cache, expected)
+    torch.testing.assert_close(_fold_cache_negative_zero(cache), expected)
 
 
 @pytest.mark.parametrize("num_tokens", [1, 7, 64, 129])
@@ -321,7 +356,7 @@ def test_fp4_fused_norm_rope_store_layout(num_tokens: int) -> None:
         loc.to(torch.int64),
         num_pages,
     )
-    torch.testing.assert_close(cache, expected)
+    torch.testing.assert_close(_fold_cache_negative_zero(cache), expected)
 
 
 def test_fp4_fused_norm_rope_skips_unaligned_decode_rows() -> None:
@@ -555,7 +590,7 @@ def test_fp4_fused_q_indexer_rope_hadamard_quant(batch_size: int) -> None:
     ref_fp4 = ref_fp4.view(batch_size, num_heads, FP4_DIM)
     ref_sf = ref_sf.view(batch_size, num_heads)
 
-    torch.testing.assert_close(q_fp4.view(torch.uint8), ref_fp4)
+    torch.testing.assert_close(_fold_negative_zero(q_fp4), ref_fp4)
     torch.testing.assert_close(q_sf, ref_sf)
     torch.testing.assert_close(weights_out.squeeze(-1), weight.float() * weight_scale)
 
