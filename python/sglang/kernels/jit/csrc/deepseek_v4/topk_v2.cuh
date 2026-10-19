@@ -1402,6 +1402,117 @@ struct TopKKernel {
   }
 
   /**
+   * \brief GLM k-pool variant of `transform_paged`: top-k over per-pool scores,
+   * fused with pool expansion, tail append and the output transform.
+   *
+   * Row `b` selects the `topk` best of `scores[b, :pool_lens[b]]`, where
+   * `topk = (out.size(1) - tail_cols) / pool_size` and `tail_cols` is
+   * `pool_size - 1` when `token_seq_lens` is given, else 0. Each selected pool `g`
+   * expands to tokens `g * pool_size + [0, pool_size)`; then the
+   * `token_seq_lens[b] % pool_size` tokens of the open tail pool follow. Tokens
+   * map through `page_table` (page size `page_size`) when given, else get
+   * `out_offsets[b]` added (0 when absent); the rest of the row is `-1`.
+   *
+   * \param scores 16-byte-aligned float32 rows; width and row stride must be multiples of 4.
+   * \param pool_lens NON-NEGATIVE; `metadata` must be `plan` over these values.
+   * \param metadata Read before the PDL wait, so it must be written before the kernel
+   * that produces `scores` is launched, not between that kernel and this one.
+   */
+  static void transform_kpool(
+      const tvm::ffi::TensorView scores,
+      const tvm::ffi::TensorView pool_lens,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> token_seq_lens,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> page_table,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> out_offsets,
+      const tvm::ffi::TensorView out,
+      const uint32_t page_size,
+      const uint32_t pool_size,
+      const tvm::ffi::TensorView metadata) {
+    using namespace host;
+    auto B = SymbolicSize{"batch_size"};
+    auto L = SymbolicSize{"max_seq_len"};
+    auto S = SymbolicSize{"score_stride"};
+    auto C = SymbolicSize{"out_cols"};
+    auto O = SymbolicSize{"out_stride"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLGPU>();
+
+    TensorMatcher({B, L})  // score
+        .with_strides({S, 1})
+        .with_dtype<float>()
+        .with_device(device_)
+        .ensure_alignment(16)
+        .verify(scores);
+    TensorMatcher({B})  // pool_lens
+        .with_dtype<int32_t>()
+        .with_device(device_)
+        .verify(pool_lens);
+    TensorMatcher({B, C})  // out
+        .with_strides({O, 1})
+        .with_dtype<int32_t>()
+        .with_device(device_)
+        .verify(out);
+    TensorMatcher({-1, 2})  // metadata
+        .with_dtype<int32_t>()
+        .with_device(device_)
+        .verify(metadata);
+    const int32_t* token_seq_lens_ptr = nullptr;
+    if (token_seq_lens.has_value()) {
+      TensorMatcher({B}).with_dtype<int32_t>().with_device(device_).verify(token_seq_lens.value());
+      token_seq_lens_ptr = static_cast<const int32_t*>(token_seq_lens.value().data_ptr());
+    }
+    const int32_t* page_table_ptr = nullptr;
+    int64_t page_table_stride = 0;
+    if (page_table.has_value()) {
+      TensorMatcher({B, -1}).with_strides({-1, 1}).with_dtype<int32_t>().with_device(device_).verify(
+          page_table.value());
+      page_table_ptr = static_cast<const int32_t*>(page_table.value().data_ptr());
+      page_table_stride = page_table.value().stride(0);
+    }
+    const int32_t* out_offsets_ptr = nullptr;
+    if (out_offsets.has_value()) {
+      RuntimeCheck(!page_table.has_value(), "page_table and out_offsets are mutually exclusive");
+      TensorMatcher({B}).with_dtype<int32_t>().with_device(device_).verify(out_offsets.value());
+      out_offsets_ptr = static_cast<const int32_t*>(out_offsets.value().data_ptr());
+    }
+
+    RuntimeCheck(std::has_single_bit(page_size), "page_size must be power of 2");
+    RuntimeCheck(pool_size > 1 && std::has_single_bit(pool_size), "pool_size must be a power of 2 > 1");
+    RuntimeCheck(S.unwrap() % 4 == 0, "score_stride must be a multiple of 4 (16-byte vectorized load)");
+    CHECK_HOST(L.unwrap() % 4 == 0) << "score width must be a multiple of 4 (16-byte vectorized load)";
+    RuntimeCheck(metadata.size(0) == B.unwrap() + 1, "invalid metadata shape");
+    const auto out_cols = static_cast<uint32_t>(C.unwrap());
+    const auto tail_cols = token_seq_lens.has_value() ? pool_size - 1 : 0u;
+    RuntimeCheck(out_cols > tail_cols && (out_cols - tail_cols) % pool_size == 0, "invalid out width ", out_cols);
+    const auto topk = (out_cols - tail_cols) / pool_size;
+    RuntimeCheck(topk > 0 && topk <= kMaxTopK, "pool-level topk must be in (0, 2048]");
+
+    const auto batch_size = static_cast<uint32_t>(B.unwrap());
+    const auto params = TopKPagedParams{
+        .scores = static_cast<const float*>(scores.data_ptr()),
+        .histograms = nullptr,
+        .seq_lens = static_cast<const int32_t*>(pool_lens.data_ptr()),
+        .page_table = page_table_ptr,
+        .page_indices = static_cast<int32_t*>(out.data_ptr()),
+        .raw_indices = nullptr,
+        .metadata = static_cast<const PlanItem*>(metadata.data_ptr()),
+        .score_stride = S.unwrap(),
+        .histogram_stride = 0,
+        .page_table_stride = page_table_stride,
+        .topk = topk,
+        .page_bits = static_cast<uint32_t>(std::countr_zero(page_size)),
+        .static_cluster_floor = get_static_cluster_floor(batch_size),
+        .batch_size = batch_size,
+        .out_stride = O.unwrap(),
+        .token_seq_lens = token_seq_lens_ptr,
+        .out_offsets = out_offsets_ptr,
+        .pool_bits = static_cast<uint32_t>(std::countr_zero(pool_size)),
+        .out_cols = out_cols,
+    };
+    launch<TopKMode::KPOOL>(params, static_cast<uint32_t>(L.unwrap()), device_.unwrap());
+  }
+
+  /**
    * \brief Ragged (prefill) variant of `transform`: per-row window, additive
    * output transform, no page table and no plan.
    *
