@@ -194,14 +194,14 @@ def test_deep_gemm_fp4_paged_logits_do_not_depend_on_row_position_at_1m():
     assert torch.equal(full[-short:], tail)
 
 
-def _relocated_flash_mla(*, relocate_main: bool, relocate_extra: bool):
+def _relocated_flash_mla(*, relocate_main: bool, relocate_extra: bool, past_bits: int):
     """Sparse FlashMLA decode read from the first pages of two caches, and from
-    the same bytes copied to pages past 2^31 bytes into each cache."""
+    the same bytes copied to pages past 2^past_bits bytes into each cache."""
     import sgl_kernel.flash_mla as flash_mla
 
     heads, d_qk, d_v, bytes_per_token, page = 64, 512, 512, 584, 288
     page_bytes = page * bytes_per_token
-    big_pages = (1 << 31) // page_bytes + 64  # the last pages sit past 2^31 bytes
+    big_pages = (1 << past_bits) // page_bytes + 64  # the last pages sit past it
     low_pages, b, topk = 32, 4, 2048
     g = torch.Generator(device="cuda").manual_seed(11)
 
@@ -247,15 +247,19 @@ def _relocated_flash_mla(*, relocate_main: bool, relocate_extra: bool):
     return base, moved
 
 
+@pytest.mark.parametrize("past_bits", [31, 32], ids=["2gib", "4gib"])
 @pytest.mark.parametrize(
     "relocate_main,relocate_extra", [(True, False), (False, True)], ids=["main", "extra"]
 )
 @torch.inference_mode()
-def test_flash_mla_sparse_decode_reads_slots_past_2gib(relocate_main, relocate_extra):
-    """B300 pools put a layer's KV past 2^31 bytes: reading a slot there must
-    give exactly what the same bytes give at the bottom of the cache."""
+def test_flash_mla_sparse_decode_reads_slots_past_2gib(
+    relocate_main, relocate_extra, past_bits
+):
+    """B300 pools put a layer's KV past 2^31 bytes (and, at ~54M-token decode
+    pools, past 2^32): reading a slot there must give exactly what the same
+    bytes give at the bottom of the cache."""
     base, moved = _relocated_flash_mla(
-        relocate_main=relocate_main, relocate_extra=relocate_extra
+        relocate_main=relocate_main, relocate_extra=relocate_extra, past_bits=past_bits
     )
     assert torch.equal(base, moved)
 
