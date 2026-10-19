@@ -188,7 +188,6 @@ class TestRaggedVerifyGraphCapability(CustomTestCase):
         self.assertTrue(torch.equal(actual[3:], torch.zeros_like(actual[3:])))
 
     def test_dflash_flashinfer_geometry_caps_unassigned_token_tail(self):
-        from sglang.srt.speculative import dflash_info
         from sglang.srt.speculative.dflash_info import DFlashVerifyInput
         from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
@@ -203,25 +202,27 @@ class TestRaggedVerifyGraphCapability(CustomTestCase):
             draft_token_num=9,
             ragged_verify_layout=layout,
         )
-        fake_kernel = mock.MagicMock()
-        with mock.patch.object(
-            dflash_info, "create_flashinfer_kv_indices_triton", fake_kernel
-        ):
-            kv_indices, kv_indptr, qo_indptr, mask = (
-                spec_info.generate_attn_arg_prefill(
-                    req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
-                    paged_kernel_lens=torch.tensor([100, 200], dtype=torch.int32),
-                    paged_kernel_lens_sum=300,
-                    req_to_token=torch.zeros((2, 256), dtype=torch.int32),
-                )
-            )
+        translator = mock.MagicMock()
+        plan = object()
+        kv_indices, kv_indptr, qo_indptr, mask = spec_info.generate_attn_arg_prefill(
+            req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
+            paged_kernel_lens=torch.tensor([100, 200], dtype=torch.int32),
+            paged_kernel_lens_sum=300,
+            translator=translator,
+            plan=plan,
+        )
 
         self.assertEqual(qo_indptr.tolist(), [0, 3, 12])
         self.assertEqual(kv_indptr.tolist(), [0, 103, 312])
         self.assertEqual(kv_indices.numel(), 318)
         self.assertIsNone(mask)
-        fake_kernel.__getitem__.assert_called_once_with((2,))
-
+        # One pack over both rows, each widened by its capped verify length.
+        translator.pack_read_stream.assert_called_once()
+        call = translator.pack_read_stream.call_args
+        self.assertIs(call.args[0], plan)
+        self.assertEqual(call.kwargs["seq_lens"].tolist(), [103, 209])
+        self.assertEqual(call.kwargs["indptr"].tolist(), [0, 103, 312])
+        self.assertIs(call.kwargs["out"], kv_indices)
 
 if __name__ == "__main__":
     unittest.main()

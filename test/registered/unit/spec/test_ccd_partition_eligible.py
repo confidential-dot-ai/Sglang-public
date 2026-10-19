@@ -35,6 +35,12 @@ NEWCOMER_LEN = 1
 _UNSET = object()
 
 
+
+def _prepared_spec_info():
+    # check_ccd_eligible only runs on a spec_info the previous decode step
+    # already prepared, which it recognizes by nxt_kv_lens_cpu being set.
+    return SimpleNamespace(reserved_seq_lens_cpu=None, nxt_kv_lens_cpu=[1])
+
 def _make_req(
     *,
     output_len=VETERAN_LEN,
@@ -80,7 +86,7 @@ def _make_batch(
         ),
         return_logprob=any(r.return_logprob for r in reqs),
         has_grammar=any(r.grammar for r in reqs),
-        spec_info=SimpleNamespace(reserved_seq_lens_cpu=None),
+        spec_info=_prepared_spec_info(),
         seq_lens_cpu=seq_lens_cpu,
         reqs=reqs,
     )

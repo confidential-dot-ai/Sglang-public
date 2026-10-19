@@ -1576,7 +1576,7 @@ class TestComputedSlots(unittest.TestCase):
             cache_loc_dtype=torch.int64,
             require_gathered_buffer=True,
             require_mlp_tp_gather=True,
-            dp_size=4,
+            num_dp_ranks=4,
             dspark_dp_verify_sum_capture_enabled=True,
         )
         fb = _MiniForwardBatch(
@@ -1615,7 +1615,7 @@ class TestComputedSlots(unittest.TestCase):
             cache_loc_dtype=torch.int64,
             require_gathered_buffer=True,
             require_mlp_tp_gather=True,
-            dp_size=4,
+            num_dp_ranks=4,
             dspark_dp_verify_sum_capture_enabled=True,
         )
         fb = _MiniForwardBatch(

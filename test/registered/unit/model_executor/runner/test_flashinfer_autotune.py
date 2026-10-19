@@ -43,7 +43,15 @@ def test_pd_roles_have_separate_autotune_records(tmp_path):
         patch.object(
             flashinfer_autotune,
             "get_parallel",
-            return_value=SimpleNamespace(pp_size=1, pp_rank=0),
+            return_value=SimpleNamespace(
+                tp_size=2,
+                pp_size=1,
+                attn_dp_size=1,
+                moe_ep_size=2,
+                tp_rank=0,
+                pp_rank=0,
+                dp_rank=0,
+            ),
         ),
         patch.object(flashinfer_autotune, "get_disagg", return_value=role),
         patch.object(

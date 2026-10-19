@@ -30,6 +30,12 @@ from sglang.srt.speculative.dflash_cc_conditional_decode import (
 from sglang.test.test_utils import CustomTestCase
 
 
+
+def _prepared_spec_info():
+    # check_ccd_eligible only runs on a spec_info the previous decode step
+    # already prepared, which it recognizes by nxt_kv_lens_cpu being set.
+    return SimpleNamespace(reserved_seq_lens_cpu=None, nxt_kv_lens_cpu=[1])
+
 def _make_device_fsm_grammar():
     fsm = DeviceTokenFSM.compile(
         transitions={0: {1: 0}},
@@ -58,7 +64,7 @@ def _make_batch(reqs, has_grammar=False):
         sampling_info=SimpleNamespace(is_all_greedy=True),
         return_logprob=False,
         has_grammar=has_grammar,
-        spec_info=SimpleNamespace(reserved_seq_lens_cpu=None),
+        spec_info=_prepared_spec_info(),
         reqs=reqs,
     )
 
@@ -103,7 +109,7 @@ class TestCcdGrammarEligibility(CustomTestCase):
             is_extend_in_batch=False,
             sampling_info=SimpleNamespace(is_all_greedy=True),
             return_logprob=False,
-            spec_info=SimpleNamespace(reserved_seq_lens_cpu=None),
+            spec_info=_prepared_spec_info(),
             reqs=[_make_req()],
         )
         self.assertIsNone(check_ccd_eligible(batch, _make_worker()))

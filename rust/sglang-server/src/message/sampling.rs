@@ -231,6 +231,10 @@ pub struct SamplingParams {
     /// Python's `CustomParamValue` exactly.
     #[serde(default)]
     pub custom_params: Option<BTreeMap<String, CustomParamValue>>,
+    /// Oracle-decode token ids this request's decode steps emit instead of
+    /// sampling; Python validates them against the vocabulary.
+    #[serde(default)]
+    pub forced_token_ids: Option<Vec<i64>>,
     #[serde(default)]
     pub watermark: Option<WatermarkRequestConfig>,
 
@@ -294,6 +298,7 @@ impl Default for SamplingParams {
             spaces_between_special_tokens: bool_true::default(),
             no_stop_trim: bool_false::default(),
             custom_params: None,
+            forced_token_ids: None,
             watermark: None,
             stream_interval: None,
             logit_bias: None,
@@ -711,7 +716,7 @@ mod tests {
         assert_eq!(sp.min_new_tokens, 4096);
     }
 
-    /// The 31 wire slots, in Python's declaration order.
+    /// The 32 wire slots, in Python's declaration order.
     ///
     /// `SamplingParams` is `msgspec.Struct(array_like=True)` on the Python side, so
     /// the header carries an ARRAY and every field is identified by POSITION. Two
@@ -749,6 +754,7 @@ mod tests {
         "logit_bias",
         "sampling_seed",
         "custom_params",
+        "forced_token_ids",
         "watermark",
         "stop_strs",
         "stop_regex_strs",
@@ -790,6 +796,7 @@ mod tests {
             no_stop_trim: true,
             stream_interval: Some(30),
             sampling_seed: Some(31),
+            forced_token_ids: Some(vec![32, 33]),
             ..Default::default()
         };
         let buf = rmp_serde::to_vec(&sp).expect("serializes");
@@ -825,6 +832,12 @@ mod tests {
         assert_eq!(arr[at("no_stop_trim")].as_bool(), Some(true));
         assert_eq!(arr[at("stream_interval")].as_i64(), Some(30));
         assert_eq!(arr[at("sampling_seed")].as_i64(), Some(31));
+        assert_eq!(
+            arr[at("forced_token_ids")]
+                .as_array()
+                .map(|ids| ids.iter().map(|id| id.as_i64()).collect::<Vec<_>>()),
+            Some(vec![Some(32), Some(33)])
+        );
         // Unset optionals ride as nil rather than being skipped.
         assert!(arr[at("stop")].is_nil());
         assert!(arr[at("logit_bias")].is_nil());

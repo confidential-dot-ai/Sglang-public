@@ -45,6 +45,9 @@ def _make_dp_server_args(*, moe_a2a_backend: str) -> ServerArgs:
     server_args.speculative_dspark_block_size = 5
     server_args.model_config = SimpleNamespace(hf_config=_bundled_hf_config())
     server_args.enable_dp_attention = True
+    # Attention DP across the whole TP group (dp_size == tp_size).
+    server_args.tp_size = 4
+    server_args.attn_dp_size = 4
     server_args.enable_dp_lm_head = True
     server_args.attn_cp_size = 1
     server_args.moe_a2a_backend = moe_a2a_backend

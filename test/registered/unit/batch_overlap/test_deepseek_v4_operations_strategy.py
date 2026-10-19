@@ -3,6 +3,8 @@
 import unittest
 from unittest.mock import patch
 
+import torch
+
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
@@ -11,6 +13,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.batch_overlap import operations_strategy as ops_strategy
 from sglang.srt.batch_overlap.operations import _convert_operations_to_stages
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayerBase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -57,8 +60,9 @@ class _StubMlp:
         pass
 
 
-class _StubDeepseekV4Layer:
+class _StubDeepseekV4Layer(DeepseekV4DecoderLayerBase):
     def __init__(self):
+        torch.nn.Module.__init__(self)
         self.self_attn = _StubAttention()
         self.mlp = _StubMlp()
 
@@ -85,10 +89,6 @@ class _StubDeepseekV4Layer:
 
     def op_mhc_postprocess(self, state):
         pass
-
-
-# OperationsStrategy.init_new_tbo dispatches on the concrete class name.
-_StubDeepseekV4Layer.__name__ = "DeepseekV4DecoderLayer"
 
 
 def _build(mode=ForwardMode.EXTEND, *, ep=False):

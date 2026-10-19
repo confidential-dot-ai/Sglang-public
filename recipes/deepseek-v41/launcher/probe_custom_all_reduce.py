@@ -500,7 +500,7 @@ def run_worker(*, args, rank, report, capture):
         gpu=torch.cuda.get_device_name(),
         compute_capability=list(torch.cuda.get_device_capability()),
         confidential_compute=is_confidential_compute(),
-        confidential_compute_env_override=os.environ.get("SGLANG_CONFIDENTIAL_COMPUTE"),
+        confidential_compute_env_override=os.environ.get("SGLANG_FORCE_CONFIDENTIAL_COMPUTE"),
         torch=torch.__version__,
         payload=dict(rows=args.rows, hidden=args.hidden, dtype="bfloat16"),
     )

@@ -11,12 +11,11 @@ ordinary GPU, run inside the sglang container:
     python -m pytest test/registered/core/test_overlap_copy_worker.py -v
 """
 
-import os
 import unittest
 from contextlib import nullcontext
-from unittest import mock
 
 import torch
+from sglang.srt.environ import envs
 from sglang.srt.managers.overlap_copy_worker import AsyncD2HCopyWorker
 from sglang.srt.utils.common import is_confidential_compute
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -122,13 +121,13 @@ class TestConfidentialComputeDetection(CustomTestCase):
 
     def test_env_override_true(self):
         is_confidential_compute.cache_clear()
-        with mock.patch.dict(os.environ, {"SGLANG_CONFIDENTIAL_COMPUTE": "1"}):
+        with envs.SGLANG_FORCE_CONFIDENTIAL_COMPUTE.override(True):
             is_confidential_compute.cache_clear()
             self.assertTrue(is_confidential_compute())
         is_confidential_compute.cache_clear()
 
     def test_env_override_false(self):
         is_confidential_compute.cache_clear()
-        with mock.patch.dict(os.environ, {"SGLANG_CONFIDENTIAL_COMPUTE": "0"}):
+        with envs.SGLANG_FORCE_CONFIDENTIAL_COMPUTE.override(False):
             is_confidential_compute.cache_clear()
             self.assertFalse(is_confidential_compute())

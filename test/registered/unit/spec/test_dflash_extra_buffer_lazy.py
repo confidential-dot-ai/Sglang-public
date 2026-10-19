@@ -19,6 +19,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import override_platform
 from sglang.srt.speculative import dflash_info
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
 def _lazy_view(**overrides):
@@ -101,7 +102,9 @@ class TestDflashVerifyRunsMambaTrackHook(CustomTestCase):
 
     def _run(self, forward_mode):
         calls = []
-        batch = SimpleNamespace(forward_mode=forward_mode)
+        batch = SimpleNamespace(
+            forward_mode=forward_mode, spec_algorithm=SpeculativeAlgorithm.DFLASH
+        )
         attn_backend = SimpleNamespace(
             init_forward_metadata=lambda fb: calls.append("init_forward_metadata")
         )

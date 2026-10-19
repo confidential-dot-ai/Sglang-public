@@ -3823,13 +3823,13 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
         # model body; eager prefill fallbacks and decode may still overlap.
         for backend in (Backend.FULL, Backend.BREAKABLE, Backend.TC_PIECEWISE):
             with self.subTest(backend=backend):
-                args = self._args(enable_dp_attention=True)
+                args = self._args(attn_dp_size=2)
                 args.cuda_graph_config = CudaGraphConfig(
                     prefill=PhaseConfig(backend=backend)
                 )
                 check_two_batch_overlap(args)
 
-        args = self._args(enable_dp_attention=True)
+        args = self._args(attn_dp_size=2)
         args.cuda_graph_config = CudaGraphConfig(
             prefill=PhaseConfig(backend=Backend.DISABLED)
         )
@@ -3837,7 +3837,7 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
 
     def test_dspark_compact_ragged_tbo_is_accepted(self):
         args = self._args(
-            enable_dp_attention=True,
+            attn_dp_size=2,
             speculative_algorithm="DSPARK",
         )
         with envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"):
@@ -3845,7 +3845,7 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
 
     def test_dspark_static_verify_remains_supported(self):
         args = self._args(
-            enable_dp_attention=True,
+            attn_dp_size=2,
             speculative_algorithm="DSPARK",
         )
         with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):

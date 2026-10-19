@@ -26,7 +26,10 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.schedule_batch import ScheduleBatch  # noqa: E402
-from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
+from sglang.srt.model_executor.forward_batch_info import (  # noqa: E402
+    CaptureHiddenMode,
+    ForwardMode,
+)
 from sglang.srt.speculative.dflash_cc_conditional_decode import (  # noqa: E402
     SGLANG_CC_CONDITIONAL_DECODE_MIN_OUTPUT_LEN,
     merge_ccd_split_results,
@@ -71,6 +74,9 @@ def _make_spec_info(bs: int, future_indices=None) -> DFlashDraftInputV2:
         new_seq_lens=torch.arange(bs, dtype=torch.int64) + 200,
         hidden_states=torch.zeros(bs, 1),
         future_indices=future_indices,
+        # Set by the previous decode step's prepare; CCD only splits
+        # already-prepared batches.
+        nxt_kv_lens_cpu=torch.arange(bs, dtype=torch.int64) + 200,
     )
 
 
@@ -81,6 +87,7 @@ def _make_req(*, output_len=VETERAN_LEN, return_logprob=False, top_k=1):
         ),
         return_logprob=return_logprob,
         return_hidden_states=False,
+        return_hidden_states_mode=CaptureHiddenMode.NULL,
         return_sampling_mask=False,
         output_ids=[0] * output_len,
         grammar=None,

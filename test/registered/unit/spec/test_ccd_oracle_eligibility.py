@@ -22,6 +22,12 @@ from sglang.srt.speculative.dflash_cc_conditional_decode import (
 from sglang.test.test_utils import CustomTestCase
 
 
+
+def _prepared_spec_info():
+    # check_ccd_eligible only runs on a spec_info the previous decode step
+    # already prepared, which it recognizes by nxt_kv_lens_cpu being set.
+    return SimpleNamespace(reserved_seq_lens_cpu=None, nxt_kv_lens_cpu=[1])
+
 def _make_req(forced_token_ids=None):
     return SimpleNamespace(
         sampling_params=SimpleNamespace(forced_token_ids=forced_token_ids),
@@ -37,7 +43,7 @@ def _make_batch(reqs):
         is_extend_in_batch=False,
         sampling_info=SimpleNamespace(is_all_greedy=True),
         return_logprob=False,
-        spec_info=SimpleNamespace(reserved_seq_lens_cpu=None),
+        spec_info=_prepared_spec_info(),
         reqs=reqs,
     )
 

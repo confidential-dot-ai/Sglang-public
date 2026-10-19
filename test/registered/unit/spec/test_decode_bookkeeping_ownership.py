@@ -60,8 +60,12 @@ _OWNER_SITES = {
     (_SB, "ScheduleBatch.prepare_for_extend", "extend_batch_idx"): 1,
     # kv_allocated_len is settled inside the owned-kv alloc functions (op28).
     ("mem_cache/allocation.py", "alloc_for_extend", "evict"): 1,
-    ("mem_cache/allocation.py", "alloc_for_extend", "kv_allocated_len"): 1,
+    # Ring-attention CP shard path: this rank holds only its local shard, so
+    # alloc_for_extend settles kv_allocated_len to cp_local_total_len and
+    # prepare_for_extend commits that shard length instead of seq_len.
+    ("mem_cache/allocation.py", "alloc_for_extend", "kv_allocated_len"): 2,
     ("mem_cache/allocation.py", "alloc_for_extend", "kv_committed_len"): 1,
+    (_SB, "ScheduleBatch.prepare_for_extend", "kv_committed_len"): 1,
     ("mem_cache/allocation.py", "alloc_for_decode_default", "evict"): 1,
     ("mem_cache/allocation.py", "alloc_for_decode_default", "kv_allocated_len"): 1,
     ("mem_cache/allocation.py", "alloc_for_decode_default", "kv_committed_len"): 1,
@@ -83,6 +87,24 @@ _OWNER_SITES = {
         "kv_allocated_len",
     ): 1,
     (*_RESOLVE, "kv_committed_len"): 1,
+    # CCSpec: a captured decode chunk emits several ticks without returning
+    # to the scheduler; this advances every host length the skipped
+    # prepare_for_decode/alloc_for_decode ticks would have.
+    (
+        "model_executor/ccspec_decode.py",
+        "reconcile_ccspec_host_lengths",
+        "decode_batch_idx",
+    ): 1,
+    (
+        "model_executor/ccspec_decode.py",
+        "reconcile_ccspec_host_lengths",
+        "kv_committed_len",
+    ): 1,
+    (
+        "model_executor/ccspec_decode.py",
+        "reconcile_ccspec_host_lengths",
+        "kv_allocated_len",
+    ): 1,
     (*_RESOLVE, "spec_verify_ct"): 1,
     # Mixed-chunk spec tails: the mixed prefill step commits the pending
     # bonus token, advancing the watermark by exactly that one token.

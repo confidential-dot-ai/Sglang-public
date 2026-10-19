@@ -129,12 +129,16 @@ class TestEngramPDHistory(CustomTestCase):
     def test_pd_handoff_seeds_predecessors_without_sampled_anchor(self):
         # A decode instance never ran EXTEND; stale slot contents must be replaced
         # using the prompt and the outputs carried across the PD boundary.
+        from sglang.srt.layers.engram import EngramHasher
+
         history = torch.full((4, 3), -99, dtype=torch.int32)
+        hasher = SimpleNamespace(max_ngram_size=4, history=history)
+        hasher.history_row = lambda ids: EngramHasher.history_row(hasher, ids)
         manager = NgramEmbeddingManager(
             enabled=False,
             table=None,
             n=0,
-            engram_hasher=SimpleNamespace(max_ngram_size=4, history=history),
+            engram_hasher=hasher,
         )
         requests = [
             SimpleNamespace(

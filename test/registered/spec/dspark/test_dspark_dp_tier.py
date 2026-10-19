@@ -164,7 +164,7 @@ class TestBusyIdleGraphKeyModeSelection(CustomTestCase):
 
     def test_sum_mode_busy_rank_selects_its_local_token_bucket(self):
         worker = self._worker(sum_enabled=True)
-        parallel = SimpleNamespace(enable_dp_attention=True, attn_dp_rank=2)
+        parallel = SimpleNamespace(attn_dp_enabled=True, attn_dp_rank=2)
         with patch(
             "sglang.srt.speculative.dspark_components.dspark_worker_v2.get_parallel",
             return_value=parallel,
@@ -173,7 +173,7 @@ class TestBusyIdleGraphKeyModeSelection(CustomTestCase):
 
     def test_sum_mode_idle_rank_uses_smallest_dummy_graph(self):
         worker = self._worker(sum_enabled=True)
-        parallel = SimpleNamespace(enable_dp_attention=True, attn_dp_rank=0)
+        parallel = SimpleNamespace(attn_dp_enabled=True, attn_dp_rank=0)
         with patch(
             "sglang.srt.speculative.dspark_components.dspark_worker_v2.get_parallel",
             return_value=parallel,
@@ -189,7 +189,7 @@ class TestBusyIdleGraphKeyModeSelection(CustomTestCase):
 
     def test_flag_off_preserves_shared_max_bucket(self):
         worker = self._worker(sum_enabled=False)
-        parallel = SimpleNamespace(enable_dp_attention=True, attn_dp_rank=0)
+        parallel = SimpleNamespace(attn_dp_enabled=True, attn_dp_rank=0)
         with patch(
             "sglang.srt.speculative.dspark_components.dspark_worker_v2.get_parallel",
             return_value=parallel,
@@ -198,7 +198,7 @@ class TestBusyIdleGraphKeyModeSelection(CustomTestCase):
 
     def test_sum_mode_invalid_shared_vector_returns_no_planner_floor(self):
         worker = self._worker(sum_enabled=True)
-        parallel = SimpleNamespace(enable_dp_attention=True, attn_dp_rank=1)
+        parallel = SimpleNamespace(attn_dp_enabled=True, attn_dp_rank=1)
         batch = self._batch()
         batch.global_spec_verify_tier_num_tokens = [0, 73, 12, 7]
         with patch(

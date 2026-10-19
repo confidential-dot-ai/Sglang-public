@@ -177,7 +177,7 @@ class TestInProcessLMCache(CustomTestCase):
     def _prefetch(self, req):
         key = RadixKey(req.origin_input_ids, cache_salt=req.cache_salt)
         match = self.cache.match_prefix(MatchPrefixParams(key=key))
-        local = len(match.device_indices)
+        local = match.device_prefix_len
         self.cache.prefetch_from_storage(
             req.cache_request_handle,
             match.last_device_node,
@@ -189,10 +189,20 @@ class TestInProcessLMCache(CustomTestCase):
         match = self.cache.match_prefix(MatchPrefixParams(key=key, req=req))
         return key, match
 
+    def _matched_indices(self, req, match):
+        # The scheduler adopts the match onto the request before reading slots.
+        req.last_node = match.last_device_node
+        req.prefix_len = match.device_prefix_len
+        return self.cache.prefix_device_indices(req)
+
     def _load(self, req, match):
-        return self.cache.init_load_back(
+        """Start the load and return the request-private slots it fills."""
+        loaded, _ = self.cache.init_load_back(
             InitLoadBackParams(match.best_match_node, match.host_hit_length, req=req)
-        )[0]
+        )
+        if not loaded:
+            return torch.empty(0, dtype=torch.int64)
+        return self.cache._external_flows[req.rid].load.device_indices
 
     def test_round_trip_abort_releases_private_slots_and_lookup_pins(self):
         """Even a completed transfer remains private until the tree takes ownership."""
@@ -207,7 +217,7 @@ class TestInProcessLMCache(CustomTestCase):
                 buf[slots], (torch.arange(16).reshape(8, 1, 2) + 100 * layer).float()
             )
         self.assertEqual(
-            len(self.cache.match_prefix(MatchPrefixParams(key=key)).device_indices), 0
+            self.cache.match_prefix(MatchPrefixParams(key=key)).device_prefix_len, 0
         )
         self.cache.release_aborted_request(req.cache_request_handle)
         self.assertEqual(self.allocator.available_size(), before - 8)
@@ -225,7 +235,7 @@ class TestInProcessLMCache(CustomTestCase):
         self.assertEqual(len(self._load(req, match)), 0)
         self.assertEqual(self.allocator.available_size(), before)
         self.assertEqual(
-            len(self.cache.match_prefix(MatchPrefixParams(key=key)).device_indices), 0
+            self.cache.match_prefix(MatchPrefixParams(key=key)).device_prefix_len, 0
         )
         self.assertFalse(self.engine.pins)
         self.assertFalse(self.cache.has_pending_cache_operations())
@@ -237,12 +247,12 @@ class TestInProcessLMCache(CustomTestCase):
         self.cache.insert(InsertParams(RadixKey(array("q", range(3))), local))
         req = self._req()
         key, match = self._prefetch(req)
-        self.assertEqual(len(match.device_indices), 0)
+        self.assertEqual(match.device_prefix_len, 0)
         before = self.allocator.available_size()
         self._load(req, match)
         match = self.cache.match_prefix(MatchPrefixParams(key=key, req=req))
-        self.assertEqual(len(match.device_indices), 8)
-        self.assertEqual(match.device_indices[:3].tolist(), local.tolist())
+        self.assertEqual(match.device_prefix_len, 8)
+        self.assertEqual(self._matched_indices(req, match)[:3].tolist(), local.tolist())
         self.cache.check_hicache_events()
         self.assertEqual(self.allocator.available_size(), before - 5)
         self.cache.release_aborted_request(req.cache_request_handle)

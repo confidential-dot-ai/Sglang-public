@@ -164,7 +164,15 @@ class TestServerInfoTransportParity(CustomTestCase):
                 )
                 http_info = _call_server_info_with(args)
                 self.assertEqual(http_info["frontend"], "python")
-                for field in ("startup_time", "internal_states", "version", "frontend"):
+                # Runtime fields: the gRPC bridge answers launch metadata only.
+                # hardwire_memory aggregates the ranks' internal states.
+                for field in (
+                    "startup_time",
+                    "internal_states",
+                    "version",
+                    "frontend",
+                    "hardwire_memory",
+                ):
                     self.assertIn(field, http_info)
                     http_info.pop(field)
 

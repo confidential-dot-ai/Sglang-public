@@ -33,7 +33,9 @@ def test_projection_break_zeroes_padding(live):
         "get_tc_piecewise_forward_context",
         return_value=context,
     ):
-        _low_ratio_source_projections(layer, x, x, torch.arange(4), bufs)
+        _low_ratio_source_projections(
+            layer, x, x, torch.arange(4), bufs, run_compressor=True, run_indexer=True
+        )
     for name, offset in (("kv", 1), ("score", 2)):
         torch.testing.assert_close(bufs[name][:live], x[:live] + offset)
         assert not bufs[name][live:].count_nonzero()
@@ -70,6 +72,7 @@ def test_prefill_graph_index_layers_follow_the_eager_indexer_switch(eager_indexe
     bufs = {"kv": torch.zeros(4, 3), "q": torch.zeros(4, 2, 3), "w": torch.zeros(4, 2)}
     backend = SimpleNamespace(
         prefill_graph_eager_indexer=eager_indexer,
+        tail_source_kv_layer_id=None,
         forward_metadata=SimpleNamespace(
             low_ratio_req_indices=req, low_ratio_pos_i64=pos
         ),
@@ -78,7 +81,9 @@ def test_prefill_graph_index_layers_follow_the_eager_indexer_switch(eager_indexe
         _low_ratio_compress_torch=Mock(),
         _low_ratio_index_topk_captured=Mock(),
     )
-    layer = SimpleNamespace(compress_ratio=1, compressor=object(), indexer=object())
+    layer = SimpleNamespace(
+        layer_id=3, compress_ratio=1, compressor=object(), indexer=object()
+    )
     x = q_lora = torch.ones(4, 3)
     batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND, encoder_swa_replay=False)
     with (
@@ -143,9 +148,7 @@ def test_precomputed_projection_reaches_the_prefill_indexer():
         prefill_candidates=Mock(),
         _publish_candidate_metadata=Mock(),
     )
-    backend._get_low_ratio_selection = partial(
-        DeepseekV4AttnBackend._get_low_ratio_selection, backend
-    )
+    backend._low_ratio_prefill_reads_page_indices = lambda _batch: True
     backend._make_low_ratio_prefill_indexer_inputs = partial(
         DeepseekV4AttnBackend._make_low_ratio_prefill_indexer_inputs, backend
     )
@@ -194,10 +197,19 @@ def test_verify_hashing_does_not_require_prefill_context(verify):
         end_layer=0,
     )
     ids = torch.arange(6)
+
+    class _StopAfterHashing(Exception):
+        pass
+
     with (
         patch.object(deepseek_v4, "is_cp_active", return_value=False),
         patch.object(deepseek_v4, "is_in_breakable_cuda_graph", return_value=True),
         patch.object(deepseek_v4, "bcg_deepseek_v4_engram_hash_ids") as prefill_hash,
+        patch.object(
+            deepseek_v4, "get_forward", return_value=SimpleNamespace(sp_active=False)
+        ),
+        patch.object(deepseek_v4.mhc, "HcState", side_effect=_StopAfterHashing),
+        pytest.raises(_StopAfterHashing),
     ):
         deepseek_v4.DeepseekV4Model._forward_layers_hc_pre_from_prev(
             model, ids, torch.ones(6, 2), batch, ids, ids, False, []

@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_parallel
 
 
 def scheduler(*, age=0.5, count=1, last_tail=False, tp_size=1):
@@ -24,9 +25,11 @@ def scheduler(*, age=0.5, count=1, last_tail=False, tp_size=1):
 
 
 def defer(s, *, idle=False):
+    # The scheduler reads its TP size from the published parallel namespace.
     with (
         patch("sglang.srt.disaggregation.decode.time.perf_counter", return_value=10),
         envs.SGLANG_DSV41_CED_TAIL_MAX_WAIT_MS.override(1000),
+        get_parallel().override(tp_size=s.ps.tp_size),
     ):
         return SchedulerDisaggregationDecodeMixin._defer_ced_tail_batch(
             s, SimpleNamespace(is_empty=lambda: idle), 8

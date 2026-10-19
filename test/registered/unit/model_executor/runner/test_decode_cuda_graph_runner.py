@@ -766,6 +766,7 @@ class TestRaggedCaptureLayoutLifetime(CustomTestCase):
         runner._ragged_graph_size = -1
         runner._replay_graph_key = mod.ShapeKey(size=1)
         runner._replay_dp_verify_sum_bucket = 99
+        runner.buffers = SimpleNamespace(num_token_non_padded=None)
         runner.enable_pdmux = False
         runner.tbo_cuda_graph_enabled = False
         runner.enable_two_batch_overlap = False
@@ -899,6 +900,7 @@ class TestRaggedVerifyLayoutPerTier(CustomTestCase):
         runner.captured_req_width = 6
         runner.capture_num_tokens = [6, 12, 24, 48]
         runner.device = "cpu"
+        runner.enable_pdmux = False
         runner._captured_ragged_layouts = {}
         with mock.patch.dict(
             os.environ, {"SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE": "0"}

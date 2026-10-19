@@ -425,7 +425,7 @@ def reconcile_ccspec_host_lengths(batch: "ScheduleBatch", emitted: int) -> None:
     batch.seq_lens_sum = None
     for req in batch.reqs:
         req.decode_batch_idx += emitted
-        req.kv_committed_len += emitted
+        req.kv.kv_committed_len += emitted
         req.kv.kv_allocated_len += emitted
 
 

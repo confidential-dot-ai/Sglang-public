@@ -23,6 +23,8 @@ class TestDFlashResolvedChunkSize(CustomTestCase):
             chunks = []
             worker = SimpleNamespace(
                 server_args=get_server_args(),
+                # No LiLiCorr head: LiLiCorr runs the injection unchunked.
+                lilicorr=None,
                 _append_target_hidden_to_draft_kv_by_loc_chunk=lambda **kw: chunks.append(
                     kw
                 ),

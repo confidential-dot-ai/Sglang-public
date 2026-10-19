@@ -93,6 +93,16 @@ class _FakeCudart:
 
 
 class TestHiCacheHostRegister(unittest.TestCase):
+    def setUp(self):
+        # These cover the registering path. Without a visible GPU the pinning
+        # probe reports False, which selects the confidential-compute fallback
+        # (TestHostRegistrationOwnership covers that one).
+        patcher = mock.patch.object(
+            host_common, "is_host_pinning_effective", return_value=True
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def _hip_non_userptr(self):
         return (
             mock.patch.object(host_common, "_is_hip", True),

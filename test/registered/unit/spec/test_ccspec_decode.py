@@ -368,8 +368,9 @@ class TestReconcileHostLengths(CustomTestCase):
             reqs.append(
                 types.SimpleNamespace(
                     decode_batch_idx=7,
-                    kv_committed_len=s0,
-                    kv=types.SimpleNamespace(kv_allocated_len=s0),
+                    kv=types.SimpleNamespace(
+                        kv_committed_len=s0, kv_allocated_len=s0
+                    ),
                 )
             )
         return types.SimpleNamespace(
@@ -391,14 +392,14 @@ class TestReconcileHostLengths(CustomTestCase):
         self.assertIsNone(batch.seq_lens_sum)
         for req in batch.reqs:
             self.assertEqual(req.decode_batch_idx, 9)
-            self.assertEqual(req.kv_committed_len, 102)
+            self.assertEqual(req.kv.kv_committed_len, 102)
             self.assertEqual(req.kv.kv_allocated_len, 102)
 
     def test_emitted_equals_cap(self):
         batch = self._make_batch(bs=1, s0=50)
         reconcile_ccspec_host_lengths(batch, CHUNK_CAP)
         self.assertEqual(int(batch.seq_lens_cpu[0]), 50 + CHUNK_CAP)
-        self.assertEqual(batch.reqs[0].kv_committed_len, 50 + CHUNK_CAP)
+        self.assertEqual(batch.reqs[0].kv.kv_committed_len, 50 + CHUNK_CAP)
         self.assertIsNone(batch.seq_lens_sum)
 
     def test_emitted_zero_is_noop(self):

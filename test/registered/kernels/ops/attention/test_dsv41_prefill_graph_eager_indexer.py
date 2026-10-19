@@ -5,7 +5,7 @@ import copy
 import unittest
 from functools import partial
 from types import SimpleNamespace
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 from unittest.mock import patch
 
 import msgspec
@@ -19,7 +19,6 @@ from sglang.srt.layers.attention.dsv4.metadata import (
 from sglang.srt.layers.attention.dsv4.v41_indexer import (
     CapturedPrefillInputs,
     PrefillInputs,
-    Selection,
     make_candidate_indexer,
     make_full_topk_indexer,
 )
@@ -45,6 +44,14 @@ GRAPH_BUCKET = 128
 # runs, so its picks match to a few ulps of the floor, not bit for bit.
 MIN_SOURCE_OVERLAP = 0.99
 MIN_CONSUMER_OVERLAP = 0.95
+
+
+class Selection(NamedTuple):
+    """An indexer's output buffers: index-K pool slots and the same picks as
+    request-local compressed positions, [rows, TOPK] int32, -1 padded."""
+
+    page_indices: Optional[torch.Tensor]
+    raw_indices: torch.Tensor
 
 
 class IndexPool:
@@ -156,6 +163,9 @@ def make_batch(contexts, rows_per_request, seed, like=None) -> Batch:
         seq_lens_cpu=list(contexts),
         rows_per_request=list(rows_per_request),
         rows_per_request_device=rows_device,
+        # Placeholders: each layer below writes into its own Selection.
+        out_raw_indices=torch.full((rows, TOPK), -1, dtype=torch.int32, device=dev),
+        out_page_indices=torch.full((rows, TOPK), -1, dtype=torch.int32, device=dev),
     )
     return Batch(pool, indexer, inputs, req_to_token, page_table)
 
@@ -177,6 +187,15 @@ def new_selection(rows: int) -> Selection:
     )
 
 
+def into(inputs: PrefillInputs, selection: Selection) -> PrefillInputs:
+    """The same inputs writing their selection into `selection`."""
+    return msgspec.structs.replace(
+        inputs,
+        out_raw_indices=selection.raw_indices,
+        out_page_indices=selection.page_indices,
+    )
+
+
 def eager_layers(batch: Batch, inputs: PrefillInputs):
     """(the candidate source's selection, a consumer's selection), as the eager
     break runs them."""
@@ -189,8 +208,8 @@ def eager_layers(batch: Batch, inputs: PrefillInputs):
     )
     rows = inputs.positions.shape[0]
     source, consumer = new_selection(rows), new_selection(rows)
-    published = prefill.publish_prefill(inputs, source)
-    prefill.consume_prefill(inputs, published, consumer)
+    published = prefill.publish_prefill(into(inputs, source))
+    prefill.consume_prefill(into(inputs, consumer), published)
     return source, consumer
 
 
@@ -225,8 +244,9 @@ def captured_layer(batch: Batch) -> Selection:
             q=batch.indexer.q,
             weights=batch.indexer.w,
             paged_metadata=metadata,
+            out_page_indices=out.page_indices,
+            out_raw_indices=out.raw_indices,
         ),
-        out,
     )
     return out
 
@@ -311,16 +331,18 @@ def make_backend(batch: Batch, static: StaticBatch, eager_indexer: bool):
         prefill_graph_eager_indexer=eager_indexer,
         forward_metadata=static.metadata,
         tail_forward_metadata=None,
+        tail_source_kv_layer_id=None,
         prefill_candidates=prefill,
         _low_ratio_in_prefill_graph=lambda: True,
         _source_projection_buffers=lambda rows, ratio: {
             name: buf[:rows] for name, buf in static.projection.items()
         },
+        # Paged attention reads the page indices too, so fill both.
+        _low_ratio_prefill_reads_page_indices=lambda forward_batch: True,
     )
     for name in (
         "_low_ratio_index_topk",
         "_make_low_ratio_prefill_indexer_inputs",
-        "_get_low_ratio_selection",
         "_publish_candidate_metadata",
     ):
         setattr(backend, name, partial(getattr(DeepseekV4AttnBackend, name), backend))
