@@ -51,6 +51,11 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreGatedKVReceiver,
     HiCacheRestoreResult,
 )
+from sglang.srt.disaggregation.ced_boundary import (
+    build_ced_boundary_injection,
+    ced_boundary_enabled,
+    take_ced_boundary_slot,
+)
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
     KVClassType,
@@ -2677,6 +2682,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             output_dsa_topk_indices,
             output_bootstrap_room,
         ) = self.metadata_buffers.get_buf(idx)
+        if ced_boundary_enabled() and self.metadata_buffers.ced_boundary is not None:
+            # Copy the handed-off window state out before the slot is freed.
+            decode_req.req.ced_boundary_state = take_ced_boundary_slot(
+                decode_req.req,
+                self.metadata_buffers.ced_boundary,
+                idx,
+                self.metadata_buffers.ced_boundary_layout,
+            )
 
         # Validate bootstrap_room to detect context corruption
         actual_room = output_bootstrap_room[0].item()
@@ -3417,6 +3430,10 @@ class SchedulerDisaggregationDecodeMixin:
             self.spec_algorithm,
         )
         batch.prepare_for_extend(preallocated=True)
+        if ced_boundary_enabled():
+            batch.ced_boundary_injection = build_ced_boundary_injection(
+                reqs, batch.device
+            )
         if envs.SGLANG_DSV41_CED_TAIL_TIMING.get():
             batch.ced_tail_prepare_ms = (
                 time.perf_counter() - tail_prepare_start

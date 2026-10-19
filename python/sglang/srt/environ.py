@@ -1903,6 +1903,13 @@ class Envs:
     # one replay, waiting at most MAX_WAIT_MS for the batch to fill.
     SGLANG_DSV41_CED_TAIL_BATCH_SIZE = EnvInt(1)
     SGLANG_DSV41_CED_TAIL_MAX_WAIT_MS = EnvInt(1000)
+    # CED boundary handoff (set on both workers, with the CED split): prefill hands
+    # each prompt's last-window state at the last kv_source layer to decode through
+    # the PD metadata slot, and decode's tail replay starts at that layer instead
+    # of rerunning the encoder. CHECK also reruns the encoder and logs how far its
+    # recomputed boundary state is from the handed-off one.
+    SGLANG_OPT_DSV41_CED_BOUNDARY_HANDOFF = EnvBool(False)
+    SGLANG_DSV41_CED_BOUNDARY_CHECK = EnvBool(False)
     # DeepSeek-V4.1 ratio-1/2 index layers: the DeepGEMM fp4 logits kernels store bf16 instead
     # of fp32 (the reference ranks bf16 scores); every consumer of those logits must take bf16.
     SGLANG_OPT_DSV41_BF16_INDEX_LOGITS = EnvBool(False)

@@ -180,6 +180,11 @@ from sglang.srt.multimodal.deepseek_v41_image_processing import (
     image_token_types,
     materialize_image_gpu,
 )
+from sglang.srt.disaggregation.ced_boundary import (
+    CedBoundaryInjection,
+    ced_boundary_enabled,
+    fill_ced_boundary_for_forward,
+)
 from sglang.srt.runtime_context import (
     get_device,
     get_disagg,
@@ -858,6 +863,22 @@ def deepseek_v4_exit_late_layer_tail(sentinel: torch.Tensor) -> torch.Tensor:
     forward_batch = get_tc_piecewise_forward_context().forward_batch
     get_attn_backend().prefill_graph_exit_late_layer_tail(forward_batch)
     return sentinel
+
+
+def deepseek_v4_ced_capture_boundary(
+    sentinel: torch.Tensor, residual: torch.Tensor, pre: Optional[torch.Tensor]
+) -> torch.Tensor:
+    # CED boundary handoff under the prefill CUDA graph: gather the live batch's
+    # last-window rows (the captured args hold the graph's static buffers).
+    fill_ced_boundary_for_forward(
+        get_tc_piecewise_forward_context().forward_batch, residual, pre
+    )
+    return sentinel
+
+
+bcg_deepseek_v4_ced_capture_boundary = eager_on_graph(True)(
+    deepseek_v4_ced_capture_boundary
+)
 
 
 bcg_deepseek_v4_enter_late_layer_tail = eager_on_graph(True)(
@@ -3571,6 +3592,8 @@ DeepseekV4DecoderLayer = (
 
 class DeepseekV4Model(nn.Module):
     fall_back_to_pt_during_load = False
+    # The layer whose input state a CED boundary handoff captures (prefill only).
+    ced_boundary_capture_layer: Optional[int] = None
 
     def __init__(
         self,
@@ -3758,6 +3781,16 @@ class DeepseekV4Model(nn.Module):
             assert getattr(config, "num_hash_layers", 0) <= self.late_layer_start, (
                 "decoder SWA bounded replay needs hash routing before the late layers"
             )
+        # CED boundary handoff: the prefill stage running the last kv_source layer
+        # captures that layer's input state for each prompt's last window.
+        self.ced_boundary_capture_layer: Optional[int] = None
+        if (
+            ced_boundary_enabled()
+            and get_disagg().disaggregation_mode == "prefill"
+            and config.kv_source_layer_ids
+            and self.start_layer <= max(config.kv_source_layer_ids) < self.end_layer
+        ):
+            self.ced_boundary_capture_layer = max(config.kv_source_layer_ids)
         # Only vision routing reads token IDs in the late layers.
         self.late_layer_vl_routing = (
             config.model_type == "deepseek_v41"
@@ -3933,6 +3966,77 @@ class DeepseekV4Model(nn.Module):
         return state.residual, state.pre
 
     @staticmethod
+    def _ced_boundary_state(
+        self,
+        state: mhc.HcState,
+        tail: LateLayerTail,
+        injection: CedBoundaryInjection,
+    ) -> mhc.HcState:
+        """The extend's state with prefill's boundary rows at the tail rows; the
+        other rows are dropped by the tail narrowing before anything reads them."""
+        rows = tail.token_indices
+        assert tail.scatter_indices is None and not tail.pad_rows, (
+            "the CED boundary handoff runs an eager late-layer tail"
+        )
+        assert rows.numel() == injection.residual.shape[0], (
+            rows.numel(),
+            injection.residual.shape[0],
+        )
+        residual = state.residual.new_zeros(state.residual.shape)
+        residual.index_copy_(0, rows, injection.residual.to(residual.dtype))
+        pre = None
+        if injection.pre is not None:
+            pre = injection.pre.new_zeros(
+                (residual.shape[0], injection.pre.shape[1])
+            )
+            pre.index_copy_(0, rows, injection.pre)
+        return mhc.HcState(residual, pre)
+
+    def _capture_ced_boundary(
+        self,
+        state: mhc.HcState,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        if is_in_breakable_cuda_graph():
+            # The break is captured unconditionally; it reads the live batch's
+            # capture spec at replay, and a batch with none is a no-op.
+            bcg_deepseek_v4_ced_capture_boundary(
+                positions.new_zeros((1,)), state.residual, state.pre
+            )
+        else:
+            fill_ced_boundary_for_forward(forward_batch, state.residual, state.pre)
+
+    def _check_ced_boundary(
+        self,
+        state: mhc.HcState,
+        tail: LateLayerTail,
+        injection: CedBoundaryInjection,
+    ) -> None:
+        """Log how far the recomputed boundary rows are from the handed-off ones."""
+        got = tail.rows(state.residual).float()
+        want = injection.residual.float()
+        diff = (got - want).abs()
+        scale = want.abs().max().clamp_min(1e-12)
+        cos = torch.nn.functional.cosine_similarity(
+            got.flatten(1), want.flatten(1), dim=1
+        )
+        msg = (
+            f"CED boundary check: rows={got.shape[0]} "
+            f"residual max_abs={diff.max().item():.4g} "
+            f"mean_abs={diff.mean().item():.4g} rel={(diff.max() / scale).item():.4g} "
+            f"cos_min={cos.min().item():.6f}"
+        )
+        if injection.pre is not None and state.pre is not None:
+            pre_diff = (tail.rows(state.pre).float() - injection.pre.float()).abs()
+            msg += f" pre max_abs={pre_diff.max().item():.4g}"
+        else:
+            msg += (
+                f" pre handed={injection.pre is not None} "
+                f"recomputed={state.pre is not None}"
+            )
+        logger.info(msg)
+
     def _check_ced_encoder_graph(
         encoder_outputs, encoder_check, expected, tail: LateLayerTail
     ) -> None:
@@ -3983,7 +4087,12 @@ class DeepseekV4Model(nn.Module):
         cp_extend = (
             is_cp_active(forward_batch) and forward_batch.forward_mode.is_extend()
         )
-        if self.engram_hasher is not None:
+        # CED boundary handoff: a tail replay starts at the last kv_source layer
+        # from prefill's state, so the encoder (and its Engram) does not run.
+        boundary = getattr(forward_batch, "ced_boundary", None)
+        injection = boundary if isinstance(boundary, CedBoundaryInjection) else None
+        replay_from_boundary = injection is not None and not injection.check
+        if self.engram_hasher is not None and not replay_from_boundary:
             if cp_extend:
                 # n-gram hashing needs each token's predecessors: hash the whole prompt
                 total = int(forward_batch.attn_cp_metadata.total_seq_lens)
@@ -4062,7 +4171,14 @@ class DeepseekV4Model(nn.Module):
         layer_start = self.start_layer
         encoder_outputs = None
         encoder_check = None
-        if ced_graphs and envs.SGLANG_DSV41_CED_TAIL_ENCODER_GRAPH.get():
+        if replay_from_boundary:
+            assert tail is not None and self.tail_writes_source_kv and _is_cuda, (
+                "the CED boundary handoff replays a CUDA late-layer tail"
+            )
+            state = self._ced_boundary_state(state, tail, injection)
+            hidden_states = residual_batch.set_written(state, forward_batch)
+            layer_start = self.late_layer_start
+        elif ced_graphs and envs.SGLANG_DSV41_CED_TAIL_ENCODER_GRAPH.get():
             from sglang.srt.model_executor.runner.ced_encoder_graph import (
                 run_ced_encoder_graph,
             )
@@ -4096,6 +4212,7 @@ class DeepseekV4Model(nn.Module):
                 layer = self.layers[i]
                 if (
                     (tail is not None and i == self.late_layer_start)
+                    or i == self.ced_boundary_capture_layer
                     or layer.engram is not None
                     or (capture_dspark and i in self.dspark_layers_to_capture)
                 ):
@@ -4111,7 +4228,14 @@ class DeepseekV4Model(nn.Module):
                     hidden_states = state = hc_boundary.materialize(
                         hidden_states, forward_batch, next=next_boundary
                     )
+                if (
+                    i == self.ced_boundary_capture_layer
+                    and forward_batch.forward_mode.is_extend()
+                ):
+                    self._capture_ced_boundary(state, positions, forward_batch)
             if tail is not None and i == self.late_layer_start:
+                if injection is not None and injection.check:
+                    self._check_ced_boundary(state, tail, injection)
                 if encoder_check is not None:
                     self._check_ced_encoder_graph(
                         encoder_outputs,
@@ -4119,7 +4243,8 @@ class DeepseekV4Model(nn.Module):
                         (state.residual, state.pre, *dspark_aux_hidden_states),
                         tail,
                     )
-                if self.tail_writes_source_kv:
+                # Under the boundary handoff prefill wrote these rows' source KV.
+                if self.tail_writes_source_kv and not replay_from_boundary:
                     source = self.layers[i]
                     attn_backend.write_tail_source_kv(
                         layer=source.self_attn,

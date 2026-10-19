@@ -77,6 +77,7 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
 from sglang.srt.disaggregation import role_switch
+from sglang.srt.disaggregation.ced_boundary import maybe_ced_boundary_layout
 from sglang.srt.disaggregation.ced_tail_timing import CedTailTimer
 from sglang.srt.disaggregation.checksum import KvChecksumComputer
 from sglang.srt.disaggregation.decode import (
@@ -1576,6 +1577,18 @@ class Scheduler(
             disagg_hidden_size = 16  # minimal padding size for RDMA
             disagg_hidden_states_dtype = torch.float32
 
+        # CED boundary handoff: decode, and the prefill stage that runs the last
+        # kv_source layer (the last pipeline stage), carry the window state.
+        ced_boundary_layout = maybe_ced_boundary_layout(
+            self.model_config.hf_text_config,
+            self.sliding_window_size,
+            holds_boundary=(
+                self.disaggregation_mode == DisaggregationMode.DECODE
+                or self.pp_group is None
+                or self.pp_group.is_last_rank
+            ),
+        )
+
         # The PD metadata wire schema must match on P and D even when only D
         # enables spec decoding; a seedless prefill writes the invalid sentinel.
         output_dsa_topk_indices_dim = get_dsa_seed_metadata_dim(
@@ -1600,6 +1613,7 @@ class Scheduler(
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
                 output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
                 kv_checksum_enabled=get_disagg().disaggregation_enable_kv_checksum,
+                ced_boundary_layout=ced_boundary_layout,
             )
 
             # The decode requests polling kv cache
@@ -1641,6 +1655,7 @@ class Scheduler(
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
                 output_dsa_topk_indices_dim=output_dsa_topk_indices_dim,
                 kv_checksum_enabled=get_disagg().disaggregation_enable_kv_checksum,
+                ced_boundary_layout=ced_boundary_layout,
             )
 
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(

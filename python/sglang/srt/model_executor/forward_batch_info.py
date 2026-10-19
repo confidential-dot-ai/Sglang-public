@@ -41,6 +41,10 @@ from sglang.kernels.ops.attention.clamp_position import clamp_position
 from sglang.kernels.ops.attention.position import compute_position_triton
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.utils import all_gather_single
+from sglang.srt.disaggregation.ced_boundary import (
+    ced_boundary_enabled,
+    ced_boundary_for_forward,
+)
 from sglang.srt.environ import envs
 from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
     compute_req_all_ids_info,
@@ -697,6 +701,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     reuse_dsa_topk_indices: Optional[bool] = False
 
     minimax_m3_precached_sparse_layers: Optional[Set[int]] = None
+
+    # CED boundary handoff: prefill's capture spec of the rows in each prompt's
+    # last window, or decode's handed-off state to start the tail replay from.
+    ced_boundary: Optional[object] = None
 
     # === Forward-derived (built in init_new on the forward stream; FB-owned) ===
     # Position information
@@ -1362,6 +1370,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if parallel.attn_dcp_size > 1 and ret.out_cache_loc is not None and is_hip():
             ret.dcp_kv_mask = (
                 ret.positions % parallel.attn_dcp_size == parallel.attn_dcp_rank
+            )
+
+        if ced_boundary_enabled():
+            ret.ced_boundary = ced_boundary_for_forward(
+                batch, ret, model_runner.sliding_window_size, device
             )
 
         return ret

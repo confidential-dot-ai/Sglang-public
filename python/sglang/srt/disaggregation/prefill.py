@@ -43,6 +43,10 @@ from sglang.srt.disaggregation.common.staging_buffer import (
     compute_grid_segments,
     staging_grid_tokens,
 )
+from sglang.srt.disaggregation.ced_boundary import (
+    ced_boundary_enabled,
+    write_ced_boundary_slots,
+)
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
@@ -931,6 +935,15 @@ class SchedulerDisaggregationPrefillMixin:
         )
 
         self.batch_result_processor._wait_result_copy(result)
+        if ced_boundary_enabled() and (
+            (metadata_buffers := self.disagg_metadata_buffers).ced_boundary is not None
+        ):
+            write_ced_boundary_slots(
+                result.ced_boundary,
+                batch.reqs,
+                metadata_buffers.ced_boundary,
+                metadata_buffers.ced_boundary_layout,
+            )
         auxiliary_output_starts = (
             self.batch_result_processor.snapshot_auxiliary_output_starts(batch, result)
         )

@@ -33,6 +33,7 @@ from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.base.conn import KVArgs, StateType
+    from sglang.srt.disaggregation.ced_boundary import CedBoundaryLayout
     from sglang.srt.disaggregation.common.conn import (
         CommonKVBootstrapServer,
         CommonKVManager,
@@ -375,6 +376,7 @@ class MetadataBuffers:
         output_dsa_topk_indices_dim: int = 0,
         *,
         kv_checksum_enabled: bool = False,
+        ced_boundary_layout: Optional["CedBoundaryLayout"] = None,
     ):
         self.custom_mem_pool = custom_mem_pool
         self.output_dsa_topk_indices_dim = output_dsa_topk_indices_dim
@@ -469,6 +471,23 @@ class MetadataBuffers:
                     device=self.bootstrap_room.device,
                 )
 
+        # CED boundary handoff: one window state per slot. Registered last, so a
+        # pipeline stage that does not run the boundary layer (and registers no
+        # such buffer) never addresses it.
+        self.ced_boundary_layout = ced_boundary_layout
+        self.ced_boundary: torch.Tensor | None = None
+        if ced_boundary_layout is not None:
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.custom_mem_pool
+                else nullcontext()
+            ):
+                self.ced_boundary = torch.zeros(
+                    (self.output_ids.shape[0], ced_boundary_layout.nbytes),
+                    dtype=torch.uint8,
+                    device=self.bootstrap_room.device,
+                )
+
     def set_kv_checksum(self, req: Req, value: int) -> None:
         self.kv_checksum[req.metadata_buffer_index, 0] = value
 
@@ -495,6 +514,8 @@ class MetadataBuffers:
         bufs.append(self.bootstrap_room)
         if self.kv_checksum is not None:
             bufs.append(self.kv_checksum)
+        if self.ced_boundary is not None:
+            bufs.append(self.ced_boundary)
         bufs = [buf for buf in bufs if buf is not None]
         ptrs = [buf.data_ptr() for buf in bufs]
         data_lens = [buf.nbytes for buf in bufs]
@@ -536,6 +557,12 @@ class MetadataBuffers:
         )
 
     def set_buf(self, req: Req):
+        if getattr(self, "ced_boundary", None) is not None:
+            from sglang.srt.disaggregation.ced_boundary import (
+                finalize_ced_boundary_slot,
+            )
+
+            finalize_ced_boundary_slot(req, self.ced_boundary, self.ced_boundary_layout)
 
         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
         # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token
