@@ -738,6 +738,13 @@ class SchedulerDisaggregationPrefillMixin:
         self.enable_continuous_input_polling = (
             self._is_continuous_input_polling_enabled()
         )
+        # Launching a batch blocks the host (synchronous copies under CC), so a
+        # result that is already finished waits a full launch before its KV is
+        # sent. Handle it first instead; continuous polling has its own wait.
+        enable_early_result = (
+            envs.SGLANG_ENABLE_DISAGG_PREFILL_EARLY_RESULT.get()
+            and not self.enable_continuous_input_polling
+        )
         self.result_queue = deque()
         batch_result_completion_status = torch.empty(1, dtype=torch.int32, device="cpu")
         # True when intake repeats while the oldest batch result is unfinished.
@@ -765,6 +772,17 @@ class SchedulerDisaggregationPrefillMixin:
             # Resume batch creation on completion, new/ready requests, or an idle step.
             if not waiting_for_batch_result or received_inputs or bootstrapped_reqs:
                 skip_batch_creation = False
+
+            processed_early = (
+                enable_early_result
+                and len(self.result_queue) > 0
+                and self._is_disagg_prefill_result_done_on_all_ranks(
+                    self.result_queue[0][1], batch_result_completion_status
+                )
+            )
+            if processed_early:
+                oldest_batch, oldest_batch_result = self.result_queue.popleft()
+                self.process_batch_result(oldest_batch, oldest_batch_result)
 
             # Keep at most two batches in flight.
             if (
@@ -799,7 +817,11 @@ class SchedulerDisaggregationPrefillMixin:
                 else:
                     batch_result = None
 
-            if self.last_batch:
+            if processed_early:
+                # The previous result was handled before this launch; the queue
+                # now holds only the batch just launched.
+                pass
+            elif self.last_batch:
                 if self.enable_continuous_input_polling:
                     # Resume intake until the oldest result is ready on all TP ranks.
                     oldest_batch_result = self.result_queue[0][1]
@@ -854,6 +876,37 @@ class SchedulerDisaggregationPrefillMixin:
         if state == 0:
             # Every rank must submit delayed sampling before entering this wait.
             raise RuntimeError("Prefill result copy must be submitted before polling")
+        return state == 2
+
+    def _is_disagg_prefill_result_done_on_all_ranks(
+        self: Scheduler,
+        batch_result: GenerationBatchResult,
+        batch_result_completion_status: torch.Tensor,
+    ) -> bool:
+        """Whether the result's D2H copy has finished on every TP rank.
+
+        Unlike ``is_disagg_prefill_batch_result_ready`` this never raises: a
+        copy that is not submitted yet (or not tracked) just reads as not done.
+        Every rank calls it at the same loop point, so the reduction matches.
+        """
+        # 0: not submitted; 1: copy unfinished; 2: copy finished locally.
+        state = 0
+        if batch_result.copy_ready_cpu is not None:
+            # Confidential computing: the copy runs on the async copy worker.
+            state = 2 if batch_result.copy_ready_cpu.is_set() else 1
+        elif (
+            batch_result.copy_done is not None
+            and batch_result.delay_sample_func is None
+        ):
+            state = 2 if batch_result.copy_done.query() else 1
+        if self.tp_size > 1:
+            batch_result_completion_status.fill_(state)
+            torch.distributed.all_reduce(
+                batch_result_completion_status,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.tp_cpu_group,
+            )
+            state = batch_result_completion_status.item()
         return state == 2
 
     def process_batch_result_disagg_prefill(
