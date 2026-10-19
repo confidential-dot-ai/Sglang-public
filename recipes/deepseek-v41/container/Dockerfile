@@ -1,4 +1,4 @@
-# DeepSeek-V4.1 PD image: the /data/venvs/dsv41 environment, frozen, plus this
+# DeepSeek-V4.1 PD image: the resolved requirements.lock environment plus this
 # repository's sglang and V4.1 launcher. One image serves both containers in
 # compose.yaml (the Engram holder and the PD pair). Build with build.sh.
 

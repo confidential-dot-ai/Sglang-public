@@ -8,8 +8,9 @@ Read this page for the DeepSeek-specific facts: how the model shapes serving, ho
 deployed, and the optimizations and knobs behind the shipped configuration.
 
 **Status:** the code was ported from the `dsv4.1` and `pp-encoder` bring-up branches. The PD pair
-in `recipes/deepseek-v41/container/` is the production configuration. The CED and PP2 prefill
-layouts are experimental and have not run on a GPU on this branch.
+in `recipes/deepseek-v41/container/` is the production configuration. The CED split and its
+tail graphs were not ported onto the upstream DeepSeek-V4.1 model; the launcher rejects
+`--ced-split`.
 
 ## At a glance
 
@@ -88,9 +89,9 @@ any one of them exits.
   `--disaggregation-transfer-backend` is rejected on a DSpark PD worker.
 - **Rejected for V4.1:** two-batch overlap, HiSparse, the unified KV layout, the trtllm DSv4
   attention backend, and speculation other than DSpark.
-- **Pipeline parallelism** is allowed only on a prefill worker with
-  `SGLANG_OPT_DSV41_CED_SPLIT` or `SGLANG_OPT_DSV41_PREFILL_TAIL` set. DSpark itself
-  (`speculative_hook.py`) also allows PP only on a PD prefill worker.
+- **Pipeline parallelism** is allowed only on a prefill worker of the experimental split
+  layouts, which this branch does not ship. DSpark itself (`speculative_hook.py`) also allows PP
+  only on a PD prefill worker.
 - **`--enable-decoder-swa-bounded-replay`** cannot combine with DP attention, with any prefill
   graph backend other than `breakable`, or with a breakable prefill graph under CP.
 - **Prefill graph length.** If the prefill graph has no `max_seq_len`, the hook sets 16,384 and
@@ -102,8 +103,7 @@ any one of them exits.
 Retraction on a DSpark decode worker reboots the request through prefill
 (`python/sglang/srt/disaggregation/decode.py`). For DSpark PD, the peers compare the DSpark
 layout (block size, target/draft KV layout) and attention TP at bootstrap
-(`python/sglang/srt/disaggregation/common/conn.py`). The attention-TP check is skipped for the
-CED split and the prefill tail, so a TP1 x PP2 prefill can feed a TP2 decode.
+(`python/sglang/srt/disaggregation/common/conn.py`).
 
 **Transfer backend.** `launch.py` always passes `--disaggregation-transfer-backend mooncake`.
 `--transport` (default `intra-node-nvlink`) only selects Mooncake's path through environment
@@ -154,17 +154,13 @@ The [recipes](../recipes/deepseek-v41/README.md) are thin wrappers.
 [`_common.sh`](../recipes/deepseek-v41/_common.sh) is sourced by each one and sets the shared
 defaults: GPUs 4–7, router 8040 (prefill 8041, decode 8042), bootstrap 8999, NCCL 29600 (decode
 29601), router metrics 29001. It also sets a timestamped output directory under
-`/data/dsv41-bringup/recipes/`. All three recipes pass `--cpu-engram-staging --split-cuda-graphs`
-and use the Mooncake backend with the default intra-node NVLink transport.
+`/data/dsv41-bringup/recipes/`. The recipe passes `--cpu-engram-staging --split-cuda-graphs`
+and uses the Mooncake backend with the default intra-node NVLink transport.
 
 | Recipe | Prefill (GPUs 4–5) | Decode (GPUs 6–7) | Feature env, both workers | Status |
 | --- | --- | --- | --- | --- |
 | [`tp2-pd.sh`](../recipes/deepseek-v41/tp2-pd.sh) | TP2+EP2, all 40 layers, DSpark | TP2+EP2, DSpark | None | Production layout; the container runs it |
-| [`ced-pp2.sh`](../recipes/deepseek-v41/ced-pp2.sh) | TP1 x PP2 (EP1), encoder layers 0–20, partition `8,13`, no DSpark | TP2+EP2, DSpark, prompt-tail replay | `SGLANG_OPT_DSV41_CED_SPLIT=1` | Experimental; ran on `pp-encoder`, not on this branch |
-| [`prefill-tail-pp2.sh`](../recipes/deepseek-v41/prefill-tail-pp2.sh) | TP1 x PP2 (EP1), all 40 layers, partition `14,26`, DSpark on the last stage, bounded replay of layers 21–39 | TP2+EP2, DSpark | `SGLANG_OPT_DSV41_PREFILL_TAIL=1` | Experimental. No GPU run recorded on any branch |
 
-The PP recipes get `SGLANG_PP_LAYER_PARTITION` on prefill only, from `--prefill-pp-partition` or
-the defaults above. `--ced-split` and `--prefill-bounded-replay` are mutually exclusive, and
 `--prefill-bounded-replay` requires `--split-cuda-graphs`.
 
 **The recipes do not encode the serving settings.** `tp2-pd.sh` passes only
@@ -243,14 +239,14 @@ worker (0 keeps the process-wide value).
 `--split-cuda-graphs` uses the breakable graph backend through an explicit
 `--cuda-graph-config`. Prefill captures powers of two from 256 tokens up to the chunk size, plus
 the chunk size itself. Decode captures powers of two up to the request limit, plus the limit
-itself and any `--decode-graph-extra-bs`. Because the prefill backend is set explicitly, PP2
-prefill keeps its graphs; `cuda_graph_hook.py` otherwise disables breakable prefill graphs under
-PP.
+itself and any `--decode-graph-extra-bs`.
 
 - **Short prompts.** Prompts under the 256-token bucket run eager prefill.
-- **Late-layer trimming.** The launcher always enables decoder SWA bounded replay (late-layer
-  trimming) on decode. On prefill it enables it with `--prefill-bounded-replay`, or when split
-  graphs are off (then both prefill and decode graphs are disabled).
+- **Late-layer trimming.** Decoder SWA bounded replay is upstream's implementation, and
+  upstream defaults it on. The launcher passes it explicitly: on for decode, off for prefill
+  (`--no-enable-decoder-swa-bounded-replay`), as in production. `--prefill-bounded-replay`, or
+  turning split graphs off (which disables both prefill and decode graphs), enables it on
+  prefill too.
 - **Verification.** `TARGET_VERIFY` satisfies `is_extend()`, so the model excludes it from
   prefill-only graph breaks.
 
@@ -265,60 +261,6 @@ Everything else stays captured. Enable it with the launcher's `--prefill-graph-m
 (with `--split-cuda-graphs`); production uses 65,536. The launcher's
 `--prefill-graph-eager-indexer` and `--prefill-hoist-per-batch` fail on purpose and point to
 that flag. Not validated with `--prefill-bounded-replay` or context parallelism.
-
-### CED split and tail graphs (experimental)
-
-In the CED split, prefill builds and runs only the **encoder layers 0–20**, through the last
-KV-source layer. It hands their KV and a wider SWA window to decode. Decode then replays each
-prompt's tail through every layer (decoder SWA bounded replay). That replay seeds:
-
-- the late-layer windows;
-- the first token;
-- the DSpark draft ring.
-
-Late layers 21–39 own no compressed KV, so prefill can skip them.
-
-Set `SGLANG_OPT_DSV41_CED_SPLIT=1` on both workers, or use the launcher's `--ced-split`. The
-prefill side runs TP1 x PP2 with partition `8,13` and no DSpark.
-
-**The cost moves to decode.** The eager tail replay is host-dispatch bound, not GPU bound. Tail
-graphs reduce the launch cost:
-
-| Feature | Knob or file |
-| --- | --- |
-| Encoder tail graphs | `SGLANG_DSV41_CED_TAIL_ENCODER_GRAPH`, `..._ENCODER_EXACT_ROWS` (`ced_encoder_graph.py`) |
-| Late-layer tail graphs | `SGLANG_DSV41_CED_TAIL_LATE_GRAPH` (`ced_tail_graph.py`) |
-| Tail coalescing | `SGLANG_DSV41_CED_TAIL_BATCH_SIZE`, `..._MAX_WAIT_MS` |
-| Static graph retention | `ced_graph_cache.py` |
-
-Padded buckets change GEMM results, so only exact-row encoder graphs are used. In the bring-up
-CED stayed behind the plain TP2 pair.
-
-**How to check CED:**
-
-- `SGLANG_DSV41_CED_TAIL_GRAPH_CHECK` cross-checks the first replay per shape against eager.
-  `..._CHECK_EVERY` checks every replay.
-- `SGLANG_DSV41_CED_TAIL_TIMING` emits non-synchronizing tail timing.
-- CED options can be changed live through the decode worker's `/set_internal_state`.
-  `python/sglang/srt/disaggregation/ced_options.py` validates them on all TP ranks.
-
-### Pipeline-parallel prefill (experimental)
-
-PP2 exists only as a prefill-side layout for the two split modes. It puts TP1 on each of two
-GPUs, with `SGLANG_PP_LAYER_PARTITION` set by `--prefill-pp-partition`. Stages must split at
-KV-source layers.
-
-Bring-up exposed two bugs, both fixed:
-
-- **Missing layer IDs.** Ratio-2 KV/index entries did not publish layer IDs, which crashed
-  Mooncake's transfer thread with an `IndexError`.
-- **Dropped `prev_pre`.** The prefill graph buffers omitted the mHC `prev_pre` coefficients, so
-  graph replay could silently discard them. They are now carried as float32
-  `[tokens, hc_mult]`; see `test/registered/unit/models/test_deepseek_v4_pp_prev_pre_handoff.py`.
-
-`SGLANG_OPT_DSV41_PREFILL_TAIL` is the alternative layout: PP2 prefill over all 40 layers
-(partition `14,26`), the late layers over only the bounded prompt tail, and DSpark on the last
-stage. No GPU run is recorded on any branch.
 
 ### DSpark on DeepSeek
 
@@ -353,9 +295,7 @@ unqualified here.
 2. **Real DSpark acceptance under DevTools OFF** is the number to qualify against.
 3. **Isolate PD handoff cost.** Correlate request IDs across router and workers, and record
    transfer bytes and durations.
-4. **CED.** Reduce eager indexer and attention scaffolding in the tail replay, and cover more
-   exact shapes without large capture memory. Until then, CED stays behind the plain TP2 pair.
-5. **Operations before any exposure:** auth, TLS, worker metrics and an admission cap. See the
+4. **Operations before any exposure:** auth, TLS, worker metrics and an admission cap. See the
    [operator guide](../recipes/deepseek-v41/Agent_Readme.md#before-go-live).
 
 ## 5. Knob reference
@@ -369,10 +309,6 @@ All of these are defined in `python/sglang/srt/environ.py` unless marked as a la
 | `SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE`, `SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT` | off, `shared` | Host-table path; needs host registration, which this CC VM lacks. The launcher always sets the first to `1` and the layout to `--host-layout` (default `auto`). `engram.py` accepts only `shared` or `per_rank`, so a launch without `--cpu-engram-staging` fails at model load unless `--host-layout shared` is passed |
 | Set by the launcher, read by nothing | | `SGLANG_DSV41_ENGRAM_HOST_TABLE_PIN`, `SGLANG_ENABLE_DSV41_ENGRAM_DROP_PAGE_CACHE`, `SGLANG_ENABLE_DSV41_ENGRAM_KV_PREFETCH`, `SGLANG_DSV41_DEEP_GEMM_CANDIDATE_INDEXER`. `--candidate-indexer deepgemm` therefore only adds DeepGEMM import checks to preflight |
 | `SGLANG_RAGGED_VERIFY_MODE` | `static` | The launcher sets `static`; the DSpark PD hook requires it |
-| `SGLANG_OPT_DSV41_CED_SPLIT` | off | CED split, set on both workers |
-| `SGLANG_OPT_DSV41_PREFILL_TAIL` | off | PP2 prefill-side tail; exclusive with CED |
-| `SGLANG_DSV41_CED_TAIL_{ENCODER_GRAPH,LATE_GRAPH,BATCH_SIZE,MAX_WAIT_MS}` | off, off, 1, 1000 | CED tail graphs and coalescing |
-| `SGLANG_DSV41_CED_TAIL_GRAPH_CHECK[_EVERY]`, `SGLANG_DSV41_CED_TAIL_TIMING` | off | CED verification and timing |
 | `SGLANG_OPT_DSV41_ASYNC_TAIL_METADATA` | off | A/B for pinned uploads in tail metadata |
 | `SGLANG_DSV41_TORCH_PREFILL_INDEXER` | off | Torch ratio-1/2 prefill indexer (fallback) |
 | `SGLANG_OPT_DSV41_PREFILL_GRAPH_EAGER_INDEXER` | off | Eager break for the prefill graph's ratio-1/2 index layers; lifts the 16,384-token prefill graph cap. Set by `--prefill-graph-max-seq-len N` above 16,384 |

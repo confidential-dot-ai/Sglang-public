@@ -47,6 +47,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
     graph_pool_capture_scope,
     graph_pool_replay_scope,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -77,7 +78,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         self._capture_inputs: Dict[Any, Any] = {}
         self._pool = None
         self._device_module = cuda_graph_runner.device_module
-        self._tp_group = cuda_graph_runner.model_runner.tp_group
+        self._tp_group = get_parallel().tp_group
         self._capture_stream: Optional[torch.cuda.Stream] = None
         self._debug_eager = debug_eager
         self._shared_output_buffer: Optional[Any] = None
@@ -130,9 +131,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                 post_warmup_hook()
 
         graph = BreakableCUDAGraph(self.deduped_cuda_graph)
-        captured_fn = (
-            eager_on_graph(True)(forward_fn) if self._debug_eager else forward_fn
-        )
+        captured_fn = eager_on_graph(forward_fn) if self._debug_eager else forward_fn
         buffer_rows = self._ensure_shared_output_buffer(warmup_out)
         with (
             graph_pool_capture_scope(),
@@ -341,8 +340,8 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                     getattr(output, name), getattr(output_buffer, name), num_tokens
                 )
             return
-        if isinstance(output, (list, tuple)) and isinstance(
-            output_buffer, type(output)
+        if (isinstance(output, list) and isinstance(output_buffer, list)) or (
+            isinstance(output, tuple) and isinstance(output_buffer, tuple)
         ):
             if len(output) != len(output_buffer):
                 raise ValueError(

@@ -1,11 +1,10 @@
 """The abort status a scheduler picks must survive to the HTTP response.
 
-`TokenizerManager._handle_abort_finish_reason` raises an HTTPException only
-for statuses it explicitly lists. A status the scheduler emits but the list
-omits does not degrade to a different code -- it is dropped entirely and the
-client receives a silent, empty, 200 completion. That silent path is what
-these cases guard: load shedding must reach the caller as 429, which the
-provider API contract requires so an overloaded server tells clients to back off.
+`TokenizerManager._handle_abort_finish_reason` raises an HTTPException for
+error statuses. A status it dropped would not degrade to a different code --
+the client would receive a silent, empty, 200 completion. That silent path is
+what these cases guard: load shedding must reach the caller as 429 so an
+overloaded server tells clients to back off.
 
 No server, no model loading -- pure CPU.
 """
@@ -34,9 +33,14 @@ def _abort_output(status_code):
 
 class TestAbortStatusPropagation(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.state = SimpleNamespace(obj=SimpleNamespace(rid="r0", lora_path=None))
+        self.state = SimpleNamespace(
+            obj=SimpleNamespace(rid="r0", lora_path=None), lora_released=False
+        )
         self.manager = SimpleNamespace(
             rid_to_state={}, enable_lora=False, lora_registry=None
+        )
+        self.manager._release_lora_once = lambda state: (
+            TokenizerManager._release_lora_once(self.manager, state)
         )
 
     async def _handle(self, status_code):

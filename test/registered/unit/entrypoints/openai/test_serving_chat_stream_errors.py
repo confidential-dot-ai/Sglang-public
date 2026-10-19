@@ -43,6 +43,7 @@ class TestChatStreamErrors(unittest.IsolatedAsyncioTestCase):
         self.chat = OpenAIServingChat.__new__(OpenAIServingChat)
         self.chat.tokenizer_manager = self.tm
         self.chat.chat_encoding_spec = None
+        self.chat.reasoning_parser = None
         self.request = ChatCompletionRequest(
             model="m3", messages=[{"role": "user", "content": "Hi"}], stream=True
         )
@@ -245,6 +246,7 @@ class TestTokenizerStreamAbort(unittest.IsolatedAsyncioTestCase):
         self.tm.rid_to_state = {}
         self.tm.encoder_dispatch_ready = {}
         self.tm.enable_metrics = False
+        self.tm.enable_lora = False
         self.tm._dispatch_to_scheduler = Mock()
         self.tm._init_req_state = self._init_state
 
@@ -254,6 +256,8 @@ class TestTokenizerStreamAbort(unittest.IsolatedAsyncioTestCase):
                 time_stats=SimpleNamespace(api_server_dispatch_time=0.0),
                 dispatched=False,
                 abort_sent=False,
+                lora_released=False,
+                obj=SimpleNamespace(lora_path=None),
             )
 
     def _mark_dispatched(self, *args):

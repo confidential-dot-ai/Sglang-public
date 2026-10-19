@@ -221,8 +221,8 @@ def _get_text_config(config: Any) -> Any:
     return config
 
 
-def _get_dspark_config(config: Any) -> dict:
-    cfg = _cfg_get(config, "dspark_config", None)
+def _get_nested_config(config: Any, key: str) -> dict:
+    cfg = _cfg_get(config, key, None)
     if cfg is None:
         return {}
     if isinstance(cfg, dict):
@@ -231,6 +231,14 @@ def _get_dspark_config(config: Any) -> dict:
         return dict(cfg)
     except Exception:
         return {}
+
+
+def _get_dspark_config(config: Any) -> dict:
+    # Published DSpark drafts nest their fields under dflash_config.
+    return {
+        **_get_nested_config(config, "dflash_config"),
+        **_get_nested_config(config, "dspark_config"),
+    }
 
 
 def _validate_dspark_swa_config(draft_hf_config: Any) -> None:

@@ -8,7 +8,7 @@ hand-started launcher.
 | piece | what it is |
 | --- | --- |
 | `Dockerfile` | CUDA 13.0.3 devel (the host toolkit), Python 3.12, `requirements.lock`, this checkout's sglang (editable) and the V4.1 launcher |
-| `requirements.lock` | `uv pip freeze` of `/data/venvs/dsv41`, installed with `--no-deps` |
+| `requirements.lock` | the resolved environment for `python/pyproject.toml` plus Mooncake and the router (regeneration command in its header), installed with `--no-deps` |
 | `build.sh` | builds `dsv41-pd:<sha>[-dirty-<hash>]` and `dsv41-pd:latest`, recording the source state for `launch.py` |
 | `compose.yaml` | `engram-cache` (the holder), `pd` (one pair via `tp2-pd.sh`) |
 | `dsv41.env` | GPUs, ports, image, and the serving flags |

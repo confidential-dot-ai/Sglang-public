@@ -61,9 +61,11 @@ six-token verification window. Verification satisfies `ForwardMode.is_extend()` 
 decode graph runner, so the model's hash/attention helpers and low-ratio projection dispatch
 exclude verification from prefill-only graph breaks.
 
-Decoder SWA bounded replay (late-layer trimming after layer 20) is always on for decode. On
-prefill it is on only with `--prefill-bounded-replay`, because the model rejects prefill graphs
-with bounded replay otherwise.
+Decoder SWA bounded replay is upstream's implementation (late-layer trimming after the last
+shared-KV source layer). Upstream defaults it on, so the launcher passes the flag explicitly:
+`--enable-decoder-swa-bounded-replay` on decode and `--no-enable-decoder-swa-bounded-replay` on
+prefill, matching the production configuration. `--prefill-bounded-replay` turns it on for
+prefill as well.
 
 ## Engram residency
 
@@ -156,7 +158,8 @@ pair's resident allocation, or both pairs must share one holder.
 - `--prefill-graph-max-seq-len N`: the longest context the split prefill graphs replay (needs
   `--split-cuda-graphs`). The server caps it at 16,384 by default; above that the prefill
   ratio-1/2 index layers run as eager breaks (`SGLANG_OPT_DSV41_PREFILL_GRAPH_EAGER_INDEXER`, set
-  on prefill workers by this flag). Rejected together with `--prefill-bounded-replay`.
+  on prefill workers by this flag). Not validated with `--prefill-bounded-replay`, which the
+  launcher rejects in combination with values above the captured-indexer limit.
   `--prefill-graph-eager-indexer` and `--prefill-hoist-per-batch` fail on purpose.
 - `--prefill-swa-prefix-tails N`: SWA prefix tails retained on prefill. Each cached prefix needs
   its own tail, so this sets how many conversations keep their prefix cache.
@@ -172,8 +175,11 @@ pair's resident allocation, or both pairs must share one holder.
 - `--parallel-load`, `--kernel-cache-dir`, `--compact-host-memory`: startup. Under CC, CUDA
   initialization needs free 2 MiB host pages; `--compact-host-memory` drops the page cache and compacts host memory right
   before each worker starts.
-- `--ced-split`, `--prefill-pp`, `--prefill-pp-partition`, `--prefill-bounded-replay`:
-  experimental split layouts; see `confai-docs/DEEPSEEK_V4.md`.
+- `--prefill-bounded-replay`: decoder SWA bounded replay on prefill too (off by default).
+- `--prefill-pp`, `--prefill-pp-partition`: experimental pipeline-parallel prefill; no GPU run
+  recorded on this branch.
+- `--ced-split`: rejected. The CED encoder and tail graphs were not ported onto the upstream
+  DeepSeek-V4.1 model.
 
 ### N prefill : 1 decode
 

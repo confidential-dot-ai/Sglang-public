@@ -326,9 +326,10 @@ def validate(args):
             )
     if args.prefill_hicache_ratio is not None and args.prefill_hicache_ratio <= 1:
         raise ValueError("--prefill-hicache-ratio must exceed 1")
-    if args.ced_split and args.prefill_bounded_replay:
+    if args.ced_split:
         raise ValueError(
-            "--ced-split and --prefill-bounded-replay are mutually exclusive"
+            "--ced-split is not supported on this branch: the CED encoder and "
+            "tail graphs were not ported onto the upstream DeepSeek-V4.1 model"
         )
     if args.prefill_bounded_replay and not args.split_cuda_graphs:
         raise ValueError("--prefill-bounded-replay requires --split-cuda-graphs")
@@ -544,10 +545,6 @@ def build_plan(args):
             CUDA_CACHE_PATH=str(cache / "nv"),
             SGLANG_CACHE_DIR=str(cache),
         )
-        if args.prefill_bounded_replay:
-            env["SGLANG_OPT_DSV41_PREFILL_TAIL"] = "1"
-        if args.ced_split:
-            env["SGLANG_OPT_DSV41_CED_SPLIT"] = "1"
         if role == "prefill" and args.prefill_hicache_ratio is not None:
             # SWA-only evictions here are mostly superseded conversation tails; the
             # synchronous CC copy that demoted them took 8% of scheduler time for no
@@ -655,8 +652,12 @@ def build_plan(args):
                 ),
             }
             command += ["--cuda-graph-config", json.dumps(graph_config)]
+            # Explicit both ways: unset, the server turns it on for supported
+            # configurations, and prefill is validated with it off.
             if role == "decode" or args.prefill_bounded_replay:
                 command += ["--enable-decoder-swa-bounded-replay"]
+            else:
+                command += ["--no-enable-decoder-swa-bounded-replay"]
         elif role == "decode" and not args.cpu_engram_staging:
             command += ["--cuda-graph-max-bs-decode", str(requests)]
         else:

@@ -384,6 +384,10 @@ class SpecInputType(IntEnum):
 
 
 class SpecInput(ABC):
+    # Whether this input carries all state required for CUDA graph replay.
+    # Algorithm-specific dataclass subclasses can override this per input.
+    cuda_graph_compatible: bool = True
+
     # Per-request verify lengths for the ragged-verify graphs (see
     # sglang.srt.speculative.ragged_verify); verify inputs of algorithms with
     # supports_ragged_verify() override it per step. Must stay a class-level
@@ -417,6 +421,10 @@ class SpecInput(ABC):
     # device tensors. Class-level default for the same dataclass-subclass
     # reason as ragged_verify_layout above.
     is_idle_participation: bool = False
+    # A multi-step draft's per-step sliding-window read rail; only the
+    # multi-step draft backend of a sliding-window KV pool builds it.
+    window_kv_indptr: Optional[torch.Tensor] = None
+    window_kv_indices: Optional[torch.Tensor] = None
 
     def __init__(self, spec_input_type: SpecInputType):
         self.spec_input_type = spec_input_type

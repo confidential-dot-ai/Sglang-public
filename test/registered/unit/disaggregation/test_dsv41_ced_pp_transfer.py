@@ -3,7 +3,7 @@
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.disaggregation.base.conn import StateType
+from sglang.srt.disaggregation.base.conn import KVPoll, StateType
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
 from sglang.srt.disaggregation.utils import (
     build_kv_layer_ids,
@@ -118,6 +118,8 @@ class TestCEDPPTransfer(unittest.TestCase):
         manager.is_hybrid_mla_backend = False
         manager.enable_custom_mem_pool = False
         manager.max_transfer_batch_indices = 0
+        manager.state_strides_validated = {"test"}
+        manager.request_status = {0: KVPoll.Transferring}
         manager.pp_size = 2
         # TP1 prefill stages feeding a TP2 decode, as in the CED PP2 topology.
         manager.attn_tp_size = 1
@@ -139,7 +141,9 @@ class TestCEDPPTransfer(unittest.TestCase):
             dst_state_layer_ids=[dst_ids],
             dst_attn_tp_size=2,
         )
-        req = SimpleNamespace(mooncake_session_id="test", dst_state_indices=[[0]])
+        req = SimpleNamespace(
+            mooncake_session_id="test", dst_state_indices=[[0]], room=0
+        )
         with envs.SGLANG_OPT_DSV41_PREFILL_TAIL.override(True):
             rc = manager.maybe_send_extra(
                 req,

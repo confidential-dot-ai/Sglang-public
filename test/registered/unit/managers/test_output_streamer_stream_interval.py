@@ -49,6 +49,7 @@ class _FakeReq:
         self.mm_audio_tokens = 0
         self.mm_video_tokens = 0
         self.multimodal_inputs = None
+        self.mm_token_counts_ready = True
         self.customized_info = None
         self.is_retracted = False
         self.return_logprob = True
@@ -60,6 +61,11 @@ class _FakeReq:
         self.spec_correct_drafts_histogram = []
         self.spec_cap_lens_histogram = []
         self.stop_prefix = False
+        self.get_mm_token_counts = lambda: (
+            self.mm_image_tokens,
+            self.mm_audio_tokens,
+            self.mm_video_tokens,
+        )
         self.logprob = SimpleNamespace(
             output_token_logprobs_val=[],
             output_token_logprobs_idx=[],

@@ -42,6 +42,9 @@ class TestLaunch(unittest.TestCase):
             self.assertEqual(
                 "--enable-decoder-swa-bounded-replay" in command, role == "decode"
             )
+            self.assertEqual(
+                "--no-enable-decoder-swa-bounded-replay" in command, role == "prefill"
+            )
 
     def test_bounded_prefill_graph_plan(self):
         plan = launch.build_plan(
@@ -70,10 +73,10 @@ class TestLaunch(unittest.TestCase):
         )
         for worker in plan["workers"]:
             self.assertNotIn("SGLANG_OPT_DSV41_CED_SPLIT", worker["env"])
-            self.assertEqual(worker["env"]["SGLANG_OPT_DSV41_PREFILL_TAIL"], "1")
+            self.assertNotIn("SGLANG_OPT_DSV41_PREFILL_TAIL", worker["env"])
             self.assertIn("--speculative-algorithm", worker["command"])
         args.ced_split = True
-        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+        with self.assertRaisesRegex(ValueError, "not supported on this branch"):
             launch.build_plan(args)
 
     def test_cleanup_only_selects_owned_gpu_pids_and_direct_children(self):
