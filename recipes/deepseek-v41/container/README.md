@@ -10,7 +10,7 @@ hand-started launcher.
 | `Dockerfile` | CUDA 13.0.3 devel (the host toolkit), Python 3.12, `requirements.lock`, this checkout's sglang (editable) and the V4.1 launcher |
 | `requirements.lock` | `uv pip freeze` of `/data/venvs/dsv41`, installed with `--no-deps` |
 | `build.sh` | builds `dsv41-pd:<sha>[-dirty-<hash>]` and `dsv41-pd:latest`, recording the source state for `launch.py` |
-| `compose.yaml` | `engram-cache` (the holder), `pd` (one pair via `tp2-pd.sh`), and the `bench` profile's `oracle-proxy` |
+| `compose.yaml` | `engram-cache` (the holder), `pd` (one pair via `tp2-pd.sh`) |
 | `dsv41.env` | GPUs, ports, image, and the serving flags |
 | `dsv41-engram-cache.service` | runs the holder container; active once every shard is locked |
 | `dsv41-pd.service` | runs the pair container; active once its smoke completion passed, relaunched 240 s after a failure |
@@ -49,24 +49,7 @@ boot of a new kernel cache also compiles kernels into `--kernel-cache-dir`; on
 B200 that took about an hour.
 
 Logs: `journalctl -u dsv41-pd` has the launcher; worker logs are in the run's
-output directory. For a benchmark run, add the oracle flag for one boot only and
-start the forced-token adapter:
-
-```bash
-sudo systemctl edit --runtime dsv41-pd   # [Service] Environment="DSV41_EXTRA_ARGS=--oracle-commit-length 6"
-sudo systemctl restart dsv41-pd
-docker compose -f recipes/deepseek-v41/container/compose.yaml \
-    --env-file recipes/deepseek-v41/container/dsv41.env --profile bench \
-    up -d --no-deps --no-recreate oracle-proxy
-```
-
-Keep `--no-deps --no-recreate`. Without them compose compares the running `pd`
-with a config that lacks systemd's `DSV41_EXTRA_ARGS`, recreates it and the holder,
-and takes the pair down (2026-10-17).
-
-Without that flag, a native `/generate` request carrying `forced_token_ids`
-crashes DSpark decode and with it the pair; the router does not forward that
-field.
+output directory.
 
 ## Why it is shaped this way
 

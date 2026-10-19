@@ -78,30 +78,6 @@ services:
       start_period: 60m
       start_interval: 15s
 
-  # Benchmark-only forced-token adapter: `--profile bench`.
-  oracle-proxy:
-    profiles: [bench]
-    image: ${DSV41_IMAGE:-dsv41-pd:latest}
-    command:
-      - python
-      - benchmark/deepseek_v41_pd/oracle_pd_proxy.py
-      - --prefill-url
-      - http://127.0.0.1:${PREFILL_PORT:-8041}@${BOOTSTRAP_PORT:-8999}
-      - --decode-url
-      - http://127.0.0.1:${DECODE_PORT:-8042}
-      - --port
-      - ${ORACLE_PROXY_PORT:-8034}
-      - --log-level
-      - warning
-    volumes:
-      # The proxy loads the tokenizer from the checkpoint.
-      - ${DSV41_MODEL:-/data/DeepSeek-V4.1-Flash}:/data/DeepSeek-V4.1-Flash:ro
-    network_mode: host
-    depends_on:
-      pd:
-        condition: service_healthy
-    restart: "no"
-
 volumes:
   # The holder's ready file (its PID); tmpfs, so it never survives the holder's node.
   run:

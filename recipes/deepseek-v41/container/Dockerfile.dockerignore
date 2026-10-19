@@ -2,7 +2,6 @@
 *
 !python
 !benchmark/deepseek_v41_pd
-!benchmark/oracle_replay
 !recipes/deepseek-v41
 **/__pycache__
 **/*.pyc

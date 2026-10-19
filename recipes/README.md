@@ -1,11 +1,11 @@
 # Recipes
 
-Launch recipes for configurations brought up on this fork. Each recipe is a
+Launch recipes for configurations served from this branch. Each recipe is a
 thin wrapper around an existing launcher. It pins the flags for one
 configuration so the command does not live only in a report or a shell history.
 
-These are bring-up and qualification configurations, not deployment advice.
-The recommended deployment for a model lives on its `docs/cookbook/` page.
+`deepseek-v41/container/` holds the production deployment: the image, compose
+file and systemd units for one PD pair.
 
 | Model | Folder | Launcher it wraps |
 | --- | --- | --- |

@@ -44,7 +44,6 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     && SGLANG_BUILD_RUST_EXTS=none uv pip install --no-deps --no-build-isolation -e python
 
 COPY benchmark/deepseek_v41_pd benchmark/deepseek_v41_pd
-COPY benchmark/oracle_replay benchmark/oracle_replay
 COPY recipes/deepseek-v41 recipes/deepseek-v41
 
 ARG SOURCE_RECORD

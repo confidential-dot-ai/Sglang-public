@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # `engram` holds the Engram pages, `pd` runs one PD pair through tp2-pd.sh with
-# the holder's PID; anything else runs as given (e.g. a probe or the oracle proxy).
+# the holder's PID; anything else runs as given (e.g. a probe).
 set -euo pipefail
 cd /opt/sglang
 export MODEL="${MODEL:-/data/DeepSeek-V4.1-Flash}"

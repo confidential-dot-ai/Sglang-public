@@ -9,8 +9,7 @@
 #   both     SGLANG_OPT_DSV41_CED_SPLIT=1
 #   prefill  SGLANG_PP_LAYER_PARTITION=8,13 (stages split at kv_source layers)
 #
-# GPU-validated on the pp-encoder branch (benchmark/deepseek_v41_pd/pp2-ced-report.md).
-# Not yet rerun on cc-main.
+# GPU-validated on the pp-encoder branch; not yet rerun on this branch.
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"
 
