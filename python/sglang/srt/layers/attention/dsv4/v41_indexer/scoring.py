@@ -24,15 +24,16 @@ from sglang.kernels.ops.attention.dsv4.topk import (
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import async_h2d
 
+from .memory_budget import INDEX_LOGITS_BUDGET_CAP_BYTES, planned_index_logits_budget
 from .types import DecodeInputs, PrefillInputs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsv4.dsv41_sparse import DeepseekV41Indexer
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
-# TODO: use a per-forward mqa_logits_budget_bytes() budget that also
-# leaves room for candidate block ids and block-selection scratch.
-_DEEP_GEMM_SCORE_BUDGET_BYTES = 2 << 30
+# Cap of one fp32 logits tile; startup planning (memory_budget) may lower it to
+# what CUDA-graph capture leaves free.
+_DEEP_GEMM_SCORE_BUDGET_BYTES = INDEX_LOGITS_BUDGET_CAP_BYTES
 
 
 class DeepGEMMDecodeData(msgspec.Struct, frozen=True):
@@ -241,7 +242,7 @@ def score_tiles(data: DeepGEMMPrefillData, kv: Tuple[torch.Tensor, torch.Tensor]
         starts=data.request_starts,
         lengths=data.compress_lens,
         context_lengths=data.lens_per_request,
-        budget_bytes=_DEEP_GEMM_SCORE_BUDGET_BYTES,
+        budget_bytes=min(_DEEP_GEMM_SCORE_BUDGET_BYTES, planned_index_logits_budget()),
     )
 
 

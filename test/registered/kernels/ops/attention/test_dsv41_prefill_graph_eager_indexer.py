@@ -11,7 +11,10 @@ from unittest.mock import patch
 import msgspec
 import torch
 
-from sglang.kernels.ops.attention.dsv4.fp4_indexer import quantize_fp4_indexer_tensor
+from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+    gather_fp4_index_k,
+    quantize_fp4_indexer_tensor,
+)
 from sglang.srt.layers.attention.dsv4.dsv41_sparse import DeepseekV41Indexer
 from sglang.srt.layers.attention.dsv4.metadata import (
     PagedIndexerMetadata,
@@ -22,6 +25,11 @@ from sglang.srt.layers.attention.dsv4.v41_indexer import (
     PrefillInputs,
     make_candidate_indexer,
     make_full_topk_indexer,
+)
+from sglang.srt.layers.attention.dsv4.v41_indexer.memory_budget import (
+    INDEX_LOGITS_BUDGET_CAP_BYTES,
+    eager_indexer_peak_bytes,
+    set_planned_index_logits_budget,
 )
 from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import (
     DeepGEMMPrefillData,
@@ -420,6 +428,68 @@ class TestPrefillGraphEagerIndexer(CustomTestCase):
         batch = make_batch([12000, 9000], [48, 30], seed=3)
         _, consumer = eager_layers(batch, with_projection(batch))
         assert_overlap(self, consumer, captured_layer(batch), MIN_CONSUMER_OVERLAP)
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10,
+    "DeepGEMM's paged sparse MQA logits need SM100",
+)
+class TestEagerIndexerPeakMemory(CustomTestCase):
+    """The candidate source, the largest eager index layer, stays within the
+    startup plan's peak model at long context, and smaller planned tiles select
+    what the full-budget tiles select."""
+
+    def setUp(self):
+        self.enterContext(get_parallel().override(attn_cp_size=1))
+        self.addCleanup(set_planned_index_logits_budget, None)
+        # The pool's own gather, not the test pool's index-tensor gather, whose
+        # [slots, 64] int64 offsets would dominate the peak.
+        self.enterContext(
+            patch.object(
+                IndexPool,
+                "get_low_ratio_index_k_fp4",
+                lambda pool, layer_id, slots: gather_fp4_index_k(
+                    pool.buf, slots, page_size=PAGE
+                ),
+            )
+        )
+
+    def _publish(self, batch: Batch, budget_bytes: int):
+        set_planned_index_logits_budget(None)
+        set_planned_index_logits_budget(budget_bytes)
+        prefill, _ = make_candidate_indexer(
+            token_to_kv_pool=batch.pool,
+            req_to_token=batch.req_to_token,
+            page_size=KV_PAGE,
+            candidate_topk_blocks=TOPK_BLOCKS,
+            candidate_block_size=BLOCK,
+        )
+        rows = batch.inputs.positions.shape[0]
+        source = new_selection(rows)
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        base = torch.cuda.memory_allocated()
+        published = prefill.publish_prefill(into(batch.inputs, source))
+        torch.cuda.synchronize()
+        peak = torch.cuda.max_memory_allocated() - base
+        del published
+        return source, peak
+
+    @torch.inference_mode()
+    def test_long_context_publish_fits_the_plan(self):
+        context, rows = 1 << 18, 4096
+        batch = make_batch([context], [rows], seed=5)
+        want, _ = self._publish(batch, INDEX_LOGITS_BUDGET_CAP_BYTES)
+        for budget in (256 << 20, 64 << 20):
+            got, peak = self._publish(batch, budget)
+            self.assertLessEqual(
+                peak,
+                eager_indexer_peak_bytes(
+                    budget_bytes=budget, rows=rows, context_len=context
+                ),
+            )
+            assert_overlap(self, got, want, MIN_SOURCE_OVERLAP)
 
 
 @unittest.skipUnless(
