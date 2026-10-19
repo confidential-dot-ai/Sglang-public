@@ -19,7 +19,7 @@ Before this becomes a customer endpoint, every TBD row needs a real answer. See 
 
 **One PD pair, no redundancy.** A V4.1 serving unit is one *pair*: a TP2+EP2 **prefill** worker on GPUs 0–1 and a TP2+EP2 **decode** worker on GPUs 2–3, behind one router. A request needs **both** roles: prefill computes the prompt, Mooncake (`--disaggregation-transfer-backend mooncake`, intra-node NVLink) moves its KV to decode, and decode generates. **Losing either V4.1 worker takes the pair down**, and the launcher tears down all of its processes when any one exits (see [Hard rules](#hard-rules)).
 
-**Why PD and TP2.** The TP2 weights and KV pools fit, and splitting prefill from decode keeps long prefills from stalling decode. GPUs 4–7 can hold a second pair (see [Configurations](#configurations)).
+**Why PD and TP2.** The TP2 weights and KV pools fit, and splitting prefill from decode keeps long prefills from stalling decode. GPUs 4–7 can hold a second pair or one of the PP2 experiment variants (see [Configurations](#configurations)).
 
 **Why the Engram tables live in CPU RAM, shared.** The checkpoint carries two Engram embedding tables (layers 1 and 14). One copy is 188.8 GiB, so two copies need 377.7 GiB, which is **more than the VM's 376.7 GiB of RAM**. On top of that, this CC VM cannot register host memory for GPU access: `cudaHostRegister` returns error 801 and every GPU reports `host_register_supported=0`. So:
 
@@ -95,7 +95,8 @@ Model facts that people get wrong: 40 target layers. Engram layers are **1 and 1
 Recipes live next to this file and wrap `benchmark/deepseek_v41_pd/launch.py`. [README.md](README.md) covers usage and port overrides; the recipe table (topology, ports, transfer, speculation, status) is in [DEEPSEEK_V4.md](../../confai-docs/DEEPSEEK_V4.md#launcher-and-recipes). Operationally:
 
 * `tp2-pd.sh` is the layout of the serving pair; the container runs it with the flags below.
-* Decoder SWA bounded replay is upstream's implementation. The launcher passes `--enable-decoder-swa-bounded-replay` to decode and `--no-enable-decoder-swa-bounded-replay` to prefill (upstream defaults it on); `--prefill-bounded-replay` turns it on for prefill too. `--ced-split` is rejected: the CED encoder and tail graphs were not ported onto the upstream model.
+* `ced-pp2.sh` and `prefill-tail-pp2.sh` are PP2 experiments for GPUs 4–7. CED PP2 ran on the `pp-encoder` branch; prefill-tail PP2 has no recorded GPU run on any branch. Neither has run on a GPU since the merge with upstream, which rewrote the V4.1 decoder layer: the CED encoder/late graphs and the PP pre-mix hand-off were re-ported, and the prefill-side tail now uses upstream's bounded replay.
+* Decoder SWA bounded replay is upstream's implementation. The launcher passes `--enable-decoder-swa-bounded-replay` to decode and `--no-enable-decoder-swa-bounded-replay` to prefill (upstream defaults it on); `--prefill-bounded-replay` turns it on for prefill too.
 
 ### Serving config
 
@@ -152,6 +153,7 @@ Per-batch KV usage, queue depth, cache hit and DSpark accept length are only in 
 * **20K continuation drift.** Four of five saved 8K–100K probe continuations match exactly, while the 20K one varies, even between two eager runs. First-token IDs and log probabilities always match. This is a reproducibility gap; bitwise equivalence is not claimed.
 * **Short prompts prefill eagerly.** The smallest prefill graph bucket is 256 tokens, and the runner rejects excessive padding. Decode still uses graphs.
 * **Long prompts prefill eagerly by default.** `deepseek_v4_hook.py` caps the prefill graph `max_seq_len` at 16,384 and logs that longer contexts run eager. `--prefill-graph-max-seq-len N` (production: 65,536; needs `--split-cuda-graphs`; not validated with `--prefill-bounded-replay`) runs the ratio-1/2 index layers as an eager break so longer contexts replay graphs.
+* **CED PP2 is well below the TP2 pair.** Its decode prompt-tail replay is bound by host dispatch, not GPU kernels.
 * **Boot persistence is configured but not yet exercised by a reboot.** `dsv41-engram-cache` and `dsv41-pd` are enabled container units. The `nvidia-persistenced` override (`/run/systemd/system/nvidia-persistenced.service.d/dsv41-recovery.conf`), where a node has one, still lives in `/run` and is lost on reboot.
 * **A native `/generate` request carrying `forced_token_ids` crashes DSpark decode, and the pair with it.** The router does not forward that field; direct worker ports do, so keep the worker ports unexposed.
 * **Driver mismatch after a restart.** After the data-disk restart, the loaded module (595.71.05) disagreed with NVML and the on-disk module (595.91.07), and `nvidia-smi` failed. Check `nvidia-smi` works before any launch.

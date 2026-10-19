@@ -1689,7 +1689,9 @@ class DeepseekV4AttnBackend(
     def low_ratio_prefill_graph(self) -> bool:
         """Whether ratio-1/2 sources use captured projections and indexer metadata."""
         return (
-            bool(self.low_ratios)
+            # The CED encoder graph runs ratio-1/2 sources at eager breaks.
+            not getattr(self, "ced_encoder_graph", False)
+            and bool(self.low_ratios)
             and has_dense_fp4_indexer()
             and is_sm100_or_newer()
             and get_parallel().attn_cp_size == 1

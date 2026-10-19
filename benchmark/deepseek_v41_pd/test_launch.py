@@ -73,10 +73,10 @@ class TestLaunch(unittest.TestCase):
         )
         for worker in plan["workers"]:
             self.assertNotIn("SGLANG_OPT_DSV41_CED_SPLIT", worker["env"])
-            self.assertNotIn("SGLANG_OPT_DSV41_PREFILL_TAIL", worker["env"])
+            self.assertEqual(worker["env"]["SGLANG_OPT_DSV41_PREFILL_TAIL"], "1")
             self.assertIn("--speculative-algorithm", worker["command"])
         args.ced_split = True
-        with self.assertRaisesRegex(ValueError, "not supported on this branch"):
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
             launch.build_plan(args)
 
     def test_cleanup_only_selects_owned_gpu_pids_and_direct_children(self):
@@ -553,7 +553,9 @@ class TestLaunch(unittest.TestCase):
             command = worker["command"]
             role = command[command.index("--disaggregation-mode") + 1]
             if role == "prefill":
-                self.assertEqual(command[command.index("--schedule-policy") + 1], "hrrn")
+                self.assertEqual(
+                    command[command.index("--schedule-policy") + 1], "hrrn"
+                )
             else:
                 self.assertNotIn("--schedule-policy", command)
 

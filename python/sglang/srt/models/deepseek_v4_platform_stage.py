@@ -396,6 +396,9 @@ class NonCudaDecoderMixin:
                 forward_batch=forward_batch,
                 positions=positions,
                 tbo_subbatch_index=tbo_subbatch_index,
+                # Already completed DSpark capture layers ride the operation
+                # pipeline; each TBO executor owns its own list.
+                dspark_aux_hidden_states=kwargs.get("dspark_aux_hidden_states", []),
             )
         )
 
@@ -439,6 +442,11 @@ class NonCudaDecoderMixin:
             state.pop("ffn_post"),
             state.pop("ffn_comb"),
         )
+        dspark_aux_hidden_states = state.pop("dspark_aux_hidden_states")
+        if self.capture_dspark_aux:
+            # The same completed post-FFN mHC boundary the non-TBO loop
+            # captures; padded child rows are cropped during the parent merge.
+            dspark_aux_hidden_states.append(hidden_states.mean(dim=1))
         output = dict(
             positions=state.positions,
             hidden_states=hidden_states,
@@ -447,6 +455,7 @@ class NonCudaDecoderMixin:
             residual=None,
             forward_batch=state.forward_batch,
             tbo_subbatch_index=state.tbo_subbatch_index,
+            dspark_aux_hidden_states=dspark_aux_hidden_states,
         )
         state.clear(
             expect_keys={
