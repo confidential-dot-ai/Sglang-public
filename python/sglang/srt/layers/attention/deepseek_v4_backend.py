@@ -1364,14 +1364,6 @@ class DeepseekV4AttnBackend(
         self._verify_mask = None
         self.cuda_graph_swa_out_cache_loc: Optional[torch.Tensor] = None
 
-    def _move_to_device(self, x: List[int]) -> torch.Tensor:
-        pin_tensor = torch.tensor(
-            x,
-            dtype=torch.int32,
-            pin_memory=not envs.SGLANG_OPT_DSV41_ASYNC_TAIL_METADATA.get(),
-        )
-        return pin_tensor.to(self.device, non_blocking=True)
-
     def _resolve_verify_layout(
         self,
         forward_batch: ForwardBatch,
@@ -2196,7 +2188,15 @@ class DeepseekV4AttnBackend(
             seq_lens_cpu=seq_lens_cpu_list,
             extend_len=block_size,
         )
-        extend_seq_lens = self._move_to_device(lengths.extend_seq_lens_cpu)
+        # Every request extends by block_size, so fill on device: an upload from
+        # pinned memory blocks the host behind the stream under CC, where
+        # pinned memory is managed, and a pageable one is refused in capture.
+        extend_seq_lens = torch.full(
+            (len(lengths.extend_seq_lens_cpu),),
+            block_size,
+            dtype=torch.int32,
+            device=self.device,
+        )
         return self.init_forward_metadata_prefill(
             # DSpark draft blocks are SWA-only, like draft extend. Their full
             # context page table is unused; retain only its 2-D placeholder.

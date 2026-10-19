@@ -591,10 +591,13 @@ def is_pin_memory_available(device=None) -> bool:
 
 
 def async_h2d(args: List, *, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
-    """A host list on ``device``; staged in pinned memory so the copy is enqueued
-    on the current stream instead of synchronizing like a pageable copy."""
+    """A host list on ``device``, enqueued on the current stream without blocking
+    the host. The source is pinned where pinning is available; otherwise (e.g.
+    under Confidential Computing) it is pageable, which the driver stages before
+    the call returns, so a non-blocking copy is still safe and does not wait for
+    the stream the way a blocking pageable copy does."""
     pin = is_pin_memory_available(device)
-    return torch.tensor(args, dtype=dtype, pin_memory=pin).to(device, non_blocking=pin)
+    return torch.tensor(args, dtype=dtype, pin_memory=pin).to(device, non_blocking=True)
 
 
 def async_h2d_stack(
@@ -608,7 +611,7 @@ def async_h2d_stack(
     out = torch.empty(
         (len(tensors), *tensors[0].shape), dtype=tensors[0].dtype, pin_memory=pin
     )
-    return torch.stack(tensors, out=out).to(device, non_blocking=pin)
+    return torch.stack(tensors, out=out).to(device, non_blocking=True)
 
 
 def async_d2h(tensor: torch.Tensor) -> torch.Tensor:
