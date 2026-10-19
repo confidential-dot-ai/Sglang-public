@@ -394,6 +394,117 @@ class TestLaunch(unittest.TestCase):
         self.assertEqual(router[router.index("--decode") + 1], workers[3]["url"])
         self.assertEqual(router[router.index("--prefill-policy") + 1], "manual")
 
+    def test_n_prefill_m_decode_plan_with_per_role_tp(self):
+        plan = launch.build_plan(
+            self.args(
+                "--num-prefill",
+                "1",
+                "--prefill-tp",
+                "4",
+                "--num-decode",
+                "2",
+                "--gpus",
+                "7,6,5,4,3,2,1,0",
+            )
+        )
+        workers = plan["workers"]
+        self.assertEqual(
+            [w["name"] for w in workers], ["prefill", "decode0", "decode1"]
+        )
+        self.assertEqual(
+            [w["env"]["CUDA_VISIBLE_DEVICES"] for w in workers],
+            ["7,6,5,4", "3,2", "1,0"],
+        )
+
+        def flag(worker, name):
+            return worker["command"][worker["command"].index(name) + 1]
+
+        self.assertEqual([flag(w, "--tp-size") for w in workers], ["4", "2", "2"])
+        self.assertEqual([flag(w, "--ep-size") for w in workers], ["4", "2", "2"])
+        self.assertEqual(
+            [flag(w, "--disaggregation-mode") for w in workers],
+            ["prefill", "decode", "decode"],
+        )
+        ports = [int(flag(w, "--port")) for w in workers]
+        nccl = [int(flag(w, "--nccl-port")) for w in workers]
+        self.assertEqual(len(set(ports + nccl)), 6)
+        self.assertTrue(plan["topology"].startswith("1x(TP4 prefill) + 2x(TP2 decode)"))
+        router = plan["router"]["command"]
+        decodes = [router[i + 1] for i, a in enumerate(router) if a == "--decode"]
+        self.assertEqual(decodes, [w["url"] for w in workers[1:]])
+        # One prefill needs no prefill policy; several decodes stay sticky per key.
+        self.assertNotIn("--prefill-policy", router)
+        self.assertEqual(router[router.index("--decode-policy") + 1], "manual")
+        self.assertEqual(router[router.index("--assignment-mode") + 1], "min_group")
+        for extra in (
+            ("--num-decode", "0"),
+            ("--gpus", "0,1,2,3,4,5,6"),
+            ("--prefill-pp", "2"),
+        ):
+            with self.subTest(extra=extra), self.assertRaises(ValueError):
+                launch.validate(
+                    self.args("--prefill-tp", "4", "--num-decode", "2", *extra)
+                )
+
+    def test_memory_profile_sizes_pools_and_reports_the_estimate(self):
+        def args(*extra):
+            return self.args(
+                "--cpu-engram-staging",
+                "--split-cuda-graphs",
+                "--chunk-size",
+                "12288",
+                "--prefill-requests",
+                "16",
+                "--prefill-swa-prefix-tails",
+                "256",
+                "--decode-requests",
+                "64",
+                "--context-length",
+                "131072",
+                "--mem-fraction",
+                "0.92",
+                "--max-total-tokens",
+                "auto",
+                "--decode-max-total-tokens",
+                "auto",
+                *extra,
+            )
+
+        # The B200 profile reproduces the measured pair: ~10 GiB free on prefill
+        # (9.67 measured at a 1.57M pool) and the decode cap set by --mem-fraction.
+        plan = launch.build_plan(args("--memory-profile", "B200"))
+        memory = plan["memory"]["per_rank"]
+        self.assertEqual(memory["prefill"]["pool_tokens"], 1638400)
+        self.assertEqual(memory["decode"]["pool_tokens"], 9568256)
+        command = plan["workers"][0]["command"]
+        self.assertEqual(command[command.index("--max-total-tokens") + 1], "1638400")
+        b300 = launch.build_plan(
+            args("--memory-profile", "B300", "--context-length", "1048576")
+        )["memory"]["per_rank"]
+        self.assertGreater(b300["decode"]["contexts_resident"], 32)
+        with self.assertRaisesRegex(ValueError, "needs --memory-profile"):
+            launch.build_plan(args())
+        # Without a profile the plan carries no estimate (today's plans unchanged).
+        self.assertNotIn("memory", launch.build_plan(self.args()))
+
+    def test_hicache_size_replaces_the_ratio_and_counts_against_host_ram(self):
+        plan = launch.build_plan(self.args("--prefill-hicache-size-gib", "96"))
+        command = plan["workers"][0]["command"]
+        self.assertEqual(command[command.index("--hicache-size") + 1], "96")
+        self.assertNotIn("--hicache-ratio", command)
+        self.assertNotIn("--hicache-size", plan["workers"][1]["command"])
+        args = self.args("--num-prefill", "3", "--prefill-hicache-size-gib", "96")
+        self.assertEqual(
+            3 * launch.hicache_host_bytes(args, 2, args.max_total_tokens),
+            3 * 96 * launch.GIB * 2,
+        )
+        with self.assertRaisesRegex(ValueError, "exclusive"):
+            launch.validate(
+                self.args(
+                    "--prefill-hicache-size-gib", "96", "--prefill-hicache-ratio", "4"
+                )
+            )
+
     def test_multi_prefill_rejects_colliding_ports_and_short_gpu_lists(self):
         cases = [
             ("--gpus", "0,1,2,3"),
@@ -730,6 +841,13 @@ class TestLaunch(unittest.TestCase):
             (path / "config.json").write_text(json.dumps(config))
             with self.assertRaisesRegex(ValueError, "TP2/EP2"):
                 launch.checkpoint_budget(path)
+            # 6 splits two ways but not four; TP4 is checked before the shards.
+            config["text_config"]["o_groups"] = 6
+            (path / "config.json").write_text(json.dumps(config))
+            with self.assertRaisesRegex(ValueError, "truncated"):
+                launch.checkpoint_budget(path)
+            with self.assertRaisesRegex(ValueError, "TP4/EP4"):
+                launch.checkpoint_budget(path, (2, 4))
 
     def test_host_registration_failure_cannot_be_bypassed_with_unpinned_memory(self):
         self.assertIn(

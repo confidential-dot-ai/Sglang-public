@@ -1,4 +1,4 @@
-"""Reproducible single-node DeepSeek V4.1 N x TP2 prefill + TP2 decode bring-up.
+"""Reproducible single-node DeepSeek V4.1 N prefill + M decode PD bring-up.
 
 Standard-library only: --dry-run never imports SGLang or touches CUDA. This is
 a qualification candidate, not a measured performance profile. See README.md.
@@ -25,27 +25,58 @@ SOURCE_RECORD = ROOT / "SOURCE_RECORD.json"
 GIB = 1024**3
 # The prefill graph cap the server applies when none is given (deepseek_v4_hook.py).
 CAPTURED_INDEXER_MAX_SEQ_LEN = 16384
+# Worker TP sizes. TP1 cannot hold the ~294 GiB of weights on one B200 or B300.
+TP_SIZES = (2, 4, 8)
+
+# Per-rank memory of a DSV4.1 FP8 worker, measured on the B200 CC VM from the
+# release-21eacbd216 TP2 pair's logs (2026-10-19). Pool sizing (--memory-profile)
+# derives KV pools from these; HBM fit still needs a real boot.
+#   memory.total 183359 MiB; avail at weight-load start 175.25 GiB.
+#   Weights: target 142.88 + DSpark draft 3.88 GiB per rank at TP2.
+#   Decode pool: 4,194,304 tokens and 64 SWA rings took 8.10 + 0.13 GiB.
+#   Prefill pool: 1,572,864 tokens and 16 + 256 SWA rings took 5.56 + 0.24 GiB.
+#   Graphs: prefill 12.68 GiB at chunk 12288 (15.28 at 16384), decode 1.75 GiB.
+GPU_PROFILES = {
+    "B200": dict(hbm_gib=183359 / 1024, measured=True),
+    # 288 GB nominal; confirm memory.total on the first B300 boot.
+    "B300": dict(hbm_gib=288e9 / GIB, measured=False),
+}
+CONTEXT_OVERHEAD_GIB = 3.81
+WEIGHTS_GIB_TP2 = 146.76
+KV_BYTES_PER_TOKEN = 1938
+SWA_RING_BYTES = int(10.5 * 2**20)
+DECODE_GRAPH_GIB = 1.75
+POOL_ROUND_TOKENS = 65536
+
+
+def pool_size(text):
+    return text if text == "auto" else int(text)
 
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--model", type=Path, required=True, help="Local V4.1 checkpoint")
     p.add_argument("--python", default=sys.executable)
-    p.add_argument(
-        "--num-prefill",
-        type=int,
-        default=1,
-        help="TP2 prefill workers feeding the one TP2 decode worker",
-    )
+    p.add_argument("--num-prefill", type=int, default=1, help="Prefill workers")
+    p.add_argument("--num-decode", type=int, default=1, help="Decode workers")
+    for role in ("prefill", "decode"):
+        p.add_argument(
+            f"--{role}-tp",
+            type=int,
+            choices=TP_SIZES,
+            default=2,
+            help=f"TP (= EP) size of each {role} worker",
+        )
     p.add_argument(
         "--gpus",
-        help="2*N+2 GPUs: prefill pairs first, last two decode; default 0..2N+1",
+        help="N*prefill-tp + M*decode-tp GPUs, prefill workers first, in worker "
+        "order; default 0..count-1",
     )
     p.add_argument(
         "--port",
         type=int,
         default=8030,
-        help="Router port; prefill i uses +1+i, decode +1+N",
+        help="Router port; prefill i uses +1+i, decode j +1+N+j",
     )
     p.add_argument(
         "--bootstrap-port", type=int, default=8998, help="Prefill i uses this +i"
@@ -57,7 +88,10 @@ def parser():
         help="Router Prometheus port; distinct per replica on one host",
     )
     p.add_argument(
-        "--nccl-port", type=int, default=29500, help="Prefill i uses +i, decode +N"
+        "--nccl-port",
+        type=int,
+        default=29500,
+        help="Prefill i uses +i, decode j +N+j",
     )
     p.add_argument("--context-length", type=int, default=16384)
     p.add_argument("--chunk-size", type=int, default=4096)
@@ -159,6 +193,12 @@ def parser():
         "pool; decode has no radix cache to extend",
     )
     p.add_argument(
+        "--prefill-hicache-size-gib",
+        type=int,
+        help="HiCache host pool per prefill rank in GiB (--hicache-size) instead of "
+        "--prefill-hicache-ratio; at B300 pool sizes a ratio would exceed host RAM",
+    )
+    p.add_argument(
         "--prefill-hicache-io-backend",
         choices=("direct", "kernel"),
         default="direct",
@@ -172,13 +212,31 @@ def parser():
         help="write_back copies KV to host only when the GPU pool evicts it",
     )
     p.add_argument(
-        "--max-total-tokens", type=int, default=65536, help="Per worker KV cap"
+        "--max-total-tokens",
+        type=pool_size,
+        default=65536,
+        help="Per worker KV cap; auto derives it from --memory-profile",
     )
     p.add_argument(
         "--decode-max-total-tokens",
-        type=int,
-        help="Decode KV cap; defaults to --max-total-tokens",
+        type=pool_size,
+        help="Decode KV cap; defaults to --max-total-tokens; auto as above",
     )
+    p.add_argument(
+        "--memory-profile",
+        choices=tuple(GPU_PROFILES),
+        help="GPU memory model for auto pool sizes and the launch plan's memory "
+        "estimate; preflight checks the GPUs' memory.total against it",
+    )
+    for role, gib in (("prefill", 10.0), ("decode", 6.0)):
+        p.add_argument(
+            f"--{role}-transient-reserve-gib",
+            type=float,
+            default=gib,
+            help=f"HBM {role} keeps free of KV pools for activations and kernel "
+            "workspaces (the eager indexer's logits tiles, up to 2 GiB each); "
+            "used only by --memory-profile sizing",
+        )
     p.add_argument("--mem-fraction", type=float, default=0.80)
     p.add_argument("--dspark-block-size", type=int, default=5)
     p.add_argument(
@@ -267,12 +325,13 @@ def parser():
 
 
 def worker_specs(args):
-    """Per-worker role, name and ports; prefill workers first, decode last."""
-    n = args.num_prefill
+    """Per-worker role, name, TP size and ports; prefill workers first."""
+    n, m = args.num_prefill, args.num_decode
     specs = [
         dict(
             role="prefill",
             name="prefill" if n == 1 else f"prefill{i}",
+            tp=args.prefill_tp,
             port=args.port + 1 + i,
             nccl_port=args.nccl_port + i,
             bootstrap_port=args.bootstrap_port + i,
@@ -281,16 +340,99 @@ def worker_specs(args):
     ]
     # Decode serves no bootstrap registry; its flag is only the default prefill
     # target for requests that omit bootstrap_port.
-    specs.append(
+    specs += [
         dict(
             role="decode",
-            name="decode",
-            port=args.port + 1 + n,
-            nccl_port=args.nccl_port + n,
+            name="decode" if m == 1 else f"decode{j}",
+            tp=args.decode_tp,
+            port=args.port + 1 + n + j,
+            nccl_port=args.nccl_port + n + j,
             bootstrap_port=args.bootstrap_port,
         )
-    )
+        for j in range(m)
+    ]
     return specs
+
+
+def weights_gib(tp):
+    """Per-rank weights; only TP2 is measured, others assume even sharding + 5%."""
+    return WEIGHTS_GIB_TP2 if tp == 2 else WEIGHTS_GIB_TP2 * 2 / tp * 1.05
+
+
+def swa_rings(args, role):
+    """Requests plus prefix tails: each holds one sliding-window ring per rank."""
+    if role == "decode":
+        return args.decode_requests
+    tails = args.prefill_swa_prefix_tails
+    return args.prefill_requests * (5 if tails is None else 1) + (tails or 0)
+
+
+def pool_estimate(args, role, tp, tokens=None):
+    """Per-rank HBM budget of one worker under --memory-profile, in GiB.
+
+    pool_tokens is the largest KV pool (rounded down) that leaves the role's
+    transient reserve free and stays within --mem-fraction of HBM for weights
+    plus pools. With `tokens`, the estimate is for that configured pool.
+    """
+    hbm = GPU_PROFILES[args.memory_profile]["hbm_gib"]
+    weights = weights_gib(tp)
+    graphs = 0.0
+    if args.split_cuda_graphs:
+        # Linear in the largest prefill bucket: 12.68 GiB at 12288, 15.28 at 16384.
+        graphs = (
+            12.68 + (args.chunk_size - 12288) * (15.28 - 12.34) / 4096
+            if role == "prefill"
+            else DECODE_GRAPH_GIB
+        )
+    transient = getattr(args, f"{role}_transient_reserve_gib")
+    rings_gib = swa_rings(args, role) * SWA_RING_BYTES / GIB
+    room = min(
+        hbm - CONTEXT_OVERHEAD_GIB - weights - graphs - transient,
+        hbm * args.mem_fraction - weights,
+    )
+    pool_tokens = (
+        max(0, int((room - rings_gib) * GIB // KV_BYTES_PER_TOKEN))
+        // POOL_ROUND_TOKENS
+        * POOL_ROUND_TOKENS
+    )
+    tokens = pool_tokens if tokens is None else tokens
+    pool_gib = tokens * KV_BYTES_PER_TOKEN / GIB + rings_gib
+    return dict(
+        hbm_gib=round(hbm, 2),
+        weights_gib=round(weights, 2),
+        graphs_gib=round(graphs, 2),
+        transient_reserve_gib=transient,
+        pool_tokens=tokens,
+        pool_gib=round(pool_gib, 2),
+        max_pool_tokens=pool_tokens,
+        free_gib=round(
+            hbm - CONTEXT_OVERHEAD_GIB - weights - graphs - pool_gib, 2
+        ),
+        contexts_resident=tokens // args.context_length,
+    )
+
+
+def hicache_host_bytes(args, tp, tokens):
+    """Host RAM of one prefill worker's HiCache pools (all ranks); 0 if off."""
+    if args.prefill_hicache_size_gib is not None:
+        return args.prefill_hicache_size_gib * GIB * tp
+    if args.prefill_hicache_ratio is None:
+        return 0
+    device = tokens * KV_BYTES_PER_TOKEN + swa_rings(args, "prefill") * SWA_RING_BYTES
+    return int(args.prefill_hicache_ratio * device) * tp
+
+
+def resolve_pool_sizes(args):
+    """Replace "auto" pool sizes with the --memory-profile estimate, once."""
+    for name, role, tp in (
+        ("max_total_tokens", "prefill", args.prefill_tp),
+        ("decode_max_total_tokens", "decode", args.decode_tp),
+    ):
+        if getattr(args, name) != "auto":
+            continue
+        if args.memory_profile is None:
+            raise ValueError(f"--{name.replace('_', '-')} auto needs --memory-profile")
+        setattr(args, name, pool_estimate(args, role, tp)["max_pool_tokens"])
 
 
 def validate(args):
@@ -327,6 +469,13 @@ def validate(args):
             )
     if args.prefill_hicache_ratio is not None and args.prefill_hicache_ratio <= 1:
         raise ValueError("--prefill-hicache-ratio must exceed 1")
+    if args.prefill_hicache_size_gib is not None:
+        if args.prefill_hicache_ratio is not None:
+            raise ValueError(
+                "--prefill-hicache-size-gib and --prefill-hicache-ratio are exclusive"
+            )
+        if args.prefill_hicache_size_gib <= 0:
+            raise ValueError("--prefill-hicache-size-gib must be positive")
     if args.ced_split and args.prefill_bounded_replay:
         raise ValueError(
             "--ced-split and --prefill-bounded-replay are mutually exclusive"
@@ -346,9 +495,12 @@ def validate(args):
         raise ValueError(
             "Parallel loading and resident-page credit require CPU staging"
         )
-    if args.num_prefill <= 0:
-        raise ValueError("num_prefill must be positive")
-    num_gpus = 2 * args.num_prefill + 2
+    if args.num_prefill <= 0 or args.num_decode <= 0:
+        raise ValueError("num_prefill and num_decode must be positive")
+    if args.prefill_pp > 1 and args.prefill_tp != 2:
+        raise ValueError("--prefill-pp splits a two-GPU worker; needs --prefill-tp 2")
+    resolve_pool_sizes(args)
+    num_gpus = args.num_prefill * args.prefill_tp + args.num_decode * args.decode_tp
     gpu_error = f"--gpus must contain {num_gpus} distinct nonnegative indices"
     try:
         gpus = (
@@ -545,8 +697,11 @@ def build_plan(args):
         ]
     bootstrap_index = common.index("--disaggregation-bootstrap-port") + 1
     workers = []
-    for i, spec in enumerate(worker_specs(args)):
+    first_gpu = 0
+    for spec in worker_specs(args):
         role = spec["role"]
+        worker_gpus = gpus[first_gpu : first_gpu + spec["tp"]]
+        first_gpu += spec["tp"]
         # Prefill workers share one cache: their commands, hence kernels, match.
         cache = (
             args.kernel_cache_dir.resolve()
@@ -555,7 +710,7 @@ def build_plan(args):
         )
         env = dict(
             common_env,
-            CUDA_VISIBLE_DEVICES=",".join(map(str, gpus[i * 2 : i * 2 + 2])),
+            CUDA_VISIBLE_DEVICES=",".join(map(str, worker_gpus)),
             TRITON_CACHE_DIR=str(cache / "triton"),
             TORCHINDUCTOR_CACHE_DIR=str(cache / "inductor"),
             FLASHINFER_WORKSPACE_BASE=str(cache / "flashinfer"),
@@ -598,6 +753,8 @@ def build_plan(args):
         requests = args.prefill_requests if role == "prefill" else args.decode_requests
         command = [*common]
         command[bootstrap_index] = str(spec["bootstrap_port"])
+        for flag in ("--tp-size", "--ep-size"):
+            command[command.index(flag) + 1] = str(spec["tp"])
         if role == "prefill":
             command = prefill_parallelism(command, pp=args.prefill_pp)
             if args.ced_split:
@@ -631,13 +788,19 @@ def build_plan(args):
             ]
         if role == "prefill" and args.prefill_swa_prefix_tails is not None:
             command += ["--swa-prefix-tails", str(args.prefill_swa_prefix_tails)]
-        if role == "prefill" and args.prefill_hicache_ratio is not None:
-            # layer_first is the layout M3 qualified under CC; an explicit ratio also
-            # turns off host-memory auto-sizing, which rejects the DSV4 pool.
+        if role == "prefill" and (
+            args.prefill_hicache_ratio is not None
+            or args.prefill_hicache_size_gib is not None
+        ):
+            # layer_first is the layout M3 qualified under CC; an explicit ratio or
+            # size also turns off host-memory auto-sizing, which rejects the DSV4 pool.
             command += [
                 "--enable-hierarchical-cache",
-                "--hicache-ratio",
-                str(args.prefill_hicache_ratio),
+                *(
+                    ["--hicache-ratio", str(args.prefill_hicache_ratio)]
+                    if args.prefill_hicache_size_gib is None
+                    else ["--hicache-size", str(args.prefill_hicache_size_gib)]
+                ),
                 "--hicache-mem-layout",
                 "layer_first",
                 "--hicache-io-backend",
@@ -700,15 +863,16 @@ def build_plan(args):
             worker["bootstrap_port"] = spec["bootstrap_port"]
         workers.append(worker)
     router = build_router(args=args, workers=workers)
-    return dict(
+    n, m, ptp, dtp = args.num_prefill, args.num_decode, args.prefill_tp, args.decode_tp
+    if n == m == 1 and ptp == dtp == 2:
+        topology = "1x(TP2 prefill + TP2 decode)"
+    else:
+        topology = f"{n}x(TP{ptp} prefill) + {m}x(TP{dtp} decode)"
+    plan = dict(
         revision=revision,
         status="unqualified",
         physical_gpus=gpus,
-        topology=(
-            "1x(TP2 prefill + TP2 decode); CPU Engram; DP=1 per worker"
-            if args.num_prefill == 1
-            else f"{args.num_prefill}x(TP2 prefill) + 1x(TP2 decode); CPU Engram; DP=1 per worker"
-        ),
+        topology=topology + "; CPU Engram; DP=1 per worker",
         collectives=dict(
             custom_all_reduce=args.custom_all_reduce,
             flashinfer_allreduce_fusion="off",
@@ -716,23 +880,51 @@ def build_plan(args):
         workers=workers,
         router=router,
     )
+    if args.memory_profile is not None:
+        plan["memory"] = memory_summary(args)
+    return plan
+
+
+def memory_summary(args):
+    """Per-rank HBM and host-RAM estimate per role for the launch plan."""
+    profile = GPU_PROFILES[args.memory_profile]
+    roles = {}
+    for role, tp, tokens in (
+        ("prefill", args.prefill_tp, args.max_total_tokens),
+        ("decode", args.decode_tp, args.decode_max_total_tokens or args.max_total_tokens),
+    ):
+        roles[role] = pool_estimate(args, role, tp, tokens)
+    host = args.num_prefill * hicache_host_bytes(
+        args, args.prefill_tp, args.max_total_tokens
+    )
+    return dict(
+        profile=args.memory_profile,
+        profile_measured=profile["measured"],
+        per_rank=roles,
+        hicache_host_gib_all_prefill=round(host / GIB, 1),
+        note="Estimate from B200 TP2 measurements; HBM fit requires a real boot.",
+    )
 
 
 def build_router(args, workers):
     prefill_args = []
-    for spec in worker_specs(args)[:-1]:
+    for spec in worker_specs(args)[: args.num_prefill]:
         prefill_args += [
             "--prefill",
             f"http://127.0.0.1:{spec['port']}",
             str(spec["bootstrap_port"]),
         ]
-    # The manual policy pins each X-SMG-Routing-Key to one prefill worker, keeping
-    # a conversation's prefix cache on one worker; unkeyed requests fall back to random.
-    policy = (
-        ["--prefill-policy", "manual", "--assignment-mode", "min_group"]
-        if args.num_prefill > 1
-        else []
-    )
+    # The manual policy pins each X-SMG-Routing-Key to one worker per role, keeping
+    # a conversation's prefix cache on one prefill (and its decode radix cache, if
+    # enabled, on one decode); unkeyed requests fall back to random.
+    policy = ["--prefill-policy", "manual"] if args.num_prefill > 1 else []
+    if args.num_decode > 1:
+        policy += ["--decode-policy", "manual"]
+    if policy:
+        policy += ["--assignment-mode", "min_group"]
+    decode_args = []
+    for worker in workers[args.num_prefill :]:
+        decode_args += ["--decode", worker["url"]]
     return dict(
         name="router",
         env={"PYTHONPATH": str(ROOT / "python")},
@@ -743,8 +935,7 @@ def build_router(args, workers):
             "sglang_router.launch_router",
             "--pd-disaggregation",
             *prefill_args,
-            "--decode",
-            workers[-1]["url"],
+            *decode_args,
             *policy,
             "--host",
             "127.0.0.1",
@@ -756,7 +947,7 @@ def build_router(args, workers):
     )
 
 
-def checkpoint_budget(model):
+def checkpoint_budget(model, tp_sizes=(2,)):
     """Exact configured Engram payload; NOT a prediction of runtime HBM use."""
     raw = (model / "config.json").read_bytes()
     config = json.loads(raw)
@@ -774,10 +965,14 @@ def checkpoint_budget(model):
         or any(x <= 0 for x in rows)
     ):
         raise ValueError("Missing or invalid Engram table dimensions in config.json")
-    for name in ("num_attention_heads", "o_groups", "n_routed_experts"):
-        value = config.get(name)
-        if not isinstance(value, int) or value <= 0 or value % 2:
-            raise ValueError(f"TP2/EP2 requires positive even {name}, got {value!r}")
+    for tp in sorted(set(tp_sizes)):
+        for name in ("num_attention_heads", "o_groups", "n_routed_experts"):
+            value = config.get(name)
+            if not isinstance(value, int) or value <= 0 or value % tp:
+                raise ValueError(
+                    f"TP{tp}/EP{tp} requires positive {name} divisible by {tp}, "
+                    f"got {value!r}"
+                )
     # MXFP4 tables (nvidia/DeepSeek-V4.1-Flash-NVFP4) pack two values per byte.
     quant = config.get("quantization_config", {})
     fp4 = str(quant.get("engram_embed_quant") or "").lower() == "mxfp4"
@@ -935,20 +1130,22 @@ def preflight(args, plan):
             )
         return result.stdout.strip()
 
-    check("checkpoint", lambda: checkpoint_budget(args.model))
+    groups = args.num_prefill + args.num_decode
+    check(
+        "checkpoint",
+        lambda: checkpoint_budget(args.model, (args.prefill_tp, args.decode_tp)),
+    )
     if args.cpu_engram_staging and "checkpoint" in results:
         budget = results["checkpoint"]
         budget["engram_bytes_pd_pair"] = budget["engram_bytes_per_instance"]
         budget["note"] = (
             "Eager staging shares immutable checkpoint page cache across P/D; excludes OS, loader and GPU memory."
         )
-    elif args.num_prefill > 1 and "checkpoint" in results:
+    elif groups > 2 and "checkpoint" in results:
         budget = results["checkpoint"]
-        budget["engram_bytes_pd_pair"] = (args.num_prefill + 1) * budget[
-            "engram_bytes_per_instance"
-        ]
+        budget["engram_bytes_pd_pair"] = groups * budget["engram_bytes_per_instance"]
         budget["note"] = (
-            f"{args.num_prefill + 1} TP groups allocate one table each; excludes OS, loader and GPU memory."
+            f"{groups} TP groups allocate one table each; excludes OS, loader and GPU memory."
         )
     check(
         "inventory",
@@ -978,6 +1175,14 @@ def preflight(args, plan):
                 )
             else:
                 idle_gpus.append(gpu)
+            if row is not None and args.memory_profile is not None:
+                expected = GPU_PROFILES[args.memory_profile]["hbm_gib"]
+                total = int(row[3]) / 1024
+                if abs(total - expected) > 0.02 * expected:
+                    errors.append(
+                        f"GPU {gpu}: memory.total {total:.1f} GiB is not the "
+                        f"{args.memory_profile} profile's {expected:.1f} GiB"
+                    )
     for name, option, required in (
         ("cc", "-f", "CC status: ON"),
         ("devtools", "-d", f"DevTools Mode: {args.devtools_mode.upper()}"),
@@ -1005,14 +1210,21 @@ def preflight(args, plan):
             lambda: resident_engram_bytes(args.model, args.resident_engram_pid),
         )
         locked_credit = results.get("resident_engram_bytes", 0)
+    # Every prefill worker pins its own HiCache host pools (one per rank).
+    hicache_host = args.num_prefill * hicache_host_bytes(
+        args, args.prefill_tp, args.max_total_tokens
+    )
+    results["hicache_host_bytes"] = hicache_host
     if (
         "checkpoint" in results
         and max(0, results["checkpoint"]["engram_bytes_pd_pair"] - locked_credit)
+        + hicache_host
         + args.host_reserve_gib * GIB
         > available
     ):
         errors.append(
-            "CPU memory cannot hold required Engram pages plus the configured host reserve"
+            "CPU memory cannot hold required Engram pages, the prefill HiCache host "
+            "pools and the configured host reserve"
         )
     for port in validate(args)[1]:
 
