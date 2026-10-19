@@ -2711,4 +2711,173 @@ mod upstream_cancel_tests {
 
         ctx.shutdown().await;
     }
+
+    /// Generous: these run alongside the whole suite on a loaded host.
+    const PD_RELAY_FINISH_TIMEOUT: Duration = Duration::from_secs(15);
+
+    /// PD config for the early-relay tests: one prefill, one decode.
+    async fn pd_test_app(
+        router_port: u16,
+        prefill_port: u16,
+        prefill_delay_ms: u64,
+        decode_port: u16,
+        decode_delay_ms: u64,
+    ) -> (AppTestContext, axum::Router) {
+        let config = RouterConfig::builder()
+            .prefill_decode_mode(
+                vec![(format!("http://127.0.0.1:{}", prefill_port), None)],
+                vec![format!("http://127.0.0.1:{}", decode_port)],
+            )
+            .round_robin_policy()
+            .host("127.0.0.1")
+            .port(router_port)
+            .max_payload_size(256 * 1024 * 1024)
+            .request_timeout_secs(600)
+            .worker_startup_timeout_secs(5)
+            .worker_startup_check_interval_secs(1)
+            .max_concurrent_requests(64)
+            .queue_timeout_secs(60)
+            .build_unchecked();
+        let mut prefill = TestWorkerConfig::prefill(prefill_port);
+        prefill.response_delay_ms = prefill_delay_ms;
+        let mut decode = TestWorkerConfig::decode(decode_port);
+        decode.response_delay_ms = decode_delay_ms;
+        let ctx = AppTestContext::new_with_config(config, vec![prefill, decode]).await;
+        let app = ctx.create_app().await;
+        (ctx, app)
+    }
+
+    fn pd_stream_request() -> Request<Body> {
+        let payload = json!({ "text": "PD early relay test", "stream": true });
+        Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap()
+    }
+
+    /// A streaming request without logprobs relays decode as soon as decode's
+    /// headers arrive, without waiting for prefill's response, and prefill's
+    /// response is still drained to completion afterwards.
+    #[tokio::test]
+    async fn test_pd_stream_relays_decode_before_prefill_finishes() {
+        let (prefill_port, decode_port) = (20341, 20342);
+        // Prefill's headers come after 1 s and its body after ~3 s; decode's
+        // come at once.
+        reset_stream_tracker(prefill_port);
+        set_slow_stream_chunks(prefill_port, 2);
+        reset_stream_tracker(decode_port);
+        set_slow_stream_chunks(decode_port, 5);
+        let (ctx, app) = pd_test_app(4341, prefill_port, 1000, decode_port, 0).await;
+
+        let start = std::time::Instant::now();
+        let resp = app.oneshot(pd_stream_request()).await.unwrap();
+        let headers_after = start.elapsed();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            headers_after < Duration::from_millis(800),
+            "decode should be relayed before prefill's headers (took {:?})",
+            headers_after
+        );
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("chunk-4"),
+            "decode stream incomplete: {}",
+            text
+        );
+        assert!(
+            text.contains("[DONE]"),
+            "decode stream incomplete: {}",
+            text
+        );
+        assert!(!text.contains("\"error\""), "unexpected error: {}", text);
+
+        let prefill_state = wait_for_stream_finish(prefill_port, PD_RELAY_FINISH_TIMEOUT)
+            .await
+            .expect("prefill stream tracking state");
+        assert!(
+            prefill_state.completed,
+            "prefill's response should be drained, not cancelled"
+        );
+
+        clear_slow_stream_chunks(prefill_port);
+        clear_slow_stream_chunks(decode_port);
+        ctx.shutdown().await;
+    }
+
+    /// Prefill failing after decode is already being relayed ends the client
+    /// stream with an error event and cancels the decode request.
+    #[tokio::test]
+    async fn test_pd_stream_prefill_failure_after_relay_ends_stream() {
+        let (prefill_port, decode_port) = (20343, 20344);
+        reset_stream_tracker(prefill_port);
+        set_slow_stream_chunks(prefill_port, 10);
+        set_stream_error_after_chunks(prefill_port, 2);
+        reset_stream_tracker(decode_port);
+        set_slow_stream_chunks(decode_port, 40);
+        // Decode's headers (50 ms) beat prefill's (100 ms); prefill then
+        // errors mid-body while decode is ~2 s from done.
+        let (ctx, app) = pd_test_app(4342, prefill_port, 100, decode_port, 50).await;
+
+        let resp = app.oneshot(pd_stream_request()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = tokio::time::timeout(PD_RELAY_FINISH_TIMEOUT, resp.into_body().collect())
+            .await
+            .expect("stream should end after prefill fails")
+            .unwrap()
+            .to_bytes();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("\"error\"") && text.contains("Prefill"),
+            "client should see prefill's failure: {}",
+            text
+        );
+        assert!(
+            !text.contains("[DONE]"),
+            "stream should not complete: {}",
+            text
+        );
+
+        let decode_state = wait_for_stream_finish(decode_port, PD_RELAY_FINISH_TIMEOUT)
+            .await
+            .expect("decode stream tracking state");
+        assert!(!decode_state.completed, "decode should be cancelled");
+
+        clear_stream_error_after_chunks(prefill_port);
+        clear_slow_stream_chunks(prefill_port);
+        clear_slow_stream_chunks(decode_port);
+        ctx.shutdown().await;
+    }
+
+    /// A client disconnect while prefill is still pending cancels both
+    /// upstream requests.
+    #[tokio::test]
+    async fn test_pd_stream_disconnect_before_prefill_finishes_cancels_both() {
+        let (prefill_port, decode_port) = (20345, 20346);
+        reset_stream_tracker(prefill_port);
+        set_slow_stream_chunks(prefill_port, 20);
+        reset_stream_tracker(decode_port);
+        set_slow_stream_chunks(decode_port, 20);
+        let (ctx, app) = pd_test_app(4343, prefill_port, 50, decode_port, 20).await;
+
+        let resp = app.oneshot(pd_stream_request()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut body = resp.into_body();
+        assert!(read_n_chunks(&mut body, 2).await > 0);
+        drop(body);
+
+        for port in [decode_port, prefill_port] {
+            let state = wait_for_stream_finish(port, PD_RELAY_FINISH_TIMEOUT)
+                .await
+                .expect("stream tracking state");
+            assert!(!state.completed, "port {} should be cancelled", port);
+        }
+
+        clear_slow_stream_chunks(prefill_port);
+        clear_slow_stream_chunks(decode_port);
+        ctx.shutdown().await;
+    }
 }
