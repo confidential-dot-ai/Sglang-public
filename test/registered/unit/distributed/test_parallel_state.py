@@ -172,6 +172,48 @@ def test_custom_allreduce_precedes_symmetric_memory_pynccl():
     coordinator.pynccl_comm.all_reduce.assert_not_called()
 
 
+def test_piecewise_graph_pins_pynccl_over_custom_allreduce():
+    """Inside a captured graph the method must not depend on tensor size.
+
+    `should_custom_ar` is a size/alignment threshold evaluated per rank. A rank
+    that answers differently from its peers runs a different collective against
+    them, and a captured graph cannot renegotiate, so the group hangs with no
+    error. Pinning one method inside the graph is what prevents that.
+    """
+    coordinator = parallel_state.GroupCoordinator.__new__(
+        parallel_state.GroupCoordinator
+    )
+    coordinator.world_size = 2
+    coordinator.unique_name = "test"
+    coordinator.hpu_communicator = None
+    coordinator.xpu_communicator = None
+    coordinator.npu_communicator = None
+    coordinator.qr_comm = None
+    coordinator.pymscclpp_comm = None
+    coordinator.torch_symm_mem_comm = None
+    coordinator._fi_workspace_hint = None
+    # The size threshold says "ca", which outside a graph would win.
+    coordinator.ca_comm = Mock(disabled=False)
+    coordinator.ca_comm.should_custom_ar.return_value = True
+    coordinator.pynccl_comm = Mock()
+    coordinator.pynccl_comm.change_state.return_value = nullcontext()
+    input_ = Mock(is_cpu=False)
+
+    with patch.object(
+        parallel_state, "is_in_tc_piecewise_cuda_graph", return_value=True
+    ):
+        method = coordinator._resolve_outplace_all_reduce_method(input_=input_)
+    assert method == "pynccl"
+
+    # Outside a graph the size threshold still wins, so this pins the graph
+    # case specifically rather than disabling custom all-reduce everywhere.
+    with patch.object(
+        parallel_state, "is_in_tc_piecewise_cuda_graph", return_value=False
+    ):
+        method = coordinator._resolve_outplace_all_reduce_method(input_=input_)
+    assert method == "ca"
+
+
 def test_parallel_group_construction_tp8_attn_cp2():
     """
     Test parallel group construction for 8 GPU configuration with:

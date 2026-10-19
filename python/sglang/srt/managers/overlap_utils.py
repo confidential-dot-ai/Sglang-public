@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING, Any, Optional, Sequence
 
 import msgspec
@@ -84,14 +85,38 @@ def _assert_nonneg_and_invalidate(
     buf[indices] = -1
 
 
+def consume_deferred_seq_lens_cpu(batch: ScheduleBatch) -> None:
+    """Run the deferred exact seq-lens mirror pull stashed by
+    FutureMap.resolve_seq_lens_cpu, if any. Idempotent; the tick's first
+    exact consumer (DSPARK draft plan / verify prep) calls this before
+    reading batch.seq_lens_cpu / seq_lens_sum."""
+    fn = batch.deferred_resolve_seq_lens_cpu
+    if fn is not None:
+        batch.deferred_resolve_seq_lens_cpu = None
+        fn()
+
+
 def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
     """Materialize input_ids at forward entry. Two sources:
 
     - Prefill: H2D copy from pinned CPU staging (prefill_input_ids_cpu).
     - Decode/spec_v2: gather from FutureMap (last iter's sampled token).
     """
+    # Gates every read below of a row-indexed FutureMap buffer
+    # (output_tokens_buf here; _resolve_spec_extras' own bufs further down)
+    # on the exact write generation for each requested row. With multiple
+    # producers, a row last written by another producer's stream would
+    # otherwise be read with no ordering guarantee, so a request's
+    # bonus_tokens/topk/hidden_states could be read stale.
+    future_map._wait_payload_rows(batch.req_pool_indices_cpu)
     if batch.prefill_input_ids_cpu is not None:
-        prefill_gpu = batch.prefill_input_ids_cpu.to(batch.device, non_blocking=True)
+        lease = batch.prefill_input_ids_staging_lease
+        if lease is None:
+            prefill_gpu = batch.prefill_input_ids_cpu.to(
+                batch.device, non_blocking=True
+            )
+        else:
+            prefill_gpu = lease.copy_to_device(device=batch.device)
         if batch.mix_running_indices is not None:
             if batch.enable_overlap and not batch.spec_algorithm.is_none():
                 future_map.resolve_mixed_spec_tails(batch)
@@ -106,6 +131,7 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
         else:
             batch.input_ids = prefill_gpu
         batch.prefill_input_ids_cpu = None
+        batch.prefill_input_ids_staging_lease = None
         batch.mix_running_indices = None
     elif batch.input_ids is None and future_map.spec_algo.is_none():
         batch.input_ids = future_map.output_tokens_buf[batch.req_pool_indices]
@@ -165,6 +191,95 @@ class RelayPayload:
             draft_probs=getattr(draft_input, "draft_probs", None),
             dsa_topk_indices=draft_input.dsa_topk_indices,
         )
+
+
+@dataclass(eq=False)
+class _RowReadyTicket:
+    """One immutable readiness generation shared by every row in a write."""
+
+    event: Any
+    refs: int = 0
+
+
+class _RowReadyTracker:
+    """Map each relay row to the exact CUDA event that last wrote it.
+
+    A producer-wide event is not precise enough: producer 0 can enqueue a new
+    prefill for unrelated rows before producer 1's decode consumes rows from an
+    older producer-0 generation. Re-recording the producer event then makes the
+    decode wait for that unrelated prefill. Tickets remain immutable while any
+    row references them, so consumers wait for the generation they actually
+    read.
+    """
+
+    def __init__(self, req_pool_size: int, event_factory) -> None:
+        self._row_tickets: list[Optional[_RowReadyTicket]] = [None] * req_pool_size
+        self._free_tickets: list[_RowReadyTicket] = []
+        self._event_factory = event_factory
+
+    def _normalize_rows(self, indices_cpu) -> list[int]:
+        if indices_cpu is None:
+            raise RuntimeError(
+                "multi-producer FutureMap writes require CPU row indices"
+            )
+        if isinstance(indices_cpu, torch.Tensor):
+            if indices_cpu.device.type != "cpu":
+                raise ValueError("FutureMap row readiness indices must be on CPU")
+            values = indices_cpu.tolist()
+        else:
+            values = list(indices_cpu)
+
+        # Duplicate request-pool rows are not expected, but deduplicating here
+        # keeps ticket refcounts sound if a malformed/padded batch contains one.
+        rows = list(dict.fromkeys(int(value) for value in values))
+        for row in rows:
+            if not 0 <= row < len(self._row_tickets):
+                raise IndexError(f"FutureMap row index out of range: {row}")
+        return rows
+
+    def _acquire_ticket(self) -> _RowReadyTicket:
+        # Reuse only completed events. Re-recording an incomplete event could
+        # retarget a wait already queued by an older consumer on another stream.
+        for index in range(len(self._free_tickets) - 1, -1, -1):
+            ticket = self._free_tickets[index]
+            if ticket.event.query():
+                self._free_tickets.pop(index)
+                return ticket
+        return _RowReadyTicket(event=self._event_factory())
+
+    def record(self, indices_cpu) -> Optional[Any]:
+        """Record one write generation and assign it to all written rows."""
+        rows = self._normalize_rows(indices_cpu)
+        if not rows:
+            return None
+
+        # Acquire before dropping old row references so this generation cannot
+        # immediately recycle one of the events it is about to supersede.
+        ticket = self._acquire_ticket()
+        ticket.refs = len(rows)
+        ticket.event.record()
+
+        for row in rows:
+            old_ticket = self._row_tickets[row]
+            self._row_tickets[row] = ticket
+            if old_ticket is None:
+                continue
+            old_ticket.refs -= 1
+            if old_ticket.refs == 0:
+                self._free_tickets.append(old_ticket)
+        return ticket.event
+
+    def events_for(self, indices_cpu) -> list[Any]:
+        """Return unique readiness events for exactly the requested rows."""
+        events = []
+        seen = set()
+        for row in self._normalize_rows(indices_cpu):
+            ticket = self._row_tickets[row]
+            if ticket is None or id(ticket) in seen:
+                continue
+            seen.add(id(ticket))
+            events.append(ticket.event)
+        return events
 
 
 class ConfidenceRelay(msgspec.Struct):
@@ -257,6 +372,7 @@ class FutureMap:
         req_to_token_pool: ReqToTokenPool,
         needs_cpu_seq_lens: bool = True,
         needs_confidence_relay: bool = False,
+        num_producers: int = 1,
     ):
         # Bufs indexed by req_pool_idx; slot 0 mirrors KV padding row so
         # CUDA-graph padded batches (req_pool_idx == 0) are harmless.
@@ -265,6 +381,12 @@ class FutureMap:
         # Computed by decide_needs_cpu_seq_lens(); see that helper for the
         # full decision (per-backend flag + TBO / piecewise CG overrides).
         self.needs_cpu_seq_lens = needs_cpu_seq_lens
+        # Armed by the scheduler (init_overlap) for DSPARK: stash the
+        # blocking exact-mirror pull on the batch instead of stalling here,
+        # so host prep up to the tick's first exact consumer (the draft
+        # plan / verify prep) overlaps the previous verify's GPU tail. See
+        # resolve_seq_lens_cpu / consume_deferred_seq_lens_cpu.
+        self.defer_spec_cpu_seq_lens = False
         self.needs_confidence_relay = needs_confidence_relay
         self.req_pool_size = req_to_token_pool.req_to_token.shape[0]
         # Kept for the mixed-tail late binding (reserved-slot gather).
@@ -309,10 +431,24 @@ class FutureMap:
         self.accept_tokens_buf: Optional[torch.Tensor] = None
         self.accept_lens_buf: Optional[torch.Tensor] = None
 
-        self.publish_ready = None  # lazy device.Event(); only spec_v2 needs it
-        # Debug consume-once state: armed by a recording publish, consumed by
-        # resolve; arm/consume strictly alternate across all batch interleavings.
-        self._publish_fresh = False
+        # One lazily-created device.Event() per producer for the legacy
+        # single-producer/fallback path. With multiple CUDA producers, the row
+        # trackers below provide generation-specific dependencies instead: a
+        # producer slot is too coarse because a newer unrelated write can
+        # replace the event before an older row is consumed.
+        self.publish_ready: list = [None] * max(num_producers, 1)
+        self._row_ready_enabled = _is_cuda and num_producers > 1
+        if self._row_ready_enabled:
+            event_factory = torch.get_device_module(self.device).Event
+            self._seq_lens_ready_by_row = _RowReadyTracker(
+                self.req_pool_size, event_factory
+            )
+            self._payload_ready_by_row = _RowReadyTracker(
+                self.req_pool_size, event_factory
+            )
+        else:
+            self._seq_lens_ready_by_row = None
+            self._payload_ready_by_row = None
 
         self.confidence_relay = ConfidenceRelay(
             device=self.device,
@@ -397,13 +533,20 @@ class FutureMap:
     ) -> Optional[ResolvedConfidence]:
         if not self.needs_confidence_relay:
             return None
+        # ConfidenceRelay's own ring (ring_pos/conf_ring/copy_done) isn't
+        # generalized for multiple producers -- it assumes one issue_ring_copy
+        # call per logical tick, so producer 0's event is the only one used.
         return self.confidence_relay.resolve(
             batch,
             stream=self.fwd_prepare_d2h_stream,
-            publish_ready=self.publish_ready,
+            publish_ready=self.publish_ready[0],
         )
 
     def _resolve_spec_extras(self, batch: ScheduleBatch) -> None:
+        # Reads output_tokens_buf/topk_p_buf/topk_index_buf/hidden_states_buf/
+        # draft_probs_buf/dsa_topk_indices_buf below. Its sole caller,
+        # resolve_forward_inputs, waits for the exact payload generations for
+        # batch.req_pool_indices_cpu before entering here.
         if self.spec_algo.is_ngram():
             draft_input = batch.spec_info
             if draft_input is None or draft_input.future_indices is None:
@@ -419,7 +562,12 @@ class FutureMap:
             # FIXME(lsyin): only prefill; not compatible with mixed mode
             return
         indices = draft_input.future_indices
-        if indices.shape[0] == 0:
+        # future_indices defaults to None on DFlashDraftInputV2 (see
+        # create_idle_input / other call sites in dflash_info_v2.py, which
+        # all guard on "is not None" before touching it) -- an idle/empty
+        # draft input reaching here is the same "nothing to resolve" case
+        # the shape[0]==0 check below already handles.
+        if indices is None or indices.shape[0] == 0:
             return
         # FIXME: indices = batch.req_pool_indices, pinned 2 iters via
         # record_batch_in_overlap; record_stream here is redundant.
@@ -458,6 +606,7 @@ class FutureMap:
             _assert_nonneg_and_invalidate(
                 draft_input.bonus_tokens, self.output_tokens_buf, indices
             )
+
 
     def stash_bonus_tokens(
         self, indices: torch.Tensor, bonus_tokens: torch.Tensor
@@ -510,6 +659,34 @@ class FutureMap:
             int(x) for x in fresh_cpu.tolist()
         ]
 
+    @staticmethod
+    def _wait_events(events, *, stream=None) -> None:
+        for ev in events:
+            if ev is None:
+                continue
+            if _is_hip:
+                # Temporary workaround: Event.wait() regresses TPOT on AMD MI355.
+                ev.synchronize()
+            elif stream is not None:
+                stream.wait_event(ev)
+            else:
+                ev.wait()
+
+    def _events_for_rows(self, indices_cpu, *, payload: bool) -> list[Any]:
+        tracker = (
+            self._payload_ready_by_row if payload else self._seq_lens_ready_by_row
+        )
+        if tracker is not None:
+            return tracker.events_for(indices_cpu)
+        return [ev for ev in self.publish_ready if ev is not None]
+
+    def _wait_payload_rows(self, indices_cpu) -> None:
+        self._wait_events(self._events_for_rows(indices_cpu, payload=True))
+
+    def _wait_all_producers(self) -> None:
+        """Legacy conservative barrier retained for non-row-aware callers."""
+        self._wait_events([ev for ev in self.publish_ready if ev is not None])
+
     def resolve_seq_lens_cpu(self, batch: ScheduleBatch) -> None:
         # Lazy pull from new_seq_lens_buf for spec_v2 (accept_lens not known to
         # schedule). The CPU mirror is gated by needs_cpu_seq_lens; backends that
@@ -521,17 +698,10 @@ class FutureMap:
         fi = draft_input.future_indices
         if fi is None:
             return
-        if self.publish_ready is not None:
-            if _DEBUG_ASSERT:
-                # Consume-once: every event wait must be re-armed by a fresh
-                # forward publish; a stale consume means a publish went missing.
-                assert self._publish_fresh, "resolve without a fresh forward publish"
-                self._publish_fresh = False
-            if _is_hip:
-                # Temporary workaround: Event.wait() regresses TPOT on AMD MI355.
-                self.publish_ready.synchronize()
-            else:
-                self.publish_ready.wait()
+        ready_events = self._events_for_rows(
+            batch.req_pool_indices_cpu, payload=False
+        )
+        self._wait_events(ready_events)
         batch.seq_lens = self.new_seq_lens_buf[fi]
 
         if not self.needs_cpu_seq_lens:
@@ -546,22 +716,58 @@ class FutureMap:
                 _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
             return
 
-        if self.fwd_prepare_d2h_stream is None or self.publish_ready is None:
+        if self.defer_spec_cpu_seq_lens:
+            # Poison the mirror so any unaudited reader in the deferral
+            # window fails loudly on None instead of silently consuming the
+            # stale committed seed; the first exact consumer re-materializes
+            # both fields via the stashed closure.
+            batch.seq_lens_cpu = None
+            batch.seq_lens_sum = None
+            batch.deferred_resolve_seq_lens_cpu = partial(
+                self._finish_resolve_seq_lens_cpu, batch, fi, ready_events
+            )
+            return
+        self._finish_resolve_seq_lens_cpu(batch, fi, ready_events)
+
+    def _finish_resolve_seq_lens_cpu(self, batch, fi, ready_events) -> None:
+        """Blocking exact-mirror pull; the only host-stalling part of the
+        resolve (waits for the previous verify's accept to land on GPU)."""
+        if self.fwd_prepare_d2h_stream is None or not ready_events:
             batch.seq_lens_cpu = batch.seq_lens.cpu()  # bootstrap / non-CUDA
             batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
             if _DEBUG_ASSERT:
                 _assert_nonneg_and_invalidate(batch.seq_lens, self.new_seq_lens_buf, fi)
             return
 
-        # Mechanism: don't sync the schedule stream; gate a private stream on the
-        # publish event and copy into the static pinned buffer.
-        self.fwd_prepare_d2h_stream.wait_event(self.publish_ready)
-        with torch.get_device_module(self.device).stream(self.fwd_prepare_d2h_stream):
-            self.new_seq_lens_cpu_pinned.copy_(self.new_seq_lens_buf, non_blocking=True)
-        self.fwd_prepare_d2h_stream.synchronize()
-
-        # FIXME: fi == batch.req_pool_indices; unify future_indices and req_pool_indices.
-        batch.seq_lens_cpu = self.new_seq_lens_cpu_pinned[batch.req_pool_indices_cpu]
+        # The multi-producer path must copy only the selected rows. Copying the
+        # entire pool would race with unrelated rows that another producer is
+        # deliberately allowed to update concurrently.
+        if self._seq_lens_ready_by_row is not None:
+            device_module = torch.get_device_module(self.device)
+            # batch.seq_lens is the already-row-selected gather above. Gate the
+            # private copy stream on that gather instead of touching `fi` from
+            # a second stream (its latest filtered value may itself have been
+            # produced on the schedule stream).
+            self.fwd_prepare_d2h_stream.wait_stream(device_module.current_stream())
+            with device_module.stream(self.fwd_prepare_d2h_stream):
+                pinned_view = self.new_seq_lens_cpu_pinned[: batch.seq_lens.shape[0]]
+                pinned_view.copy_(batch.seq_lens, non_blocking=True)
+            self.fwd_prepare_d2h_stream.synchronize()
+            batch.seq_lens_cpu = pinned_view.clone()
+        else:
+            self._wait_events(ready_events, stream=self.fwd_prepare_d2h_stream)
+            with torch.get_device_module(self.device).stream(
+                self.fwd_prepare_d2h_stream
+            ):
+                self.new_seq_lens_cpu_pinned.copy_(
+                    self.new_seq_lens_buf, non_blocking=True
+                )
+            self.fwd_prepare_d2h_stream.synchronize()
+            # FIXME: fi == batch.req_pool_indices; unify future_indices and
+            # req_pool_indices.
+            batch.seq_lens_cpu = self.new_seq_lens_cpu_pinned[
+                batch.req_pool_indices_cpu
+            ]
         batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
         if _DEBUG_ASSERT:
             # After the D2H copy completed (synchronize above), so the pinned
@@ -573,6 +779,9 @@ class FutureMap:
         future_indices: torch.Tensor,
         new_seq_lens: torch.Tensor,
         confidence: Optional[torch.Tensor] = None,
+        *,
+        producer: int = 0,
+        future_indices_cpu: Optional[torch.Tensor] = None,
     ) -> None:
         indices = future_indices
         if indices.shape[0] == 0:
@@ -581,19 +790,38 @@ class FutureMap:
         publish_confidence = self.needs_confidence_relay and confidence is not None
         if publish_confidence:
             self.confidence_relay.scatter(indices, confidence)
-        # Only spec_v2 needs the event; it gates the seq_lens D2H on the private stream.
+        # Only spec_v2 consumes this readiness event. Multi-producer mode maps
+        # the written rows to an immutable generation event; the fallback keeps
+        # the original producer-wide chaining behavior.
         if self.spec_algo.is_some():
-            if self.publish_ready is None:
-                self.publish_ready = torch.get_device_module(self.device).Event()
-            self.publish_ready.record()
-            self._publish_fresh = True
+            device_module = torch.get_device_module(self.device)
+            if self._seq_lens_ready_by_row is not None:
+                ev = self._seq_lens_ready_by_row.record(future_indices_cpu)
+                self.publish_ready[producer] = ev
+            else:
+                ev = self.publish_ready[producer]
+                if ev is None:
+                    ev = device_module.Event()
+                    self.publish_ready[producer] = ev
+                else:
+                    # Chain records from off-stream callers that share a
+                    # producer slot (for example PD-decode prebuilt seeding).
+                    device_module.current_stream().wait_event(ev)
+                ev.record()
         if publish_confidence:
             self.confidence_relay.issue_ring_copy(
                 stream=self.fwd_prepare_d2h_stream,
-                publish_ready=self.publish_ready,
+                publish_ready=self.publish_ready[0],
             )
 
-    def stash(self, future_indices: torch.Tensor, payload: RelayPayload) -> None:
+    def stash(
+        self,
+        future_indices: torch.Tensor,
+        payload: RelayPayload,
+        *,
+        producer: int = 0,
+        future_indices_cpu: Optional[torch.Tensor] = None,
+    ) -> None:
         indices = future_indices
         if indices.shape[0] == 0:
             # DP idle: payload is empty stub; lazy-init shape peek would IndexError.
@@ -602,6 +830,8 @@ class FutureMap:
             self._maybe_init_ngram_bufs(payload)
             self.accept_tokens_buf[indices] = payload.accept_tokens
             self.accept_lens_buf[indices] = payload.accept_lens
+            if self._payload_ready_by_row is not None:
+                self._payload_ready_by_row.record(future_indices_cpu)
             return
         self._maybe_init_forward_bufs(payload)
         self._maybe_init_dsa_topk_indices_buf(payload)
@@ -626,3 +856,5 @@ class FutureMap:
             self.dsa_topk_indices_buf[indices] = payload.dsa_topk_indices.to(
                 self.dsa_topk_indices_buf.dtype
             )
+        if self._payload_ready_by_row is not None:
+            self._payload_ready_by_row.record(future_indices_cpu)

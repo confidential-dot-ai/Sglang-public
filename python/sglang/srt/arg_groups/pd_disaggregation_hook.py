@@ -94,12 +94,63 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                     "--disaggregation-decode-enable-radix-cache is incompatible "
                     "with --disaggregation-transfer-backend fake"
                 )
-            if cfg.speculative_algorithm not in (None, "DSPARK"):
-                raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache is incompatible "
-                    "with speculative decoding "
-                    f"(--speculative-algorithm {cfg.speculative_algorithm})"
+            if cfg.speculative_algorithm is not None:
+                # Only the DFlash family materializes draft KV from transferred
+                # target hidden states over a bounded tail of the extend region;
+                # EAGLE-style algorithms need full-prompt draft KV and stay
+                # blocked.
+                #
+                # This used to test `str(algo).upper().startswith("DFLASH")`.
+                # That is a spelling test, not a semantic one: it silently
+                # excluded DSPARK, which IS in is_dflash_family() and which
+                # every other gate in the tree admits. The exclusion was never
+                # an analysed decision -- c295d9b55 predates DSpark on this
+                # path, and 76f0654b9 only deleted the flag from a launch
+                # script after hitting the ValueError below.
+                from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+                algo = SpeculativeAlgorithm.from_string(
+                    str(cfg.speculative_algorithm)
                 )
+                # getattr-with-False, not a bare call: from_string can return a
+                # registered CustomSpecAlgo, and anything that does not
+                # affirmatively declare itself DFlash-family must stay blocked.
+                if not getattr(algo, "is_dflash_family", lambda: False)():
+                    raise ValueError(
+                        "--disaggregation-decode-enable-radix-cache is incompatible "
+                        "with speculative decoding "
+                        f"(--speculative-algorithm {server_args.speculative_algorithm})"
+                    )
+                # Within the family, the exemption's real precondition is that
+                # the draft cannot address the reused prefix -- which is what
+                # the compact draft req->token table buys, and only DFlash with
+                # --speculative-draft-window-size has it. DSpark sets
+                # use_compact_draft_cache = False unconditionally
+                # (dspark_worker_v2.py) and its draft runs at absolute seq_lens
+                # bounded by the draft model's own SWA, so a radix-hit prefix is
+                # inside its reach. Whether that actually degrades anything is
+                # an empirical question -- the tell is accept length, so say so
+                # rather than silently allowing or silently blocking.
+                is_dspark = getattr(algo, "is_dspark", lambda: False)()
+                if is_dspark or server_args.speculative_draft_window_size is None:
+                    logger.warning(
+                        "EXPERIMENTAL/UNVALIDATED: decode radix cache with "
+                        "--speculative-algorithm %s and "
+                        "--speculative-draft-window-size %s. There is no compact "
+                        "draft req->token table on this path, so the draft can "
+                        "read draft-KV at reused-prefix positions that the PD "
+                        "transfer never wrote. Failure mode is SILENT accept-"
+                        "length degradation, partly masked by the cache-hit "
+                        "throughput win -- compare accept length against a run "
+                        "with this flag off before trusting any TPM number.",
+                        server_args.speculative_algorithm,
+                        server_args.speculative_draft_window_size,
+                    )
+                else:
+                    logger.warning(
+                        "EXPERIMENTAL: decode radix cache enabled together with "
+                        "DFLASH speculative decoding (delta PD transfer)."
+                    )
 
             if resolved_view(server_args).enable_dp_attention:
                 logger.warning(

@@ -30,9 +30,9 @@ use std::time::Instant;
 const X_SGL_TTFT_SLO_MS: HeaderName = HeaderName::from_static("x-sgl-ttft-slo-ms");
 const X_SGL_TPS_SLO: HeaderName = HeaderName::from_static("x-sgl-tps-slo");
 
-/// Maximum buffered request body, including base64 multimodal inputs (32 MiB).
+/// Maximum buffered request body, including base64 multimodal inputs (64 MiB).
 /// Enforced by the `DefaultBodyLimit` layer in app.rs, which returns 413.
-pub const MAX_CHAT_BODY_BYTES: usize = 32 << 20;
+pub const MAX_CHAT_BODY_BYTES: usize = 64 << 20;
 
 /// Validate, select workers, and forward a chat-completions request.
 pub async fn chat_completions(
@@ -386,6 +386,21 @@ fn parse_optional_positive_f64_header(
 mod tests {
     use super::*;
 
+    /// The M3 provider inspection manual sets a floor of 64 MB on the chat
+    /// request body. The value is dictated by that spec, not by this repo, and
+    /// a body under it makes 200-image and base64-video requests unservable
+    /// with a 413 the client cannot work around.
+    #[test]
+    fn chat_body_cap_meets_the_provider_manual_floor() {
+        assert!(
+            MAX_CHAT_BODY_BYTES >= 64 * 1024 * 1024,
+            "provider manual requires >=64 MB, got {MAX_CHAT_BODY_BYTES} bytes"
+        );
+    }
+
+    /// An unavailable indexer must never fail a request that min-load routing
+    /// can still serve. `QueryTooLarge` belongs here too: a prompt that outgrows
+    /// the query's message limit loses cache affinity, not availability.
     #[test]
     fn unavailable_indexer_degrades_to_empty_prefix_signal() {
         for error in [

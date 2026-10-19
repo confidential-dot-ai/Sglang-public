@@ -53,7 +53,7 @@ from sglang.srt.utils.network import resolve_base_url, resolve_host_port
 
 _ROUTING_KEY_HEADER = "X-SMG-Routing-Key"
 
-_EMBEDDING_UNSUPPORTED_DATASETS = {"image", "mmmu", "mooncake"}
+_EMBEDDING_UNSUPPORTED_DATASETS = {"image", "mmmu", "mooncake", "oracle-trace"}
 
 TERM_PLOTLIB_AVAILABLE = (importlib.util.find_spec("termplotlib") is not None) and (
     shutil.which("gnuplot") is not None
@@ -1325,6 +1325,37 @@ def _normalize_round_messages(turn: Any) -> Optional[List[Dict[str, str]]]:
     return None
 
 
+def _round_messages_and_extra_body(
+    turn: Any,
+) -> tuple[Optional[List[Dict[str, str]]], Dict[str, Any]]:
+    """Like ``_normalize_round_messages``, but also accepts
+    ``{"messages": [...], "extra_request_body": {...}}`` so a dataset (e.g.
+    oracle-mode replay) can vary per-round request params -- most commonly
+    ``forced_token_ids``, which differs turn to turn and can't live on the
+    conversation-level ``DatasetRow.extra_request_body``. Returns
+    ``(None, {})`` on an unrecognized shape so callers can use the first
+    element as a predicate, same as ``_normalize_round_messages``.
+    """
+    if isinstance(turn, dict) and "messages" in turn:
+        return _normalize_round_messages(turn["messages"]), turn.get(
+            "extra_request_body", {}
+        )
+    return _normalize_round_messages(turn), {}
+
+
+def _strip_reasoning_for_history(content: str) -> str:
+    """Drop everything up to and including the last "</think>" before a
+    completion re-enters context as history. Real reasoning-model serving
+    doesn't replay prior turns' raw chain-of-thought back into context, so
+    accumulating it verbatim here would overstate context length and
+    understate real prefix-cache growth. No-op (returns unchanged) when the
+    completion has no "</think>", so this is harmless for non-reasoning
+    models and datasets."""
+    if "</think>" not in content:
+        return content
+    return content.rsplit("</think>", 1)[1].lstrip("\n")
+
+
 def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callable:
     assert backend in MULTI_TURN_BACKENDS, (
         f"Multi-turn only supports chat backends: {MULTI_TURN_BACKENDS}, got {backend}"
@@ -1339,17 +1370,25 @@ def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callab
         outputs = []
 
         for round_index in range(len(prompts)):
-            normalized = _normalize_round_messages(prompts[round_index])
+            normalized, round_extra_body = _round_messages_and_extra_body(
+                prompts[round_index]
+            )
             if normalized is None:
                 raise ValueError(
-                    f"Multi-turn round {round_index} must be a str or a "
-                    "non-empty List[Dict] of role/content messages, got: "
-                    f"{type(prompts[round_index]).__name__}"
+                    f"Multi-turn round {round_index} must be a str, a "
+                    "non-empty List[Dict] of role/content messages, or a "
+                    '{"messages": [...], "extra_request_body": {...}} dict, '
+                    f"got: {type(prompts[round_index]).__name__}"
                 )
             prev_messages.extend(normalized)
 
             inner_input = replace(
-                copy.deepcopy(request_func_input), prompt=copy.deepcopy(prev_messages)
+                copy.deepcopy(request_func_input),
+                prompt=copy.deepcopy(prev_messages),
+                extra_request_body={
+                    **request_func_input.extra_request_body,
+                    **round_extra_body,
+                },
             )
             # Each round's prompt length comes from the server's usage block,
             # which a streamed response only carries when asked for. Default the
@@ -1366,7 +1405,10 @@ def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callab
             outputs.append(output)
 
             prev_messages.append(
-                {"role": "assistant", "content": output.generated_text}
+                {
+                    "role": "assistant",
+                    "content": _strip_reasoning_for_history(output.generated_text),
+                }
             )
 
         return outputs
@@ -1406,7 +1448,8 @@ async def benchmark(
 
     is_mooncake = args.dataset_name == "mooncake"
     # Multi-turn iff prompt[0] is a valid per-round payload. Single-shot
-    # OpenAI messages (List[Dict]) is excluded since its first element is a dict.
+    # OpenAI messages (List[Dict]) is excluded since its first element is a dict
+    # without a "messages" key (see _round_messages_and_extra_body).
     if is_mooncake:
         # Mooncake dataset rows are raw trace dictionaries. They are converted
         # into DatasetRow objects by get_mooncake_request_over_time below.
@@ -1416,7 +1459,7 @@ async def benchmark(
         is_multi_turn = (
             isinstance(first_prompt, list)
             and bool(first_prompt)
-            and _normalize_round_messages(first_prompt[0]) is not None
+            and _round_messages_and_extra_body(first_prompt[0])[0] is not None
         )
     if is_multi_turn:
         request_func = wrap_multi_turn_request_func(request_func, backend=backend)
@@ -2295,6 +2338,7 @@ def cli_main():
             "mmmu",
             "image",
             "mooncake",
+            "oracle-trace",
             "longbench_v2",
             "speed-bench",
         ],
@@ -2316,7 +2360,7 @@ def cli_main():
         type=int,
         default=None,
         help="Cap each conversation to at most this many turns (agentic-trace "
-        "dataset). Default: use all turns in the trace.",
+        "and oracle-trace datasets). Default: use all turns in the trace.",
     )
     parser.add_argument(
         "--speed-bench-category",

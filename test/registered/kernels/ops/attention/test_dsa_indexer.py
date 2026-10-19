@@ -301,6 +301,31 @@ class TestDSAIndexer(CustomTestCase):
         self.device = "cuda"
         self.dtype = torch.bfloat16
 
+    def test_paged_mqa_topk_histogram_workspace_is_cached_by_row_bucket(self):
+        indexer = object.__new__(Indexer)
+        torch.nn.Module.__init__(indexer)
+        indexer._paged_mqa_topk_histogram_workspaces = {}
+
+        rows_3 = indexer._get_paged_mqa_topk_histogram_workspace(
+            3, torch.device(self.device)
+        )
+        rows_4 = indexer._get_paged_mqa_topk_histogram_workspace(
+            4, torch.device(self.device)
+        )
+        rows_5 = indexer._get_paged_mqa_topk_histogram_workspace(
+            5, torch.device(self.device)
+        )
+        rows_3_again = indexer._get_paged_mqa_topk_histogram_workspace(
+            3, torch.device(self.device)
+        )
+
+        self.assertEqual(rows_3.shape, (3, 1024))
+        self.assertEqual(rows_5.shape, (5, 1024))
+        self.assertEqual(rows_3.data_ptr(), rows_4.data_ptr())
+        self.assertEqual(rows_3.data_ptr(), rows_3_again.data_ptr())
+        self.assertNotEqual(rows_3.data_ptr(), rows_5.data_ptr())
+        self.assertEqual(len(indexer._paged_mqa_topk_histogram_workspaces), 2)
+
     def _init_model_runner(self, config_override=None):
         """Initialize model runner with optional config override."""
         config = self.config.copy()

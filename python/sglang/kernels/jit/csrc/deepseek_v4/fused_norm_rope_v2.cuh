@@ -8,6 +8,7 @@
 #include <sgl_kernel/warp.cuh>
 
 #include <sgl_kernel/deepseek_v4/compress_v2.cuh>
+#include <sgl_kernel/deepseek_v4/fp4_utils.cuh>
 #include <sgl_kernel/deepseek_v4/fp8_utils.cuh>
 #include <sgl_kernel/deepseek_v4/kv_layout.cuh>
 
@@ -22,20 +23,6 @@ using PlanD = device::compress::DecodePlan;
 using deepseek_v4::fp8::cast_to_ue8m0;
 using deepseek_v4::fp8::inv_scale_ue8m0;
 using deepseek_v4::fp8::pack_fp8;
-
-SGL_DEVICE uint8_t quant_fp4_e2m1(float x) {
-  const float ax = fminf(fabsf(x), 6.0f);
-  uint8_t idx = 0;
-  idx += ax > 0.25f;
-  idx += ax > 0.75f;
-  idx += ax > 1.25f;
-  idx += ax > 1.75f;
-  idx += ax > 2.5f;
-  idx += ax > 3.5f;
-  idx += ax > 5.0f;
-  if (x < 0.0f && idx != 0) idx |= 0x8;
-  return idx;
-}
 
 constexpr uint32_t kBlockSize = 256;
 constexpr uint32_t kNumWarps = kBlockSize / device::kWarpThreads;
@@ -258,21 +245,52 @@ INDEXER_KERNEL void fused_norm_rope_indexer_fp4(const __grid_constant__ FusedNor
   if (work_id >= params.num_tokens) return;
 
   const auto input = static_cast<DType*>(params.input) + work_id * kHeadDim;
-  int32_t position;
-  int64_t out_loc;
-  if constexpr (kMode == CompressExtend) {
-    const auto plan = static_cast<const PlanC*>(params.handle)[work_id];
-    if (plan.is_invalid()) return;
-    position = plan.seq_len - params.compress_ratio;
-    out_loc = params.out_loc[plan.ragged_id];
-  } else if constexpr (kMode == CompressDecode) {
-    const auto plan = static_cast<const PlanD*>(params.handle)[work_id];
-    if (plan.seq_len % params.compress_ratio != 0) return;
-    position = plan.seq_len - params.compress_ratio;
-    out_loc = params.out_loc[work_id];
-  } else {
-    static_assert(host::dependent_false_v<DType>, "Unsupported Mode");
+  // Plan and cache-location metadata are warp-uniform. Resolve them in lane 0
+  // instead of issuing 32 identical 16-byte plan loads and 32 identical
+  // 8-byte out_loc loads. Split the 64-bit location into two shuffle-friendly
+  // words for an exact bitwise broadcast.
+  uint32_t plan_valid = 0;
+  int32_t position = 0;
+  uint64_t out_loc_bits = 0;
+  if (lane_id == 0) {
+    if constexpr (kMode == CompressExtend) {
+      const auto plan = static_cast<const PlanC*>(params.handle)[work_id];
+      plan_valid = !plan.is_invalid();
+      if (plan_valid) {
+        position = plan.seq_len - params.compress_ratio;
+        out_loc_bits = static_cast<uint64_t>(params.out_loc[plan.ragged_id]);
+      }
+    } else if constexpr (kMode == CompressDecode) {
+      const auto plan = static_cast<const PlanD*>(params.handle)[work_id];
+      plan_valid = plan.seq_len % params.compress_ratio == 0;
+      if (plan_valid) {
+        position = plan.seq_len - params.compress_ratio;
+        out_loc_bits = static_cast<uint64_t>(params.out_loc[work_id]);
+      }
+    } else {
+      static_assert(host::dependent_false_v<DType>, "Unsupported Mode");
+    }
   }
+#ifndef USE_ROCM
+  plan_valid = __shfl_sync(warp::kFullMask, plan_valid, 0, kWarpThreads);
+#else
+  plan_valid = __shfl(plan_valid, 0, kWarpThreads);
+#endif
+  if (!plan_valid) return;
+
+  uint32_t out_loc_low = static_cast<uint32_t>(out_loc_bits);
+  uint32_t out_loc_high = static_cast<uint32_t>(out_loc_bits >> 32);
+#ifndef USE_ROCM
+  position = __shfl_sync(warp::kFullMask, position, 0, kWarpThreads);
+  out_loc_low = __shfl_sync(warp::kFullMask, out_loc_low, 0, kWarpThreads);
+  out_loc_high = __shfl_sync(warp::kFullMask, out_loc_high, 0, kWarpThreads);
+#else
+  position = __shfl(position, 0, kWarpThreads);
+  out_loc_low = __shfl(out_loc_low, 0, kWarpThreads);
+  out_loc_high = __shfl(out_loc_high, 0, kWarpThreads);
+#endif
+  const auto out_loc =
+      static_cast<int64_t>((static_cast<uint64_t>(out_loc_high) << 32) | out_loc_low);
   const auto freqs_cis = params.freqs_cis + position * kRopeDim;
 
   PDLWaitPrimary<kUsePDL>();
@@ -362,9 +380,12 @@ INDEXER_KERNEL void fused_norm_rope_indexer_fp4(const __grid_constant__ FusedNor
     const auto scale_ue8m0 = static_cast<uint8_t>(cast_to_ue8m0(scale_raw));
     const auto inv_scale = inv_scale_ue8m0(scale_ue8m0);
 
-    const uint8_t packed0 = quant_fp4_e2m1(data[0] * inv_scale) | (quant_fp4_e2m1(data[1] * inv_scale) << 4);
-    const uint8_t packed1 = quant_fp4_e2m1(data[2] * inv_scale) | (quant_fp4_e2m1(data[3] * inv_scale) << 4);
-    const uint16_t packed = static_cast<uint16_t>(packed0) | (static_cast<uint16_t>(packed1) << 8);
+    const uint8_t packed0 =
+        deepseek_v4::fp4::quant_e2m1x2(data[0] * inv_scale, data[1] * inv_scale);
+    const uint8_t packed1 =
+        deepseek_v4::fp4::quant_e2m1x2(data[2] * inv_scale, data[3] * inv_scale);
+    const uint16_t packed =
+        static_cast<uint16_t>(packed0) | (static_cast<uint16_t>(packed1) << 8);
 
     const int64_t page = out_loc >> kPageBits;
     const int64_t offset = out_loc & ((1 << kPageBits) - 1);

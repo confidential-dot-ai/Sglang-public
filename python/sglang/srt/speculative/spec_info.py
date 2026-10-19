@@ -187,6 +187,7 @@ class SpeculativeAlgorithm(Enum):
         req_to_token_pool,
         needs_cpu_seq_lens: bool = True,
         needs_confidence_relay: bool = False,
+        num_producers: int = 1,
     ) -> FutureMap:
         from sglang.srt.managers.overlap_utils import FutureMap
 
@@ -196,6 +197,7 @@ class SpeculativeAlgorithm(Enum):
             req_to_token_pool,
             needs_cpu_seq_lens,
             needs_confidence_relay,
+            num_producers=num_producers,
         )
 
     def build_disagg_draft_input(
@@ -391,8 +393,9 @@ class SpecInput(ABC):
     ragged_verify_layout: Optional[RaggedVerifyLayout] = None
 
     # Uniform per-request token width of this forward (and its logits-row
-    # counterpart). Doubles as the DP-attention global_num_tokens multiplier
-    # (ragged forwards carry 1 there). -1 = not set by this flow.
+    # counterpart). Doubles as the DP-attention global_num_tokens multiplier;
+    # compact SUM verify supplies an explicit per-rank graph-token vector
+    # instead. -1 = not set by this flow.
     num_tokens_per_req: int = -1
     num_tokens_for_logprob_per_req: int = -1
 
@@ -406,6 +409,14 @@ class SpecInput(ABC):
     dsa_topk_indices: Optional[torch.Tensor] = None
     future_dsa_topk_indices_available: bool = False
     dsa_seed_topk_capture: Optional[torch.Tensor] = None
+
+    # True only on the fabricated input of an idle DP rank's participation
+    # forward (see DSparkVerifyExecutor.run_idle_participation): every row is
+    # padding, out_cache_loc is all location-0 sentinels, and KV-write prep
+    # may substitute a cached empty plan instead of resolving one from
+    # device tensors. Class-level default for the same dataclass-subclass
+    # reason as ragged_verify_layout above.
+    is_idle_participation: bool = False
 
     def __init__(self, spec_input_type: SpecInputType):
         self.spec_input_type = spec_input_type
@@ -448,6 +459,22 @@ def spec_scale_global_num_tokens(
     """Scale the raw per-rank sync values (request counts on decode-family
     rounds) into this forward's token units using the spec input's uniform
     per-request widths."""
+    dp_graph_num_tokens = getattr(spec_info, "dp_graph_num_tokens", None)
+    if dp_graph_num_tokens is not None:
+        if len(dp_graph_num_tokens) != len(global_num_tokens) or len(
+            dp_graph_num_tokens
+        ) != len(global_num_tokens_for_logprob):
+            raise ValueError(
+                "compact verify DP graph-token vector has "
+                f"{len(dp_graph_num_tokens)} ranks, expected "
+                f"token/logprob vectors of lengths {len(global_num_tokens)}/"
+                f"{len(global_num_tokens_for_logprob)}"
+            )
+        # Compact SUM capture communicates padded graph rows, not the live
+        # ragged total.  The layout masks ghost rows; DP gather/scatter must
+        # use the same per-rank graph-token buckets that select ShapeKey.size.
+        graph_tokens = [int(value) for value in dp_graph_num_tokens]
+        return graph_tokens, list(graph_tokens)
     return (
         [x * spec_info.num_tokens_per_req for x in global_num_tokens],
         [

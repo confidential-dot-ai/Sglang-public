@@ -258,6 +258,33 @@ class SWAKVPool(BaseSWAKVPool):
             # the attention backend; set_kv_buffer never translates internally.
             assert swa_loc is not None
             loc = swa_loc
+        if is_swa_layer and (
+            not loc.is_cuda or not torch.cuda.is_current_stream_capturing()
+        ):
+            # -1 is the established skip sentinel on this pool's write paths
+            # (the commit gate writes it for rejected verify columns, the ring
+            # publishers write it for tokens older than the window), but this
+            # kernel ASSERTS on a negative index rather than skipping. Drop
+            # the skip rows host-side. Eager only: during capture a sync here
+            # is illegal (cudaErrorStreamCaptureUnsupported) and the capture
+            # wrapper's fill(0) guarantees no -1 exists then; replay re-runs
+            # kernels, not this Python.
+            if loc.numel() and bool((loc < 0).any()):
+                _keep = torch.nonzero(loc >= 0, as_tuple=False).flatten()
+                if _keep.numel() == 0:
+                    return
+                loc = loc.index_select(0, _keep)
+                cache_k = cache_k.index_select(0, _keep)
+                cache_v = cache_v.index_select(0, _keep)
+            # TEMP DEBUG (ring bring-up): range check, raises with the
+            # caller's stack instead of a device assert. Remove after
+            # validation.
+            _hi = int(loc.max().item()) if loc.numel() else 0
+            if _hi >= pool.size:
+                raise RuntimeError(
+                    f"RING-DEBUG set_kv_buffer OOB: layer_id={layer_id} "
+                    f"pool_size={pool.size} max_loc={_hi} n={loc.numel()}"
+                )
         if isinstance(pool, MLATokenToKVPool):
             pool.set_kv_buffer(
                 None,
@@ -275,6 +302,87 @@ class SWAKVPool(BaseSWAKVPool):
                 k_scale,
                 v_scale,
                 layer_id_override=layer_id_pool,
+            )
+
+    def set_kv_buffer_prefix_valid(
+        self,
+        layer: RadixAttention,
+        loc_2d: torch.Tensor,
+        commit_lens: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        layer_id_override: Optional[int] = None,
+    ):
+        """Commit-gated 2D write, translated into the SWA sub-pool.
+
+        The speculative verify path writes a [bs, verify_len] block of locs and
+        commits only the first ``commit_lens[i]`` columns of each row -- the
+        rest are rejected draft tokens whose KV must not land. On a hybrid SWA
+        pool those locs are in the FULL index space, so a sliding layer needs
+        them translated before they mean anything, exactly as ``set_kv_buffer``
+        requires a pre-resolved ``swa_loc``.
+
+        Two gates, not one, and the second is what makes this different from
+        the dense pool's version:
+
+          * ``col < commit_lens[i]`` -- the caller's commit gate.
+          * ``swa_loc >= 0`` -- the ring's OWN gate. A ring-pooled draft
+            publishes -1 for any token that has fallen out of its sliding
+            window (older tokens share a ring slot with a live token and would
+            race). Writing a -1 would index the buffer's LAST row and silently
+            corrupt whichever token owns it, so the sentinel has to be dropped
+            here rather than trusted to the callee.
+
+        Both gates are resolved on the host side into a flat valid-row gather
+        and one ``set_kv_buffer`` call. That gives up the dense pool's fused
+        tiled kernel, which cannot express the second gate; the cost is a
+        gather over at most ``max_running_requests * verify_len`` rows (~1.2k
+        for M3 at 128 x 9), which is negligible next to the forward itself.
+        """
+        layer_id = (
+            layer_id_override if layer_id_override is not None else layer.layer_id
+        )
+        layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
+
+        if loc_2d.ndim != 2:
+            raise ValueError(f"loc_2d must be rank-2, got shape={tuple(loc_2d.shape)}.")
+        if commit_lens.ndim != 1 or commit_lens.shape[0] != loc_2d.shape[0]:
+            raise ValueError(
+                "commit_lens must match loc_2d batch size: "
+                f"{tuple(commit_lens.shape)=} {tuple(loc_2d.shape)=}."
+            )
+        num_rows = int(loc_2d.numel())
+        if cache_k.shape[0] != num_rows or cache_v.shape[0] != num_rows:
+            raise ValueError(
+                "KV rows must match loc_2d size: "
+                f"{tuple(cache_k.shape)=} {tuple(cache_v.shape)=} "
+                f"{tuple(loc_2d.shape)=}."
+            )
+
+        flat = loc_2d.reshape(-1).to(torch.int64)
+        if is_swa_layer:
+            flat = self.translate_loc_from_full_to_swa(flat).to(torch.int64)
+
+        cols = torch.arange(loc_2d.shape[1], device=loc_2d.device)
+        valid = cols[None, :] < commit_lens.to(torch.int64)[:, None]
+        valid = valid.reshape(-1)
+        if is_swa_layer:
+            valid &= flat >= 0
+        valid_idx = torch.nonzero(valid, as_tuple=False).flatten()
+        if valid_idx.numel() == 0:
+            return
+
+        pool = self.swa_kv_pool if is_swa_layer else self.full_kv_pool
+        loc = flat.index_select(0, valid_idx)
+        k = cache_k.index_select(0, valid_idx)
+        v = cache_v.index_select(0, valid_idx)
+        if isinstance(pool, MLATokenToKVPool):
+            pool.set_kv_buffer(None, loc, k, v, layer_id_override=layer_id_pool)
+        else:
+            pool.set_kv_buffer(
+                None, loc, k, v, k_scale, v_scale, layer_id_override=layer_id_pool
             )
 
     def set_mla_kv_buffer(

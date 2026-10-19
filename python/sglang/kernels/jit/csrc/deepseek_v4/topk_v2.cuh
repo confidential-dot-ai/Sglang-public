@@ -38,6 +38,7 @@ enum class TopKMode {
 using Register2 = impl::TopKRegister<2>;  // <= 8192, register-resident, 1 read
 using Register4 = impl::TopKRegister<4>;  // <= 16384, register-resident, 1 read
 using Streaming = impl::TopKStreaming;
+using StreamingHistogram = impl::TopKStreamingHistogram;
 
 constexpr uint32_t kBlockSize = impl::TopKConfig::kBlockSize;
 constexpr uint32_t kOccupancy = impl::TopKConfig::kOccupancy;
@@ -72,12 +73,14 @@ struct PageTransform {
 
 struct TopKPagedParams {
   const float* __restrict__ scores;
+  uint32_t* __restrict__ histograms;  // optional [batch, 1024] fp16-coarse bins
   const int32_t* __restrict__ seq_lens;
   const int32_t* __restrict__ page_table;
   int32_t* __restrict__ page_indices;
   int32_t* __restrict__ raw_indices;      // DUAL_OUTPUT only, nullptr otherwise
   const PlanItem* __restrict__ metadata;  // [0]=GlobalMetadata, [1+i]=PlanItem
   int64_t score_stride;
+  int64_t histogram_stride;
   int64_t page_table_stride;
   uint32_t topk;
   uint32_t page_bits;
@@ -96,11 +99,18 @@ struct TopKPagedParams {
   SGL_DEVICE int32_t* get_output_ptr(uint32_t batch_id) const {
     return page_indices + batch_id * static_cast<int64_t>(topk);
   }
+  SGL_DEVICE uint32_t* get_histogram_ptr(uint32_t batch_id) const {
+    return histograms == nullptr ? nullptr : histograms + batch_id * histogram_stride;
+  }
   SGL_DEVICE PageTransform get_transform(uint32_t batch_id) const {
     return {
         page_table == nullptr ? nullptr : page_table + batch_id * page_table_stride,
         page_bits,
         raw_indices == nullptr ? nullptr : raw_indices + batch_id * static_cast<int64_t>(topk)};
+  }
+  SGL_DEVICE void clear_histogram(uint32_t batch_id) const {
+    static_assert(kBlockSize == 1024);
+    get_histogram_ptr(batch_id)[threadIdx.x] = 0;
   }
   SGL_DEVICE TopKProblem problem(uint32_t batch_id, uint32_t seq_len) const {
     const auto k = static_cast<int64_t>(topk);
@@ -356,7 +366,7 @@ TOPK_KERNEL void topk_packed_kernel(const __grid_constant__ TopKPackedParams par
  * - Level 2: max_seq_len <= cluster_floor  -> trivial + register<4> + streaming
  * - Level 3: max_seq_len > cluster_floor   -> + epilogue process of cluster path
  */
-template <bool kPDL, int kLevel, TopKMode kMode>
+template <bool kPDL, int kLevel, TopKMode kMode, bool kPrecomputedHistogram = false>
 TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKPagedParams params) {
   device::enable_smem_spilling();
   constexpr bool kNeedStaging = kMode != TopKMode::INDICES;
@@ -373,6 +383,10 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKPagedParams params
   const auto bx = blockIdx.x;
   auto problem = params.problem(bx);
   if (problem.seq_len <= problem.topk) {
+    if constexpr (kPrecomputedHistogram) {
+      device::PDLWaitPrimary<kPDLEarly>();
+      params.clear_histogram(bx);
+    }
     return trivial_transform<kPDLEarly, kMode>(problem, params.get_transform(bx));
   }
   if constexpr (kNeedStaging) {
@@ -389,10 +403,15 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKPagedParams params
   } else {
     const auto cluster_threshold = kHandleCluster ? params.cluster_threshold() : UINT_MAX;
     static_assert(kLevel == 2 || kLevel == 3, "we only support level = 0,1,2,3 now");
-    if (problem.seq_len <= kReg4MaxSeqLen) {
+    if (!kPrecomputedHistogram && problem.seq_len <= kReg4MaxSeqLen) {
       Register4::forward<kPDLEarly>(problem, &smem);
     } else if (problem.seq_len <= cluster_threshold) {
-      Streaming::forward<kPDLEarly>(problem, &smem);
+      if constexpr (kPrecomputedHistogram) {
+        StreamingHistogram::forward<kPDLEarly, true>(problem, &smem, params.get_histogram_ptr(bx));
+        params.clear_histogram(bx);
+      } else {
+        Streaming::forward<kPDLEarly>(problem, &smem);
+      }
     } else [[unlikely]] {
       // Cluster path: the pool already selected into our output row; the only
       // work left is the epilogue, so this is the one path that waits for it.
@@ -435,7 +454,7 @@ constexpr uint32_t kClusterMaxBatch = 512;
 #define CLUSTER_TOPK_KERNEL TOPK_KERNEL __cluster_dims__(1, kClusterSize, 1)
 
 /// Persistent cluster kernel for the items the plan routed to the pool; topk_main_kernel handles the rest.
-template <bool kPDL, uint32_t kClusterSize>
+template <bool kPDL, uint32_t kClusterSize, bool kPrecomputedHistogram = false>
 CLUSTER_TOPK_KERNEL void topk_persistent_cluster_kernel(const __grid_constant__ TopKPagedParams params) {
   device::enable_smem_spilling();
   using ClusterN = impl::TopKCluster<kClusterSize>;
@@ -450,13 +469,17 @@ CLUSTER_TOPK_KERNEL void topk_persistent_cluster_kernel(const __grid_constant__ 
   while (idx >= 0) {
     const auto it = params.item(idx);
     const auto problem = params.problem(it.batch_id, it.seq_len);
-    ClusterN::template forward<false>(problem, &smem);
+    ClusterN::template forward<false, kPrecomputedHistogram>(
+        problem, &smem, params.get_histogram_ptr(it.batch_id));
+    if constexpr (kPrecomputedHistogram) {
+      if (blockIdx.y == 0) params.clear_histogram(it.batch_id);
+    }
     idx -= kNumPersistentClusters;
     if (idx >= 0) __syncthreads();
   }
 }
 
-template <bool kPDL, TopKMode kMode, uint32_t kClusterSize, uint32_t kOccupancy>
+template <bool kPDL, TopKMode kMode, uint32_t kClusterSize, uint32_t kOccupancy, bool kPrecomputedHistogram = false>
 CLUSTER_TOPK_KERNEL void topk_small_batch_cluster_kernel(const __grid_constant__ TopKPagedParams params) {
   device::enable_smem_spilling();
   constexpr bool kNeedStaging = kMode != TopKMode::INDICES;
@@ -471,6 +494,10 @@ CLUSTER_TOPK_KERNEL void topk_small_batch_cluster_kernel(const __grid_constant__
   const auto worker_rank = bx % kClusterSize;
   if (problem.seq_len <= problem.topk) {
     if (by != worker_rank) return;
+    if constexpr (kPrecomputedHistogram) {
+      device::PDLWaitPrimary<kPDL>();
+      params.clear_histogram(bx);
+    }
     return trivial_transform<kPDL, kMode>(problem, params.get_transform(bx));
   }
 
@@ -478,18 +505,26 @@ CLUSTER_TOPK_KERNEL void topk_small_batch_cluster_kernel(const __grid_constant__
     problem.out = s_topk_indices;  // write into stage buffer in smem first
   }
   // for small batch, we will fuse in the cluster case
-  if (problem.seq_len <= kReg4MaxSeqLen) {
+  if (!kPrecomputedHistogram && problem.seq_len <= kReg4MaxSeqLen) {
     if (by != worker_rank) return;
     Register4::forward<kPDL>(problem, &smem);
   } else if (problem.seq_len <= params.static_cluster_floor) {
     if (by != worker_rank) return;
-    Streaming::forward<kPDL>(problem, &smem);
+    if constexpr (kPrecomputedHistogram) {
+      StreamingHistogram::forward<kPDL, true>(problem, &smem, params.get_histogram_ptr(bx));
+      params.clear_histogram(bx);
+    } else {
+      Streaming::forward<kPDL>(problem, &smem);
+    }
   } else {
     auto cluster = cooperative_groups::this_cluster();
     if constexpr (kNeedStaging) {
       problem.out = cluster.map_shared_rank(s_topk_indices, 0);
     }
-    ClusterN::forward<kPDL>(problem, &smem);
+    ClusterN::template forward<kPDL, kPrecomputedHistogram>(problem, &smem, params.get_histogram_ptr(bx));
+    if constexpr (kPrecomputedHistogram) {
+      if (by == 0) params.clear_histogram(bx);
+    }
     if constexpr (kNeedStaging) {
       device::PDLTriggerSecondary<kPDL>();
       cluster.sync();
@@ -652,10 +687,36 @@ struct TopKKernel {
       const uint32_t page_size,
       const tvm::ffi::TensorView metadata,
       const tvm::ffi::Optional<tvm::ffi::TensorView> raw_indices) {
+    transform_paged_impl<false>(scores, nullptr, seq_lens, page_table, page_indices, page_size, metadata, raw_indices);
+  }
+
+  static void transform_with_histogram(
+      const tvm::ffi::TensorView scores,
+      const tvm::ffi::TensorView histograms,
+      const tvm::ffi::TensorView seq_lens,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> page_table,
+      const tvm::ffi::TensorView page_indices,
+      const uint32_t page_size,
+      const tvm::ffi::TensorView metadata,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> raw_indices) {
+    transform_paged_impl<true>(scores, &histograms, seq_lens, page_table, page_indices, page_size, metadata, raw_indices);
+  }
+
+  template <bool kPrecomputedHistogram>
+  static void transform_paged_impl(
+      const tvm::ffi::TensorView scores,
+      const tvm::ffi::TensorView* histograms,
+      const tvm::ffi::TensorView seq_lens,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> page_table,
+      const tvm::ffi::TensorView page_indices,
+      const uint32_t page_size,
+      const tvm::ffi::TensorView metadata,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> raw_indices) {
     using namespace host;
     auto B = SymbolicSize{"batch_size"};
     auto L = SymbolicSize{"max_seq_len"};
     auto S = SymbolicSize{"score_stride"};
+    auto HS = SymbolicSize{"histogram_stride"};
     auto K = SymbolicSize{"topk"};
     auto device_ = SymbolicDevice{};
     device_.set_options<kDLGPU>();
@@ -665,6 +726,14 @@ struct TopKKernel {
         .with_dtype<float>()
         .with_device(device_)
         .verify(scores);
+    if constexpr (kPrecomputedHistogram) {
+      RuntimeCheck(page_table.has_value(), "precomputed histogram requires a page table");
+      TensorMatcher({B, 1024})
+          .with_strides({HS, 1})
+          .with_dtype<int32_t>()
+          .with_device(device_)
+          .verify(*histograms);
+    }
     TensorMatcher({B})  // seq_lens
         .with_dtype<int32_t>()
         .with_device(device_)
@@ -726,12 +795,14 @@ struct TopKKernel {
 
     const auto params = TopKPagedParams{
         .scores = static_cast<const float*>(scores.data_ptr()),
+        .histograms = histograms != nullptr ? static_cast<uint32_t*>(histograms->data_ptr()) : nullptr,
         .seq_lens = static_cast<const int32_t*>(seq_lens.data_ptr()),
         .page_table = page_table_ptr,
         .page_indices = static_cast<int32_t*>(page_indices.data_ptr()),
         .raw_indices = raw_indices_ptr,
         .metadata = static_cast<const PlanItem*>(metadata.data_ptr()),
         .score_stride = S.unwrap(),
+        .histogram_stride = histograms != nullptr ? HS.unwrap() : 0,
         .page_table_stride = page_table_stride,
         .topk = topk,
         .page_bits = page_bits,
@@ -764,7 +835,7 @@ struct TopKKernel {
           if (batch_size <= kMaxCluster16BatchSize) {
             constexpr uint32_t kClusterSize = 16;
             // Widths above 8 are non-portable; the launch is rejected without this.
-            const auto kernel = topk_small_batch_cluster_kernel<kUsePDL, kMode, kClusterSize, 1>;
+            const auto kernel = topk_small_batch_cluster_kernel<kUsePDL, kMode, kClusterSize, 1, kPrecomputedHistogram>;
             [[maybe_unused]]
             static const bool _ = [&kernel] {
               const auto kernel_ptr = reinterpret_cast<const void*>(kernel);
@@ -782,33 +853,33 @@ struct TopKKernel {
             constexpr uint32_t kClusterSize = 8;
             return LaunchKernel({batch_size, kClusterSize}, kBlockSize, device)
                 .config({.use_pdl = kUsePDL, .cluster_dim = dim3{1, kClusterSize}})
-                .launch(topk_small_batch_cluster_kernel<kUsePDL, kMode, kClusterSize, 2>, params);
+                .launch(topk_small_batch_cluster_kernel<kUsePDL, kMode, kClusterSize, 2, kPrecomputedHistogram>, params);
           } else {
             constexpr uint32_t kClusterSize = 8;
             const uint32_t num_clusters = std::min(batch_size, kNumPersistentClusters);
             LaunchKernel({num_clusters, kClusterSize}, kBlockSize, device)
                 .config({.use_pdl = kUsePDL, .cluster_dim = dim3{1, kClusterSize}})
-                .launch(topk_persistent_cluster_kernel<kUsePDL, kClusterSize>, params);
+                .launch(topk_persistent_cluster_kernel<kUsePDL, kClusterSize, kPrecomputedHistogram>, params);
             LaunchKernel(batch_size, kBlockSize, device)
                 .config({.use_pdl = kUsePDL})
-                .launch(topk_main_kernel<kUsePDL, /*kLevel=*/3, kMode>, params);
+                .launch(topk_main_kernel<kUsePDL, /*kLevel=*/3, kMode, kPrecomputedHistogram>, params);
             return void();
           }
         }
       }
 #endif
-      if (max_seq_len <= kReg2MaxSeqLen) {
+      if (!kPrecomputedHistogram && max_seq_len <= kReg2MaxSeqLen) {
         LaunchKernel(batch_size, kBlockSize, device)
             .config({.use_pdl = kUsePDL})
             .launch(topk_main_kernel<kUsePDL, /*kLevel=*/0, kMode>, params);
-      } else if (max_seq_len <= kReg4MaxSeqLen) {
+      } else if (!kPrecomputedHistogram && max_seq_len <= kReg4MaxSeqLen) {
         LaunchKernel(batch_size, kBlockSize, device)
             .config({.use_pdl = kUsePDL})
             .launch(topk_main_kernel<kUsePDL, /*kLevel=*/1, kMode>, params);
       } else {
         LaunchKernel(batch_size, kBlockSize, device)
             .config({.use_pdl = kUsePDL})
-            .launch(topk_main_kernel<kUsePDL, /*kLevel=*/2, kMode>, params);
+            .launch(topk_main_kernel<kUsePDL, /*kLevel=*/2, kMode, kPrecomputedHistogram>, params);
       }
     });
   }

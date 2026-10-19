@@ -144,7 +144,11 @@ def cutedsl_paged_mqa_logits(
     blocksize: int,
     sm_count: int,
     get_paged_mqa_logits_metadata_fn: Callable[..., torch.Tensor],
-) -> torch.Tensor:
+    topk_lengths: torch.Tensor | None = None,
+    topk_histogram_workspace: torch.Tensor | None = None,
+    num_init_tokens: int = 0,
+    num_local_tokens: int = 0,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     from sglang.kernels.ops.attention.dsa.cutedsl_paged_mqa_logits import (
         CuteDSLPagedMQALogitsRunner,
     )
@@ -181,4 +185,8 @@ def cutedsl_paged_mqa_logits(
         block_tables_dsl,
         schedule_metadata,
         max_seq_len,
+        topk_lengths=topk_lengths,
+        topk_histogram_workspace=topk_histogram_workspace,
+        num_init_tokens=num_init_tokens,
+        num_local_tokens=num_local_tokens,
     )

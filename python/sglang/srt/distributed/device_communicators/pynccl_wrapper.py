@@ -385,6 +385,17 @@ class NCCLLibrary:
         # it is better not to call it at all.
         # ncclResult_t  ncclCommDestroy(ncclComm_t comm);
         Function("ncclCommDestroy", ncclResult_t, [ncclComm_t]),
+        # ncclResult_t ncclCommAbort(ncclComm_t comm);
+        # Unlike Destroy, this does not wait for peers: it raises the abort
+        # flag the collective kernels poll, so a spinning kernel exits and the
+        # process can be torn down. The only lever against a hung collective.
+        Function("ncclCommAbort", ncclResult_t, [ncclComm_t]),
+        # ncclResult_t ncclCommGetAsyncError(ncclComm_t comm, ncclResult_t *err);
+        Function(
+            "ncclCommGetAsyncError",
+            ncclResult_t,
+            [ncclComm_t, ctypes.POINTER(ncclResult_t)],
+        ),
         # ncclResult_t ncclGroupStart();
         Function("ncclGroupStart", ncclResult_t, []),
         # ncclResult_t ncclGroupEnd();
@@ -635,6 +646,24 @@ class NCCLLibrary:
 
     def ncclCommDestroy(self, comm: ncclComm_t) -> None:
         self.NCCL_CHECK(self._funcs["ncclCommDestroy"](comm))
+
+    def ncclCommAbort(self, comm: ncclComm_t) -> int:
+        """Raise the abort flag so in-flight collective kernels exit.
+
+        Deliberately does not NCCL_CHECK: every caller is already tearing the
+        process down, and raising here would mask that reason.
+        """
+        return int(self._funcs["ncclCommAbort"](comm))
+
+    def ncclCommGetAsyncError(self, comm: ncclComm_t) -> int:
+        """Poll the communicator's async error. 0 means no error so far.
+
+        A hang is not an error, so this never reports one; it only surfaces
+        faults NCCL itself has noticed, such as a peer that aborted.
+        """
+        err = ncclResult_t()
+        rc = int(self._funcs["ncclCommGetAsyncError"](comm, ctypes.byref(err)))
+        return int(err.value) if rc == 0 else rc
 
     def ncclCommWindowRegister(
         self, comm: ncclComm_t, buff: buffer_type, size: int, win_flags: int

@@ -429,11 +429,12 @@ class _GenerationStreamAccumulator:
                     req.sampling_params.stream_interval or self.default_stream_interval
                 )
 
-                # origin stream_interval logic
-                should_output = (
-                    len(req.output_ids) % stream_interval == 1
-                    if stream_interval > 1
-                    else len(req.output_ids) % stream_interval == 0
+                # Speculative steps can jump over every modulo boundary. Count
+                # tokens since the last emission instead, including tokens held
+                # back by stop-string buffering, and send the first block promptly.
+                new_tokens = len(req.output_ids) - req.send_token_offset
+                should_output = new_tokens > 0 and (
+                    req.send_token_offset == 0 or new_tokens >= stream_interval
                 )
 
                 if should_output:

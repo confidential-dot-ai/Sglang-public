@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -43,6 +44,9 @@ if TYPE_CHECKING:
 
 
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
+_LOG_DP_VERIFY_SKEW = envs.SGLANG_LOG_DP_VERIFY_SKEW.get()
+
+logger = logging.getLogger(__name__)
 
 
 def _resolve_elastic_world_dp_size(
@@ -218,6 +222,19 @@ class MLPSyncBatchInfo:
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
                 tp0_info_cpu[:, 5].tolist()
+            )
+        # Diagnostic-only, TODO.md J14c Milestone 0: measure real cross-rank
+        # request-count skew on extend-in-batch (TARGET_VERIFY) steps to size
+        # the sum_bucket capture window before building Milestone 1's capture
+        # path. Every rank logs the same global_num_tokens/skew (each rank
+        # runs this method independently after an identical all-gather), so
+        # expect dp_size duplicate lines per step -- harmless, diagnostic-only.
+        if _LOG_DP_VERIFY_SKEW and self.is_extend_in_batch and self.global_num_tokens:
+            skew = max(self.global_num_tokens) - min(self.global_num_tokens)
+            logger.info(
+                "[dp_verify_skew] global_num_tokens=%s skew=%d",
+                self.global_num_tokens,
+                skew,
             )
 
 

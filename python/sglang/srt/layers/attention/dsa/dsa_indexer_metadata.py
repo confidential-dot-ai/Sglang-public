@@ -167,3 +167,19 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
             batch_idx_list=batch_idx_list,
             force_unfused_topk=self.force_unfused_topk,
         )
+
+    def topk_transform_with_histogram(
+        self,
+        logits: torch.Tensor,
+        histograms: torch.Tensor,
+        topk: int,
+    ) -> torch.Tensor:
+        return self.topk_backend.topk_transform_with_histogram(
+            logits=logits,
+            histograms=histograms,
+            lengths=self.get_seqlens_expanded(),
+            topk=topk,
+            topk_transform_method=self.topk_transform_method,
+            attn_metadata=self.attn_metadata,
+            force_unfused_topk=self.force_unfused_topk,
+        )

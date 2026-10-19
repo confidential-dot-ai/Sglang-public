@@ -152,6 +152,14 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     logit_bias: Optional[Dict[str, float]] = None
     sampling_seed: Optional[int] = None
     custom_params: Optional[Dict[str, CustomParamValue]] = None
+    # Oracle mode ("teacher-forced" decode): when set, decode steps for this
+    # request emit these exact token ids instead of sampling, so a known
+    # dataset trace can be replayed to reproduce its real compute profile
+    # (KV-cache growth, prefix-cache reuse) without depending on the model
+    # actually reproducing that text via real sampling. See
+    # oracle_decode/forced_token_pool.py. Only covers plain (non-speculative)
+    # decode today -- DFlash/CCD verify-commit isn't bypassed yet.
+    forced_token_ids: Optional[List[int]] = None
 
     # --- Internal fields (populated by __post_init__ or normalize(), not API-facing) ---
     stop_strs: Optional[Union[str, List[str]]] = None  # from stop
@@ -299,6 +307,25 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
             raise ValueError(
                 "Only one of json_schema, regex, ebnf, or structural_tag can be set."
             )
+
+        if self.forced_token_ids is not None:
+            if len(self.forced_token_ids) == 0:
+                raise ValueError("forced_token_ids must be non-empty if set.")
+            for token_id in self.forced_token_ids:
+                if not 0 <= token_id < vocab_size:
+                    raise ValueError(
+                        f"forced_token_ids must be in [0, {vocab_size - 1}], got "
+                        f"{token_id}."
+                    )
+            if (
+                self.max_new_tokens is not None
+                and len(self.forced_token_ids) > self.max_new_tokens
+            ):
+                raise ValueError(
+                    f"forced_token_ids has {len(self.forced_token_ids)} tokens, "
+                    f"which exceeds max_new_tokens={self.max_new_tokens}; raise "
+                    "max_new_tokens to cover the full forced sequence."
+                )
 
     def normalize(self, tokenizer):
         # Process stop strings

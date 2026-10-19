@@ -51,6 +51,7 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     build_kv_layer_ids,
     build_staging_slot_metadata,
+    disagg_swa_transfer_window,
     get_dsa_tail_state_indices,
     get_kv_class,
     get_kv_transfer_buf_infos,
@@ -774,17 +775,14 @@ class SchedulerDisaggregationPrefillMixin:
             next_token_ids,
             extend_input_len_per_req,
             extend_logprob_start_len_per_req,
-            copy_done,
         ) = (
             result.logits_output,
             result.next_token_ids,
             result.extend_input_len_per_req,
             result.extend_logprob_start_len_per_req,
-            result.copy_done,
         )
 
-        if copy_done is not None:
-            copy_done.synchronize()
+        self.batch_result_processor._wait_result_copy(result)
         auxiliary_output_starts = (
             self.batch_result_processor.snapshot_auxiliary_output_starts(batch, result)
         )
@@ -1403,7 +1401,9 @@ class SchedulerDisaggregationPrefillMixin:
                 ]
 
             def _swa_payload():
-                window_size = self.sliding_window_size
+                window_size = disagg_swa_transfer_window(
+                    self.sliding_window_size, page_size
+                )
                 window_start = max(req.disagg_decode_prefix_len, seq_len - window_size)
                 window_start = (window_start // page_size) * page_size
                 window_kv_indices_full = self.req_to_token_pool.req_to_token[

@@ -367,6 +367,14 @@ struct Router {
     max_payload_size: usize,
     dp_aware: bool,
     api_key: Option<String>,
+    admin_api_key: Option<String>,
+    ops_api_key: Option<String>,
+    api_key_store: Option<String>,
+    reject_video: bool,
+    max_inflight_images: i64,
+    max_inflight_megapixels: i64,
+    max_images_per_request: i64,
+    unmeasured_image_megapixels: i64,
     log_dir: Option<String>,
     log_level: Option<String>,
     json_log: bool,
@@ -381,6 +389,9 @@ struct Router {
     prometheus_host: Option<String>,
     prometheus_duration_buckets: Option<Vec<f64>>,
     request_timeout_secs: u64,
+    stream_total_timeout_secs: u64,
+    request_read_timeout_secs: u64,
+    stream_idle_timeout_secs: u64,
     shutdown_grace_period_secs: u64,
     request_id_headers: Option<Vec<String>>,
     pd_disaggregation: bool,
@@ -498,7 +509,26 @@ impl Router {
                 },
                 PolicyType::ConsistentHashing => ConfigPolicyConfig::ConsistentHashing,
                 PolicyType::PrefixHash => ConfigPolicyConfig::PrefixHash {
-                    prefix_token_count: 256,
+                    // Was 256 -- empirically too short for agent-trace-style
+                    // workloads that share a long boilerplate system prompt
+                    // (SWE-agent harnesses commonly do): measured directly
+                    // against Wejh/ninja-agent-traces (2026-07-24), 49 of 50
+                    // sampled conversations shared an IDENTICAL first 263
+                    // tokens, so at 256 nearly all of them hashed to the same
+                    // consistent-hash-ring bucket -- collapsing prefix_hash's
+                    // whole point (spread load across workers by prefix) down
+                    // to effectively one worker regardless of client-side
+                    // concurrency. Raising the window to 1024 empirically
+                    // restores real diversity on that same dataset (35 unique
+                    // groups out of 50, largest cluster only 3) by hashing
+                    // past the shared preamble into the actual per-task
+                    // content. There is currently no way to override this
+                    // from the Python launch path at all (no CLI flag reaches
+                    // this closure) -- if a real per-deployment override is
+                    // ever needed, add one; until then this default should be
+                    // long enough to clear typical shared-system-prompt
+                    // boilerplate for agentic workloads specifically.
+                    prefix_token_count: 1024,
                     load_factor: 1.25,
                 },
             }
@@ -595,6 +625,9 @@ impl Router {
             .connection_mode(self.connection_mode.clone())
             .max_payload_size(self.max_payload_size)
             .request_timeout_secs(self.request_timeout_secs)
+            .stream_total_timeout_secs(self.stream_total_timeout_secs)
+            .request_read_timeout_secs(self.request_read_timeout_secs)
+            .stream_idle_timeout_secs(self.stream_idle_timeout_secs)
             .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
             .worker_startup_check_interval_secs(self.worker_startup_check_interval)
             .max_concurrent_requests(self.max_concurrent_requests)
@@ -630,6 +663,14 @@ impl Router {
             })
             .history_backend(history_backend)
             .maybe_api_key(self.api_key.as_ref())
+            .maybe_admin_api_key(self.admin_api_key.as_ref())
+            .maybe_ops_api_key(self.ops_api_key.as_ref())
+            .maybe_api_key_store(self.api_key_store.as_ref())
+            .reject_video(self.reject_video)
+            .max_inflight_images(self.max_inflight_images)
+            .max_inflight_megapixels(self.max_inflight_megapixels)
+            .max_images_per_request(self.max_images_per_request)
+            .unmeasured_image_megapixels(self.unmeasured_image_megapixels)
             .maybe_discovery(discovery)
             .maybe_metrics(metrics)
             .maybe_trace(trace_config)
@@ -688,6 +729,14 @@ impl Router {
         max_payload_size = 512 * 1024 * 1024,
         dp_aware = false,
         api_key = None,
+        admin_api_key = None,
+        ops_api_key = None,
+        api_key_store = None,
+        reject_video = false,
+        max_inflight_images = 0,
+        max_inflight_megapixels = 0,
+        max_images_per_request = 0,
+        unmeasured_image_megapixels = 0,
         log_dir = None,
         log_level = None,
         json_log = false,
@@ -702,6 +751,9 @@ impl Router {
         prometheus_host = None,
         prometheus_duration_buckets = None,
         request_timeout_secs = 1800,
+        stream_total_timeout_secs = 0,
+        request_read_timeout_secs = 600,
+        stream_idle_timeout_secs = 120,
         shutdown_grace_period_secs = 180,
         request_id_headers = None,
         pd_disaggregation = false,
@@ -780,6 +832,14 @@ impl Router {
         max_payload_size: usize,
         dp_aware: bool,
         api_key: Option<String>,
+        admin_api_key: Option<String>,
+        ops_api_key: Option<String>,
+        api_key_store: Option<String>,
+        reject_video: bool,
+        max_inflight_images: i64,
+        max_inflight_megapixels: i64,
+        max_images_per_request: i64,
+        unmeasured_image_megapixels: i64,
         log_dir: Option<String>,
         log_level: Option<String>,
         json_log: bool,
@@ -794,6 +854,9 @@ impl Router {
         prometheus_host: Option<String>,
         prometheus_duration_buckets: Option<Vec<f64>>,
         request_timeout_secs: u64,
+        stream_total_timeout_secs: u64,
+        request_read_timeout_secs: u64,
+        stream_idle_timeout_secs: u64,
         shutdown_grace_period_secs: u64,
         request_id_headers: Option<Vec<String>>,
         pd_disaggregation: bool,
@@ -885,6 +948,14 @@ impl Router {
             max_payload_size,
             dp_aware,
             api_key,
+            admin_api_key,
+            ops_api_key,
+            api_key_store,
+            reject_video,
+            max_inflight_images,
+            max_inflight_megapixels,
+            max_images_per_request,
+            unmeasured_image_megapixels,
             log_dir,
             log_level,
             json_log,
@@ -899,6 +970,9 @@ impl Router {
             prometheus_host,
             prometheus_duration_buckets,
             request_timeout_secs,
+            stream_total_timeout_secs,
+            request_read_timeout_secs,
+            stream_idle_timeout_secs,
             shutdown_grace_period_secs,
             request_id_headers,
             pd_disaggregation,

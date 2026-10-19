@@ -1,6 +1,6 @@
 import inspect
 import logging
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -31,6 +31,8 @@ _flashinfer_allreduce_unavailable = False
 _flashinfer_create_workspace_supports_group = False
 _flashinfer_create_workspace_supports_comm_backend = False
 _flashinfer_allreduce_supports_trigger_completion = False
+
+_FLASHINFER_FUSION_WORKSPACE_PREFIX = "flashinfer_fusion_"
 
 
 def _mnnvl_supported(is_multi_node: bool) -> bool:
@@ -228,6 +230,42 @@ def is_flashinfer_allreduce_unavailable() -> bool:
     return _flashinfer_allreduce_unavailable
 
 
+def _cc_ipc_fusion_enabled() -> bool:
+    """Run FlashInfer's trtllm AR+RMSNorm fusion on a multicast-free IPC
+    workspace under Confidential Computing, so the SAME kernel is used CC-on and
+    CC-off (kernel parity). Auto-enabled whenever CC is detected.
+
+    The trtllm one-shot Lamport fusion kernel is multicast-free (verified: 0
+    `multimem` in trtllm_allreduce_fusion.cuh); the only multicast dependency is
+    the workspace allocator. `create_allreduce_fusion_workspace` hardcodes
+    `use_symm_dev_mem=True` (→ multicast, which fails under CC), but the
+    low-level `trtllm_create_ipc_workspace_for_all_reduce_fusion(
+    use_symm_dev_mem=False)` gives an IPC-only workspace the same kernel runs on.
+
+    Off-CC this returns False, so non-CC behavior is unchanged.
+    """
+    try:
+        from sglang.srt.utils.common import is_confidential_compute
+
+        return is_confidential_compute()
+    except Exception:
+        return False
+
+
+def _resolve_flashinfer_comm_fn(name: str):
+    """Resolve a FlashInfer comm fn from the top-level module or the trtllm_ar
+    submodule (export location varies by FlashInfer version)."""
+    fn = getattr(_flashinfer_comm, name, None)
+    if fn is None:
+        try:
+            import flashinfer.comm.trtllm_ar as _tar
+
+            fn = getattr(_tar, name, None)
+        except Exception:
+            fn = None
+    return fn
+
+
 def _make_flashinfer_workspace_allocation_prop(cuda_driver):
     from flashinfer.comm.mnnvl import is_mnnvl_fabric_supported
 
@@ -395,11 +433,13 @@ class FlashInferWorkspaceManager:
     Supports trtllm and mnnvl backends via create_allreduce_fusion_workspace().
     """
 
-    def __init__(self):
+    def __init__(self, resource_key: Optional[str] = None):
+        self.resource_key = resource_key
         self.workspace = None
         self.world_size = None
         self.rank = None
         self.group = None
+        self.backend = None
         self.max_token_num = None
         self.hidden_dim = None
         self.dtype = None
@@ -410,6 +450,10 @@ class FlashInferWorkspaceManager:
         self._max_token_num_seen: Optional[int] = None
         self._max_hidden_dim_seen: Optional[int] = None
         self._logged_init = False
+        # CC IPC fusion: multicast-free workspace state.
+        self.cc_ipc = False
+        self.workspace_tensor = None
+        self.workspace_metadata = None
         self._workspace_size_check_kwarg = None
         self._workspace_size_check_strategy_type = None
 
@@ -446,6 +490,25 @@ class FlashInferWorkspaceManager:
         """Initialize workspace using FlashInfer's unified API."""
         global _flashinfer_allreduce_unavailable
 
+        requested_group = (device_group, cpu_group)
+
+        # A workspace owns peer-visible buffers and synchronization state for
+        # exactly one communicator. Rebinding a live manager is unsafe once a
+        # CUDA graph has captured its pointers, even when the replacement
+        # group contains the same ranks. Callers must select a distinct
+        # resource key for a distinct GroupCoordinator instead.
+        if self.initialized and (
+            self.world_size != world_size
+            or self.rank != rank
+            or self.group != requested_group
+            or self.backend != backend
+        ):
+            raise RuntimeError(
+                "FlashInfer allreduce-fusion workspace cannot be rebound to a "
+                "different communicator/backend; request a per-communicator "
+                f"manager instead (resource_key={self.resource_key!r})"
+            )
+
         # Track the high-water mark so allocations only grow
         self._max_token_num_seen = max(max_token_num, self._max_token_num_seen or 0)
         self._max_hidden_dim_seen = max(hidden_dim, self._max_hidden_dim_seen or 0)
@@ -474,6 +537,90 @@ class FlashInferWorkspaceManager:
             return
 
         self.cleanup()
+
+        global _flashinfer_allreduce_unavailable
+
+        # Under CC, build a multicast-free IPC workspace so FlashInfer's own
+        # trtllm fusion kernel runs (cc_off parity). Skips the cuMulticast
+        # preflight — that probe is exactly what disables fusion under CC.
+        if _cc_ipc_fusion_enabled():
+            make_ws = _resolve_flashinfer_comm_fn(
+                "trtllm_create_ipc_workspace_for_all_reduce_fusion"
+            )
+            if make_ws is None:
+                logger.warning(
+                    "CC IPC fusion requested but "
+                    "trtllm_create_ipc_workspace_for_all_reduce_fusion is "
+                    "unavailable; leaving fusion disabled."
+                )
+                _flashinfer_allreduce_unavailable = True
+                self.workspace = None
+                self.initialized = False
+                return
+            ipc_kwargs = dict(
+                use_fp32_lamport=(dtype == torch.float32),
+                # Pin the IPC handle-exchange to the actual TP/EP subgroup.
+                group=device_group,
+                create_metadata=True,
+                use_symm_dev_mem=False,  # <-- no multicast (CC/NVLE-safe)
+            )
+            # CRITICAL: pass the same comm_backend the symm path uses. The IPC
+            # workspace creation does a collective handle exchange; without the
+            # correct backend/group it addresses the wrong peers and HANGS across
+            # ranks (the skipped cuMulticast preflight also voted ranks together).
+            if (
+                _TorchDistBackend is not None
+                and device_group is not None
+                and cpu_group is not None
+            ):
+                ipc_kwargs["comm_backend"] = _TorchDistBackend(
+                    device_group=device_group, cpu_group=cpu_group
+                )
+            try:
+                # No transport override needed here: the GB200/GB300 Fabric-
+                # vs-PosixFD workaround this used to be wrapped in
+                # (_flashinfer_posix_fd_transport_override_if_needed) was
+                # removed upstream once FlashInfer's own transport issue was
+                # fixed (and it was aarch64-only besides -- always a no-op on
+                # this x86_64 host). The wrapper call survived a merge
+                # conflict in this cc-fix as a dangling reference to an
+                # already-deleted helper, raising a plain NameError on every
+                # rank and silently disabling the whole fusion path.
+                ws = make_ws(
+                    rank,
+                    world_size,
+                    max_token_num,
+                    hidden_dim,
+                    **ipc_kwargs,
+                )
+                # (ipc_handles, workspace_tensor, metadata)
+                self.workspace = ws
+                self.workspace_tensor = ws[1]
+                self.workspace_metadata = ws[2] if len(ws) > 2 else None
+                self.cc_ipc = True
+            except Exception as e:
+                _flashinfer_allreduce_unavailable = True
+                logger.warning(
+                    f"Failed to init CC IPC fusion workspace: {e}. "
+                    "Disabling flashinfer allreduce fusion."
+                )
+                self.workspace = None
+                self.initialized = False
+                return
+
+            self.world_size = world_size
+            self.rank = rank
+            self.group = requested_group
+            self.backend = backend
+            self.max_token_num = max_token_num
+            self.hidden_dim = hidden_dim
+            self.dtype = dtype
+            self.initialized = True
+            logger.info(
+                "FlashInfer CC IPC fusion workspace initialized (multicast-free) "
+                f"for rank {rank}, world_size {world_size}"
+            )
+            return
 
         if not _preflight_check_workspace_memory(
             world_size=world_size,
@@ -535,7 +682,8 @@ class FlashInferWorkspaceManager:
             self._configure_workspace_size_check()
             self.world_size = world_size
             self.rank = rank
-            self.group = (device_group, cpu_group)
+            self.group = requested_group
+            self.backend = backend
             self.max_token_num = alloc_token_num
             self.hidden_dim = alloc_hidden_dim
             self.dtype = dtype or torch.bfloat16
@@ -580,6 +728,14 @@ class FlashInferWorkspaceManager:
     ) -> bool:
         if not self.initialized or self.workspace is None:
             return False
+        if self.cc_ipc:
+            # IPC workspace is a raw tuple (no helper). Manual size check:
+            # workspace holds max_token_num*hidden_dim*dtype; reuse if it fits.
+            return (
+                token_num <= self.max_token_num
+                and hidden_dim == self.hidden_dim
+                and dtype == self.dtype
+            )
         try:
             check_kw = dict(
                 tp_size=self.world_size,
@@ -617,18 +773,33 @@ class FlashInferWorkspaceManager:
         """Clean up workspace."""
         if self.workspace is not None:
             try:
-                if hasattr(self.workspace, "destroy"):
+                if self.cc_ipc:
+                    # IPC workspace is a raw tuple; free via the destroy helper.
+                    destroy = _resolve_flashinfer_comm_fn(
+                        "trtllm_destroy_ipc_workspace_for_all_reduce_fusion"
+                    )
+                    if destroy is not None:
+                        grp = self.group[0] if self.group else None
+                        try:
+                            destroy(self.workspace, group=grp)
+                        except TypeError:
+                            destroy(self.workspace)
+                elif hasattr(self.workspace, "destroy"):
                     self.workspace.destroy()
             except Exception as e:
                 logger.warning(f"Failed to cleanup FlashInfer workspace: {e}")
             finally:
                 self.workspace = None
+                self.workspace_tensor = None
+                self.workspace_metadata = None
+                self.cc_ipc = False
                 self._workspace_size_check_kwarg = None
                 self._workspace_size_check_strategy_type = None
                 self.initialized = False
                 self.world_size = None
                 self.rank = None
                 self.group = None
+                self.backend = None
                 self.max_token_num = None
                 self.hidden_dim = None
                 self.dtype = None
@@ -637,19 +808,45 @@ class FlashInferWorkspaceManager:
                 self._logged_init = False
 
 
-def _get_workspace_manager(use_attn_tp_group: bool) -> FlashInferWorkspaceManager:
-    """The per-group fusion workspace manager; the instances live on
-    ``ctx.resources`` (one per comm group, created lazily)."""
+def _resolve_workspace_coordinator(use_attn_tp_group: bool):
+    from sglang.srt.layers.moe.utils import post_experts_reduction_group
 
+    if use_attn_tp_group:
+        return get_parallel().attn_tp_group
+    return post_experts_reduction_group()
+
+
+def _workspace_resource_key(use_attn_tp_group: bool, coordinator: Any) -> str:
+    """Stable process-local slot for one fusion role and communicator.
+
+    Distinct GroupCoordinator instances may contain identical ranks while
+    owning independent peer buffers/semaphores (e.g. pdmux's duplicate TP
+    group), so rank lists or world size are not sufficient identity.
+    ``unique_name`` is assigned to every GroupCoordinator at construction and
+    already identifies custom-op dispatch for the same reason.
+    """
+    unique_name = getattr(coordinator, "unique_name", None)
+    if not unique_name:
+        raise RuntimeError(
+            "FlashInfer allreduce fusion requires a GroupCoordinator with a "
+            "stable unique_name"
+        )
+    role = "attn_tp" if use_attn_tp_group else "moe_tp"
+    return f"{_FLASHINFER_FUSION_WORKSPACE_PREFIX}{role}_workspace:{unique_name}"
+
+
+def _get_workspace_manager(
+    use_attn_tp_group: bool, coordinator: Any = None
+) -> FlashInferWorkspaceManager:
+    """Return the workspace owned by this fusion role *and* communicator."""
+
+    if coordinator is None:
+        coordinator = _resolve_workspace_coordinator(use_attn_tp_group)
     buffers = get_resources().buffers
-    name = (
-        "flashinfer_fusion_attn_tp_workspace"
-        if use_attn_tp_group
-        else "flashinfer_fusion_moe_tp_workspace"
-    )
+    name = _workspace_resource_key(use_attn_tp_group, coordinator)
     manager = buffers.get(name)
     if manager is None:
-        manager = FlashInferWorkspaceManager()
+        manager = FlashInferWorkspaceManager(resource_key=name)
         buffers[name] = manager
     return manager
 
@@ -743,7 +940,7 @@ def ensure_workspace_initialized(
     if world_size <= 1:
         return False
 
-    workspace_manager = _get_workspace_manager(use_attn_tp_group)
+    workspace_manager = _get_workspace_manager(use_attn_tp_group, coordinator)
     token_num = token_num or max_token_num
     group_key = (device_group, cpu_group)
     effective_dtype = dtype or torch.bfloat16
@@ -756,6 +953,7 @@ def ensure_workspace_initialized(
         or workspace_manager.world_size != world_size
         or workspace_manager.rank != rank
         or workspace_manager.group != group_key
+        or workspace_manager.backend != backend
         or not workspace_manager.is_buffer_size_sufficient(
             token_num=token_num,
             hidden_dim=hidden_dim,
@@ -874,23 +1072,51 @@ def flashinfer_allreduce_residual_rmsnorm(
     residual_out = torch.empty_like(residual)
     norm_out = torch.empty_like(input_tensor)
 
-    kwargs = dict(
-        input=input_tensor,
-        workspace=workspace_manager.workspace,
-        pattern=_flashinfer_comm.AllReduceFusionPattern.kARResidualRMSNorm,
-        launch_with_pdl=True,
-        residual_out=residual_out,
-        norm_out=norm_out,
-        residual_in=residual,
-        rms_gamma=weight,
-        rms_eps=eps,
-        use_oneshot=use_oneshot,
-    )
-    if workspace_manager.backend == "trtllm":
-        kwargs["fp32_acc"] = fp32_acc
-    if _flashinfer_allreduce_supports_trigger_completion:
-        kwargs["trigger_completion_at_end"] = trigger_completion_at_end
-    _flashinfer_comm.allreduce_fusion(**kwargs)
+    if getattr(workspace_manager, "cc_ipc", False):
+        # CC: same FlashInfer kernel on the multicast-free IPC workspace, driven
+        # via the low-level op. We force oneshot (correct for decode-sized
+        # messages); the high-level heuristic is bypassed here.
+        ar_fuse = _resolve_flashinfer_comm_fn("trtllm_allreduce_fusion")
+        ar_fuse(
+            allreduce_in=input_tensor,
+            world_size=workspace_manager.world_size,
+            world_rank=workspace_manager.rank,
+            token_num=input_tensor.shape[0],
+            hidden_dim=input_tensor.shape[-1],
+            workspace_ptrs=workspace_manager.workspace_tensor,
+            launch_with_pdl=True,
+            use_oneshot=True if use_oneshot is None else bool(use_oneshot),
+            trigger_completion_at_end=trigger_completion_at_end,
+            fp32_acc=fp32_acc,
+            pattern_code=_flashinfer_comm.AllReduceFusionPattern.kARResidualRMSNorm,
+            allreduce_out=None,
+            residual_in=residual,
+            residual_out=residual_out,
+            norm_out=norm_out,
+            quant_out=None,
+            scale_out=None,
+            rms_gamma=weight,
+            rms_eps=eps,
+            scale_factor=None,
+            layout_code=None,
+        )
+    else:
+        kwargs = dict(
+            input=input_tensor,
+            workspace=workspace_manager.workspace,
+            pattern=_flashinfer_comm.AllReduceFusionPattern.kARResidualRMSNorm,
+            launch_with_pdl=True,
+            residual_out=residual_out,
+            norm_out=norm_out,
+            residual_in=residual,
+            rms_gamma=weight,
+            rms_eps=eps,
+            use_oneshot=use_oneshot,
+            fp32_acc=fp32_acc,
+        )
+        if _flashinfer_allreduce_supports_trigger_completion:
+            kwargs["trigger_completion_at_end"] = trigger_completion_at_end
+        _flashinfer_comm.allreduce_fusion(**kwargs)
 
     return norm_out, residual_out
 
@@ -1053,10 +1279,16 @@ def pre_initialize_workspaces(
 def cleanup_flashinfer_workspace():
 
     buffers = get_resources().buffers
-    for name in (
-        "flashinfer_fusion_attn_tp_workspace",
-        "flashinfer_fusion_moe_tp_workspace",
-    ):
-        manager = buffers.get(name)
-        if manager is not None:
-            manager.cleanup()
+    # Snapshot keys because cleanup removes every communicator-scoped manager.
+    # Include the two legacy unscoped names so teardown remains safe if this
+    # code is hot-reloaded into a process that created an older workspace.
+    names = [
+        name
+        for name, manager in buffers.items()
+        if isinstance(name, str)
+        and name.startswith(_FLASHINFER_FUSION_WORKSPACE_PREFIX)
+        and callable(getattr(manager, "cleanup", None))
+    ]
+    for name in names:
+        manager = buffers.pop(name)
+        manager.cleanup()

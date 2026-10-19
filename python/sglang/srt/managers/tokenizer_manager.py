@@ -532,11 +532,24 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Init request dispatcher
         self.init_request_dispatcher()
 
+        # Initialize debug request profiling before the transport, which must
+        # remain the final potentially thread-owning component.
+        self.init_auto_profile()
+
         # Construct this last so later initialization failures cannot orphan
         # the transport's recycler thread.
         self.cuda_vmm_feature_transport = CudaVmmFeatureTransport(
             self.server_args, self.mm_processor
         )
+    def init_auto_profile(self):
+        # Debug-only (SGLANG_DEBUG_AUTO_PROFILE_REQUESTS): reference-counted
+        # torch-profile-per-request state. Lock serializes concurrent
+        # requests' enter/exit against the shared counter; a request that
+        # finds the profiler already running (count > 0 before increment)
+        # must not start it again, and one that leaves it still in use
+        # (count > 0 after decrement) must not stop it.
+        self._auto_profile_lock = asyncio.Lock()
+        self._auto_profile_count = 0
 
     def init_model_config(self):
         server_args = self.server_args
@@ -851,6 +864,48 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.sampling_params_class = SamplingParams
         self.signal_handler_class = SignalHandler
 
+    async def _auto_profile_enter(self, rid: Union[str, List[str]]) -> bool:
+        """Start the shared torch profiler if this is the first concurrent
+        auto-profiled request; returns whether this call incremented the
+        count (and therefore owns a matching _auto_profile_exit).
+
+        Excludes the periodic /health / /health_generate probe requests
+        (HEALTH_CHECK_RID_PREFIX): those recur every ~1s, so profiling them
+        would start/stop/export a full torch-profiler trace on the readiness
+        loop alone -- each export takes several seconds on a real model,
+        which starves the readiness/liveness checks it is trying to answer.
+        Health checks are always single-request (rid: str), but this also
+        accepts the List[str] batch-request shape for a uniform call site.
+        """
+        if not envs.SGLANG_DEBUG_AUTO_PROFILE_REQUESTS.get():
+            return False
+        first_rid = rid[0] if isinstance(rid, list) else rid
+        if isinstance(first_rid, str) and first_rid.startswith(
+            HEALTH_CHECK_RID_PREFIX
+        ):
+            return False
+        async with self._auto_profile_lock:
+            self._auto_profile_count += 1
+            if self._auto_profile_count == 1:
+                try:
+                    await self.start_profile()
+                except Exception:
+                    logger.exception(
+                        "SGLANG_DEBUG_AUTO_PROFILE_REQUESTS: start_profile failed"
+                    )
+        return True
+
+    async def _auto_profile_exit(self):
+        async with self._auto_profile_lock:
+            self._auto_profile_count -= 1
+            if self._auto_profile_count == 0:
+                try:
+                    await self.stop_profile()
+                except Exception:
+                    logger.exception(
+                        "SGLANG_DEBUG_AUTO_PROFILE_REQUESTS: stop_profile failed"
+                    )
+
     async def generate_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -858,69 +913,74 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         self.auto_create_handle_loop()
 
-        # Normalize the request
-        obj.normalize_batch_and_arguments()
-        self._set_default_priority(obj)
-        if (
-            isinstance(obj, GenerateReqInput)
-            and obj.max_thinking_tokens is not None
-            and not get_serving().enable_strict_thinking
-        ):
-            raise ValueError(
-                "max_thinking_tokens requires the server to be launched with "
-                "--enable-strict-thinking"
-            )
-
-        if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
-            dp_size = self.elastic_worker_count
-            if dp_size <= 1 and obj.routed_dp_rank == 0:
-                logger.debug(
-                    f"routed_dp_rank={obj.routed_dp_rank} is ignored because dp_size={dp_size}"
-                )
-            elif obj.routed_dp_rank < 0 or obj.routed_dp_rank >= dp_size:
-                raise ValueError(
-                    f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {dp_size})"
-                )
-
-        self._init_req_state(obj, request)
-        request_rids = {obj.rid} if obj.is_single else set(obj.rid)
+        auto_profiling = await self._auto_profile_enter(obj.rid)
         try:
-            if get_disagg().language_only:
-                self._handle_epd_disaggregation_encode_request(obj)
+            # Normalize the request
+            obj.normalize_batch_and_arguments()
+            self._set_default_priority(obj)
+            if (
+                isinstance(obj, GenerateReqInput)
+                and obj.max_thinking_tokens is not None
+                and not get_serving().enable_strict_thinking
+            ):
+                raise ValueError(
+                    "max_thinking_tokens requires the server to be launched with "
+                    "--enable-strict-thinking"
+                )
 
-            # Log the request
-            self.request_logger.log_received_request(obj, self.tokenizer, request)
+            if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
+                dp_size = self.elastic_worker_count
+                if dp_size <= 1 and obj.routed_dp_rank == 0:
+                    logger.debug(
+                        f"routed_dp_rank={obj.routed_dp_rank} is ignored because dp_size={dp_size}"
+                    )
+                elif obj.routed_dp_rank < 0 or obj.routed_dp_rank >= dp_size:
+                    raise ValueError(
+                        f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {dp_size})"
+                    )
 
-            async with self.is_pause_cond:
-                await self.is_pause_cond.wait_for(lambda: not self.is_pause)
+            self._init_req_state(obj, request)
+            request_rids = {obj.rid} if obj.is_single else set(obj.rid)
+            try:
+                if get_disagg().language_only:
+                    self._handle_epd_disaggregation_encode_request(obj)
 
-            async with self.model_update_lock.reader_lock:
-                await self._validate_and_resolve_lora(obj)
+                # Log the request
+                self.request_logger.log_received_request(obj, self.tokenizer, request)
 
-                # Tokenize the request and send it to the scheduler
-                if obj.is_single:
-                    tokenized_obj = await self._tokenize_one_request(obj)
-                    state = self.rid_to_state[obj.rid]
-                    if obj.return_prompt_token_ids:
-                        state.prompt_token_ids = list(tokenized_obj.input_ids)
-                    await self._send_one_request(tokenized_obj)
-                    async for response in self._wait_one_response(obj, request):
-                        yield response
-                else:
-                    async for response in self._handle_batch_request(
-                        obj, request, request_rids
-                    ):
-                        yield response
-        except BaseException:
-            # _init_req_state created a rid_to_state entry per (sub-)request up
-            # front. The normal remover is the scheduler-response path
-            # (_handle_batch_output), so a failure *before* a request reaches the
-            # scheduler -- e.g. input-length validation rejecting an over-context
-            # request -- would otherwise leak those entries forever. Drop
-            # undelivered states, but abort dispatched requests for scheduler-side
-            # cleanup.
-            self._release_req_states_on_failure(request_rids)
-            raise
+                async with self.is_pause_cond:
+                    await self.is_pause_cond.wait_for(lambda: not self.is_pause)
+
+                async with self.model_update_lock.reader_lock:
+                    await self._validate_and_resolve_lora(obj)
+
+                    # Tokenize the request and send it to the scheduler
+                    if obj.is_single:
+                        tokenized_obj = await self._tokenize_one_request(obj)
+                        state = self.rid_to_state[obj.rid]
+                        if obj.return_prompt_token_ids:
+                            state.prompt_token_ids = list(tokenized_obj.input_ids)
+                        await self._send_one_request(tokenized_obj)
+                        async for response in self._wait_one_response(obj, request):
+                            yield response
+                    else:
+                        async for response in self._handle_batch_request(
+                            obj, request, request_rids
+                        ):
+                            yield response
+            except BaseException:
+                # _init_req_state created a rid_to_state entry per (sub-)request up
+                # front. The normal remover is the scheduler-response path
+                # (_handle_batch_output), so a failure *before* a request reaches the
+                # scheduler -- e.g. input-length validation rejecting an over-context
+                # request -- would otherwise leak those entries forever. Drop
+                # undelivered states, but abort dispatched requests for scheduler-side
+                # cleanup.
+                self._release_req_states_on_failure(request_rids)
+                raise
+        finally:
+            if auto_profiling:
+                await self._auto_profile_exit()
 
     def _detect_input_format(
         self, texts: Union[str, List[str]], is_cross_encoder: bool
@@ -1810,6 +1870,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         ) in (
             HTTPStatus.SERVICE_UNAVAILABLE,
             HTTPStatus.INTERNAL_SERVER_ERROR,
+            # Load shedding (queue full, waiting timeout). Omitting it here
+            # does not downgrade the status -- it drops the error entirely and
+            # the client sees a silent empty completion.
+            HTTPStatus.TOO_MANY_REQUESTS,
         ):
             # Delete the key to prevent resending abort request to the scheduler and
             # to ensure aborted request state is cleaned up.

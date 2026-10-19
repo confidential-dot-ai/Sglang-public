@@ -1,7 +1,10 @@
 use std::{
     borrow::Cow,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -170,6 +173,30 @@ pub(crate) fn init_metrics() {
     describe_counter!(
         "smg_http_rate_limit_total",
         "Rate limiting decisions by result (allowed/rejected)"
+    );
+    describe_gauge!(
+        "smg_admission_limit",
+        "Current global admission ceiling (max concurrent requests across all replicas)"
+    );
+    describe_gauge!(
+        "smg_admission_inflight",
+        "Requests currently holding an admission permit"
+    );
+    describe_counter!(
+        "smg_admission_rejected_total",
+        "Requests refused by the admission limiter, by reason"
+    );
+    describe_gauge!(
+        "smg_image_limit",
+        "Ceiling on images in flight on this gateway (max_inflight_images; 0 = disabled)"
+    );
+    describe_gauge!(
+        "smg_image_inflight",
+        "Images held by admitted requests whose responses are still open"
+    );
+    describe_counter!(
+        "smg_image_rejected_total",
+        "Requests refused by the image admission limit, by endpoint"
     );
 
     // Layer 2: Router metrics
@@ -345,6 +372,27 @@ pub fn start_prometheus(config: PrometheusConfig) {
         ]
     });
 
+    // A histogram with no bucket match is exported as a summary, whose
+    // quantiles are per-process and cannot be aggregated across replicas into a
+    // cluster P50. The matcher above covers only `*duration_seconds`.
+    //
+    // TTFT is bucketed around the 3s gate; TPOT around 16.7ms, the P50 TPS > 60
+    // gate expressed as seconds per token.
+    let ttft_bucket: Vec<f64> = vec![
+        0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0, 20.0, 30.0, 60.0,
+        120.0,
+    ];
+    let tpot_bucket: Vec<f64> = vec![
+        0.001, 0.002, 0.004, 0.008, 0.0167, 0.025, 0.05, 0.1, 0.2, 0.4, 0.8, 1.0, 2.0, 5.0,
+    ];
+    let token_bucket: Vec<f64> = vec![
+        16.0, 64.0, 256.0, 1024.0, 4096.0, 8192.0, 16384.0, 32768.0, 65536.0, 98304.0, 131072.0,
+        196608.0, 262144.0, 524288.0, 1048576.0,
+    ];
+    let ratio_bucket: Vec<f64> = vec![
+        0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.85, 0.9, 0.95, 0.99, 1.0,
+    ];
+
     let ip_addr: IpAddr = config
         .host
         .parse()
@@ -356,6 +404,36 @@ pub fn start_prometheus(config: PrometheusConfig) {
         .upkeep_timeout(Duration::from_secs(5 * 60))
         .set_buckets_for_metric(duration_matcher, &duration_bucket)
         .expect("failed to set duration bucket")
+        .set_buckets_for_metric(
+            Matcher::Full(String::from("smg_inference_ttft_seconds")),
+            &ttft_bucket,
+        )
+        .expect("failed to set ttft bucket")
+        .set_buckets_for_metric(
+            Matcher::Full(String::from("smg_inference_tpot_seconds")),
+            &tpot_bucket,
+        )
+        .expect("failed to set tpot bucket")
+        .set_buckets_for_metric(
+            Matcher::Full(String::from("smg_inference_input_tokens")),
+            &token_bucket,
+        )
+        .expect("failed to set input token bucket")
+        .set_buckets_for_metric(
+            Matcher::Full(String::from("smg_inference_output_tokens")),
+            &token_bucket,
+        )
+        .expect("failed to set output token bucket")
+        .set_buckets_for_metric(
+            Matcher::Full(String::from("smg_inference_cached_tokens")),
+            &token_bucket,
+        )
+        .expect("failed to set cached token bucket")
+        .set_buckets_for_metric(
+            Matcher::Full(String::from("smg_inference_cache_hit_ratio")),
+            &ratio_bucket,
+        )
+        .expect("failed to set cache hit ratio bucket")
         .install()
         .expect("failed to install Prometheus metrics exporter");
 }
@@ -452,6 +530,21 @@ pub mod metrics_labels {
 /// Design principles for low overhead:
 /// - Dynamic labels use string interning (single allocation per unique value)
 /// - Static labels use the metrics crate's internal caching
+/// Runtime kill switch for metric recording, toggled via `POST /admin/metrics`.
+///
+/// Gates emission, not the exporter: the Prometheus listener is bound at startup
+/// and stays bound, so while this is false `/metrics` still serves, with gauges
+/// frozen at their last value and counters not advancing.
+static METRICS_ENABLED: AtomicBool = AtomicBool::new(true);
+
+pub fn metrics_enabled() -> bool {
+    METRICS_ENABLED.load(Ordering::Relaxed)
+}
+
+pub fn set_metrics_enabled(enabled: bool) {
+    METRICS_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
 pub struct Metrics;
 
 /// Parameters for recording streaming metrics.
@@ -479,6 +572,9 @@ impl Metrics {
     /// Here we want a metric to directly reflect user's experience ("I am sending a request")
     /// when viewing the router as a blackbox, and is bumped immediately when the request arrives.
     pub fn record_http_request(method: &'static str, path: &str) {
+        if !metrics_enabled() {
+            return;
+        }
         let path_interned = intern_string(path);
         counter!(
             "smg_http_requests_total",
@@ -491,6 +587,9 @@ impl Metrics {
     /// Record HTTP request duration.
     /// For best performance, pass static strings for method.
     pub fn record_http_duration(method: &'static str, path: &str, duration: Duration) {
+        if !metrics_enabled() {
+            return;
+        }
         let path_interned = intern_string(path);
         histogram!(
             "smg_http_request_duration_seconds",
@@ -502,11 +601,17 @@ impl Metrics {
 
     /// Set active HTTP connections count
     pub fn set_http_connections_active(count: usize) {
+        if !metrics_enabled() {
+            return;
+        }
         gauge!("smg_http_connections_active").set(count as f64);
     }
 
     /// Record HTTP response.
     pub fn record_http_response(status_code: u16, error_code: &str) {
+        if !metrics_enabled() {
+            return;
+        }
         let status_str: Cow<'static, str> = status_code_to_cow(status_code);
         let error_interned = intern_string(error_code);
         counter!(
@@ -519,9 +624,81 @@ impl Metrics {
 
     /// Record rate limit decision.
     pub fn record_http_rate_limit(result: &'static str) {
+        if !metrics_enabled() {
+            return;
+        }
         counter!(
             "smg_http_rate_limit_total",
             "result" => result
+        )
+        .increment(1);
+    }
+
+    /// Publish the admission ceiling alongside in-flight occupancy.
+    ///
+    /// Both are sampled from the live TokenBucket at each admission decision, so
+    /// a 429 spike can be attributed to load (inflight at limit) rather than to
+    /// someone lowering the limit via POST /admission.
+    pub fn set_admission_state(limit: f64, in_flight: f64) {
+        if !metrics_enabled() {
+            return;
+        }
+        gauge!("smg_admission_limit").set(limit);
+        gauge!("smg_admission_inflight").set(in_flight);
+    }
+
+    pub fn record_admission_rejected(reason: &'static str) {
+        if !metrics_enabled() {
+            return;
+        }
+        counter!(
+            "smg_admission_rejected_total",
+            "reason" => reason
+        )
+        .increment(1);
+    }
+
+    /// Publish the image ceiling. Set once at startup: unlike the request
+    /// ceiling it has no runtime retune, so it never needs re-sampling.
+    pub fn set_image_limit(limit: i64) {
+        if !metrics_enabled() {
+            return;
+        }
+        gauge!("smg_image_limit").set(limit as f64);
+    }
+
+    /// Publish image occupancy. Sampled after every reserve and release so a
+    /// 429 spike can be read against the ceiling.
+    pub fn set_image_pixels_limit(limit: i64) {
+        if !metrics_enabled() {
+            return;
+        }
+        gauge!("smg_image_pixels_limit").set(limit as f64);
+    }
+
+    /// Image area in flight, in pixels. The leading indicator for base-GPU
+    /// pressure: it rises before an out-of-memory, where the count does not.
+    pub fn set_image_pixels_inflight(in_flight: i64) {
+        if !metrics_enabled() {
+            return;
+        }
+        gauge!("smg_image_pixels_inflight").set(in_flight as f64);
+    }
+
+    pub fn set_image_inflight(in_flight: i64) {
+        if !metrics_enabled() {
+            return;
+        }
+        gauge!("smg_image_inflight").set(in_flight as f64);
+    }
+
+    pub fn record_image_rejected(endpoint: &'static str) {
+        if !metrics_enabled() {
+            return;
+        }
+        counter!(
+            "smg_image_rejected_total",
+            "endpoint" => endpoint
         )
         .increment(1);
     }
@@ -544,6 +721,9 @@ impl Metrics {
         endpoint: &'static str,
         streaming: &'static str,
     ) {
+        if !metrics_enabled() {
+            return;
+        }
         let model = intern_string(model_id);
         counter!(
             "smg_router_requests_total",
@@ -567,6 +747,9 @@ impl Metrics {
         endpoint: &'static str,
         duration: Duration,
     ) {
+        if !metrics_enabled() {
+            return;
+        }
         let model = intern_string(model_id);
         histogram!(
             "smg_router_request_duration_seconds",
@@ -589,6 +772,9 @@ impl Metrics {
         endpoint: &'static str,
         error_type: &'static str,
     ) {
+        if !metrics_enabled() {
+            return;
+        }
         let model = intern_string(model_id);
         counter!(
             "smg_router_request_errors_total",
@@ -609,6 +795,9 @@ impl Metrics {
         stage: &'static str,
         duration: Duration,
     ) {
+        if !metrics_enabled() {
+            return;
+        }
         histogram!(
             "smg_router_stage_duration_seconds",
             "router_type" => router_type,
@@ -624,6 +813,9 @@ impl Metrics {
         status_code: u16,
         error_code: &str,
     ) {
+        if !metrics_enabled() {
+            return;
+        }
         let status_str: Cow<'static, str> = status_code_to_cow(status_code);
         let error_interned = intern_string(error_code);
         counter!(
@@ -648,6 +840,9 @@ impl Metrics {
         endpoint: &'static str,
         duration: Duration,
     ) {
+        if !metrics_enabled() {
+            return;
+        }
         let model = intern_string(model_id);
         histogram!(
             "smg_router_ttft_seconds",
@@ -667,6 +862,9 @@ impl Metrics {
         endpoint: &'static str,
         duration: Duration,
     ) {
+        if !metrics_enabled() {
+            return;
+        }
         let model = intern_string(model_id);
         histogram!(
             "smg_router_tpot_seconds",
@@ -687,6 +885,9 @@ impl Metrics {
         token_type: &'static str,
         count: u64,
     ) {
+        if !metrics_enabled() {
+            return;
+        }
         let model = intern_string(model_id);
         counter!(
             "smg_router_tokens_total",
@@ -708,6 +909,9 @@ impl Metrics {
         endpoint: &'static str,
         duration: Duration,
     ) {
+        if !metrics_enabled() {
+            return;
+        }
         let model = intern_string(model_id);
         histogram!(
             "smg_router_generation_duration_seconds",
@@ -724,6 +928,9 @@ impl Metrics {
     /// This consolidates TTFT, TPOT, generation duration, and token metrics
     /// into one function, handling TPOT calculation internally.
     pub fn record_streaming_metrics(params: StreamingMetricsParams<'_>) {
+        if !metrics_enabled() {
+            return;
+        }
         let StreamingMetricsParams {
             router_type,
             backend_type,
@@ -810,6 +1017,9 @@ impl Metrics {
         model_id: &str,
         size: usize,
     ) {
+        if !metrics_enabled() {
+            return;
+        }
         let model = intern_string(model_id);
         gauge!(
             "smg_worker_pool_size",
@@ -826,6 +1036,9 @@ impl Metrics {
         connection_mode: &'static str,
         count: usize,
     ) {
+        if !metrics_enabled() {
+            return;
+        }
         gauge!(
             "smg_worker_connections_active",
             "worker_type" => worker_type,
@@ -836,6 +1049,9 @@ impl Metrics {
 
     /// Record health check result
     pub fn record_worker_health_check(worker_type: &'static str, result: &'static str) {
+        if !metrics_enabled() {
+            return;
+        }
         counter!(
             "smg_worker_health_checks_total",
             "worker_type" => worker_type,
@@ -851,6 +1067,9 @@ impl Metrics {
         model_id: &str,
         policy: &'static str,
     ) {
+        if !metrics_enabled() {
+            return;
+        }
         let model = intern_string(model_id);
         counter!(
             "smg_worker_selection_total",
@@ -868,6 +1087,9 @@ impl Metrics {
         connection_mode: &'static str,
         error_type: &'static str,
     ) {
+        if !metrics_enabled() {
+            return;
+        }
         counter!(
             "smg_worker_errors_total",
             "worker_type" => worker_type,
@@ -879,6 +1101,9 @@ impl Metrics {
 
     /// Record manual policy execution branch for routing decisions
     pub fn record_worker_manual_policy_branch(branch: &'static str) {
+        if !metrics_enabled() {
+            return;
+        }
         counter!(
             "smg_manual_policy_branch_total",
             "branch" => branch
@@ -888,11 +1113,17 @@ impl Metrics {
 
     /// Set manual policy cache entries count
     pub fn set_manual_policy_cache_entries(count: usize) {
+        if !metrics_enabled() {
+            return;
+        }
         gauge!("smg_manual_policy_cache_entries").set(count as f64);
     }
 
     /// Record consistent hashing policy execution branch for routing decisions
     pub fn record_worker_consistent_hashing_policy_branch(branch: &'static str) {
+        if !metrics_enabled() {
+            return;
+        }
         counter!(
             "smg_consistent_hashing_policy_branch_total",
             "branch" => branch
@@ -902,6 +1133,9 @@ impl Metrics {
 
     /// Record prefix hash policy execution branch for routing decisions
     pub fn record_worker_prefix_hash_policy_branch(branch: &'static str) {
+        if !metrics_enabled() {
+            return;
+        }
         counter!(
             "smg_prefix_hash_policy_branch_total",
             "branch" => branch
@@ -911,6 +1145,9 @@ impl Metrics {
 
     /// Set running requests per worker
     pub fn set_worker_requests_active(worker: &str, count: usize) {
+        if !metrics_enabled() {
+            return;
+        }
         let worker_interned = intern_string(worker);
         gauge!(
             "smg_worker_requests_active",
@@ -921,6 +1158,9 @@ impl Metrics {
 
     /// Set active routing keys per worker
     pub fn set_worker_routing_keys_active(worker: &str, count: usize) {
+        if !metrics_enabled() {
+            return;
+        }
         let worker_interned = intern_string(worker);
         gauge!(
             "smg_worker_routing_keys_active",
@@ -931,6 +1171,9 @@ impl Metrics {
 
     /// Set worker health status
     pub fn set_worker_health(worker_url: &str, healthy: bool) {
+        if !metrics_enabled() {
+            return;
+        }
         let worker_interned = intern_string(worker_url);
         gauge!(
             "smg_worker_health",
@@ -939,12 +1182,31 @@ impl Metrics {
         .set(if healthy { 1.0 } else { 0.0 });
     }
 
+    /// Set worker drain status
+    ///
+    /// Distinct from `smg_worker_health`: a draining worker is deliberately
+    /// out of rotation, so an alert on health alone would page for it.
+    pub fn set_worker_draining(worker_url: &str, draining: bool) {
+        if !metrics_enabled() {
+            return;
+        }
+        let worker_interned = intern_string(worker_url);
+        gauge!(
+            "smg_worker_draining",
+            "worker" => worker_interned
+        )
+        .set(if draining { 1.0 } else { 0.0 });
+    }
+
     // ========================================================================
     // Layer 3: Worker resilience metrics (circuit breaker)
     // ========================================================================
 
     /// Set circuit breaker state (0=closed, 1=open, 2=half_open)
     pub fn set_worker_cb_state(worker: &str, state_code: u8) {
+        if !metrics_enabled() {
+            return;
+        }
         let worker_interned = intern_string(worker);
         gauge!(
             "smg_worker_cb_state",
@@ -955,6 +1217,9 @@ impl Metrics {
 
     /// Record circuit breaker state transition
     pub fn record_worker_cb_transition(worker: &str, from: &'static str, to: &'static str) {
+        if !metrics_enabled() {
+            return;
+        }
         let worker_interned = intern_string(worker);
         counter!(
             "smg_worker_cb_transitions_total",
@@ -967,6 +1232,9 @@ impl Metrics {
 
     /// Record circuit breaker outcome
     pub fn record_worker_cb_outcome(worker: &str, outcome: &'static str) {
+        if !metrics_enabled() {
+            return;
+        }
         let worker_interned = intern_string(worker);
         counter!(
             "smg_worker_cb_outcomes_total",
@@ -978,6 +1246,9 @@ impl Metrics {
 
     /// Set circuit breaker consecutive failures
     pub fn set_worker_cb_consecutive_failures(worker: &str, count: u32) {
+        if !metrics_enabled() {
+            return;
+        }
         let worker_interned = intern_string(worker);
         gauge!(
             "smg_worker_cb_consecutive_failures",
@@ -988,6 +1259,9 @@ impl Metrics {
 
     /// Set circuit breaker consecutive successes
     pub fn set_worker_cb_consecutive_successes(worker: &str, count: u32) {
+        if !metrics_enabled() {
+            return;
+        }
         let worker_interned = intern_string(worker);
         gauge!(
             "smg_worker_cb_consecutive_successes",
@@ -1002,6 +1276,9 @@ impl Metrics {
 
     /// Record retry attempt
     pub fn record_worker_retry(worker_type: &'static str, endpoint: &'static str) {
+        if !metrics_enabled() {
+            return;
+        }
         counter!(
             "smg_worker_retries_total",
             "worker_type" => worker_type,
@@ -1012,6 +1289,9 @@ impl Metrics {
 
     /// Record retries exhausted
     pub fn record_worker_retries_exhausted(worker_type: &'static str, endpoint: &'static str) {
+        if !metrics_enabled() {
+            return;
+        }
         counter!(
             "smg_worker_retries_exhausted_total",
             "worker_type" => worker_type,
@@ -1022,6 +1302,9 @@ impl Metrics {
 
     /// Record retry backoff duration.
     pub fn record_worker_retry_backoff(attempt: u32, duration: Duration) {
+        if !metrics_enabled() {
+            return;
+        }
         let attempt_str: Cow<'static, str> = match attempt {
             1 => Cow::Borrowed("1"),
             2 => Cow::Borrowed("2"),
@@ -1043,6 +1326,9 @@ impl Metrics {
 
     /// Record worker registration attempt
     pub fn record_discovery_registration(source: &'static str, result: &'static str) {
+        if !metrics_enabled() {
+            return;
+        }
         counter!(
             "smg_discovery_registrations_total",
             "source" => source,
@@ -1053,6 +1339,9 @@ impl Metrics {
 
     /// Record worker deregistration
     pub fn record_discovery_deregistration(source: &'static str, reason: &'static str) {
+        if !metrics_enabled() {
+            return;
+        }
         counter!(
             "smg_discovery_deregistrations_total",
             "source" => source,
@@ -1063,6 +1352,9 @@ impl Metrics {
 
     /// Record discovery sync duration
     pub fn record_discovery_sync_duration(source: &'static str, duration: Duration) {
+        if !metrics_enabled() {
+            return;
+        }
         histogram!(
             "smg_discovery_sync_duration_seconds",
             "source" => source
@@ -1072,6 +1364,9 @@ impl Metrics {
 
     /// Set workers discovered count
     pub fn set_discovery_workers_discovered(source: &'static str, count: usize) {
+        if !metrics_enabled() {
+            return;
+        }
         gauge!(
             "smg_discovery_workers_discovered",
             "source" => source
@@ -1085,6 +1380,9 @@ impl Metrics {
 
     /// Record MCP tool call
     pub fn record_mcp_tool_call(model_id: &str, tool_name: &str, result: &'static str) {
+        if !metrics_enabled() {
+            return;
+        }
         let model = intern_string(model_id);
         let tool = intern_string(tool_name);
         counter!(
@@ -1098,6 +1396,9 @@ impl Metrics {
 
     /// Record MCP tool execution duration
     pub fn record_mcp_tool_duration(model_id: &str, tool_name: &str, duration: Duration) {
+        if !metrics_enabled() {
+            return;
+        }
         let model = intern_string(model_id);
         let tool = intern_string(tool_name);
         histogram!(
@@ -1110,11 +1411,17 @@ impl Metrics {
 
     /// Set active MCP servers count
     pub fn set_mcp_servers_active(count: usize) {
+        if !metrics_enabled() {
+            return;
+        }
         gauge!("smg_mcp_servers_active").set(count as f64);
     }
 
     /// Record MCP tool loop iteration
     pub fn record_mcp_tool_iteration(model_id: &str) {
+        if !metrics_enabled() {
+            return;
+        }
         let model = intern_string(model_id);
         counter!(
             "smg_mcp_tool_iterations_total",
@@ -1133,6 +1440,9 @@ impl Metrics {
         operation: &'static str,
         result: &'static str,
     ) {
+        if !metrics_enabled() {
+            return;
+        }
         counter!(
             "smg_db_operations_total",
             "storage_type" => storage_type,
@@ -1148,6 +1458,9 @@ impl Metrics {
         operation: &'static str,
         duration: Duration,
     ) {
+        if !metrics_enabled() {
+            return;
+        }
         histogram!(
             "smg_db_operation_duration_seconds",
             "storage_type" => storage_type,
@@ -1158,6 +1471,9 @@ impl Metrics {
 
     /// Set active database connections
     pub fn set_db_connections_active(storage_type: &'static str, count: usize) {
+        if !metrics_enabled() {
+            return;
+        }
         gauge!(
             "smg_db_connections_active",
             "storage_type" => storage_type
@@ -1167,6 +1483,9 @@ impl Metrics {
 
     /// Record item stored
     pub fn increment_db_items_stored(storage_type: &'static str) {
+        if !metrics_enabled() {
+            return;
+        }
         counter!(
             "smg_db_items_stored",
             "storage_type" => storage_type
@@ -1179,6 +1498,9 @@ impl Metrics {
     // ========================================================================
 
     pub fn remove_worker_metrics(worker_url: &str) {
+        if !metrics_enabled() {
+            return;
+        }
         // Intern once, clone (cheap) for each metric
         let worker = intern_string(worker_url);
 

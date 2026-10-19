@@ -3,12 +3,11 @@ from __future__ import annotations
 import gc
 import logging
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Optional
 
 import msgspec
 import torch
-
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.hybrid_arch import (
     hybrid_gdn_config,
@@ -348,6 +347,86 @@ class KVCacheConfigurator:
             return get_kv_cache_quant_method("cpu_fp8_e4m3")
         return self._build_fp4_quant_method(num_layers=num_layers)
 
+    def _draft_swa_ring_active(self, sizes: "_PoolSizes") -> bool:
+        """True when this draft pooled a ring and must own its own loc mapping."""
+        return (
+            self.is_draft_worker
+            and self.is_hybrid_swa
+            and envs.SGLANG_OPT_DRAFT_SWA_RING.get()
+            and not getattr(self.model_config, "full_attention_layer_ids", None)
+            and sizes.full_max_total_num_tokens == 0
+            and self.memory_pool_config is not None
+        )
+
+    def draft_swa_ring_slots(self, config: MemoryPoolConfig) -> int:
+        """Slots a per-request ring needs to cover every draft window.
+
+        A request's windowed page table spans the last `sliding_window` tokens
+        plus the draft tokens still unverified, and it can straddle a page
+        boundary, so round up and add one page.
+        """
+        window = int(self.model_config.hf_text_config.sliding_window)
+        draft_tokens = int(max_speculative_num_draft_tokens() or 0)
+        page_size = self.pool_page_size
+        pages_per_req = -(-(window + draft_tokens) // page_size) + 1
+        max_reqs = int(config.max_running_requests or 0)
+        assert max_reqs > 0, "draft SWA ring requires a resolved max_running_requests"
+        # +1 ROW, NOT A MARGIN: ReqToTokenPool allocates size+1 rows and hands
+        # out indices 1..size (row 0 is its cuda-graph padding row), so the
+        # highest LEGITIMATE req_pool_index is max_running_requests itself.
+        # Sizing the ring for max_running rows made slot
+        # req*stride (req=max_running) land exactly at the pool's end -- a
+        # whole request's writes off the end of the ring, first found as the
+        # boot-14/16 warmup OOB (loc_range started at precisely pool_size).
+        # Keep this in lockstep with the stride divisor where the ring is
+        # registered (the `_draft_swa_ring_active` branch).
+        return pages_per_req * page_size * (max_reqs + 1)
+
+    def _maybe_size_draft_swa_ring(self, config: MemoryPoolConfig) -> MemoryPoolConfig:
+        """Re-point a uniformly-sliding draft at a ring instead of the target pool.
+
+        The draft is handed the TARGET's resolved config, so without this it
+        allocates one slot per target token to hold a window it can never read
+        past. Only the draft's own pool shrinks; it keeps indexing the target's
+        allocator and translates through the registered ring mapping.
+        """
+        if not (self.is_hybrid_swa and envs.SGLANG_OPT_DRAFT_SWA_RING.get()):
+            return config
+        if getattr(self.model_config, "full_attention_layer_ids", None):
+            return config
+        allocator = getattr(
+            self.token_to_kv_pool_allocator,
+            "logical_attn_allocator",
+            self.token_to_kv_pool_allocator,
+        )
+        if isinstance(allocator, UnifiedSWAAllocatorBase):
+            # The target's virtual ids require the full-sized identity mapping.
+            return config
+        ring_slots = self.draft_swa_ring_slots(config)
+        if ring_slots >= config.max_total_num_tokens:
+            logger.info(
+                "Draft SWA ring (%d slots) is not smaller than the target pool "
+                "(%d); leaving the draft pool full-size",
+                ring_slots,
+                config.max_total_num_tokens,
+            )
+            return config
+        logger.info(
+            "Draft SWA ring: %d slots (%.2fx smaller than the target's %d), "
+            "window=%d page_size=%d max_running_requests=%d",
+            ring_slots,
+            config.max_total_num_tokens / ring_slots,
+            config.max_total_num_tokens,
+            self.model_config.hf_text_config.sliding_window,
+            self.pool_page_size,
+            config.max_running_requests,
+        )
+        return replace(
+            config,
+            full_max_total_num_tokens=0,
+            swa_max_total_num_tokens=ring_slots,
+        )
+
     def configure(self, *, pre_model_load_memory: int) -> KVCacheConfigResult:
         """Apply a resolved MemoryPoolConfig and initialize pools."""
         if current_platform.is_cpu() and self.kv_cache_dtype == torch.float8_e4m3fn:
@@ -362,10 +441,10 @@ class KVCacheConfigurator:
                 )
 
         if not self.spec_algorithm.is_none() and self.is_draft_worker:
-            assert self.memory_pool_config is not None, (
-                "Draft worker requires memory_pool_config"
-            )
-            config = self.memory_pool_config
+            assert (
+                self.memory_pool_config is not None
+            ), "Draft worker requires memory_pool_config"
+            config = self._maybe_size_draft_swa_ring(self.memory_pool_config)
         else:
             config = self._resolve_memory_pool_config(pre_model_load_memory)
 
@@ -760,9 +839,9 @@ class KVCacheConfigurator:
         config = self.mambaish_config
         assert config is not None and self.is_hybrid_swa
         assert self.page_size >= 1, f"page_size must be >= 1, got {self.page_size}"
-        assert not self.use_mla_backend, (
-            "unified tri-pool does not support an MLA full side yet"
-        )
+        assert (
+            not self.use_mla_backend
+        ), "unified tri-pool does not support an MLA full side yet"
         # Mirror the non-shared path's extra_max_context_len computation.
         extra_max_context_len = 4
         if get_spec().speculative_num_draft_tokens is not None:
@@ -872,9 +951,9 @@ class KVCacheConfigurator:
         # Both sub-pools are page-aware; the SWA composite runs alloc_extend_kernel
         # once in virtual space and binds the new pages on both sub-allocators.
         assert self.page_size >= 1, f"page_size must be >= 1, got {self.page_size}"
-        assert not self.use_mla_backend, (
-            "unified memory pool does not support MLA-SWA hybrid yet"
-        )
+        assert (
+            not self.use_mla_backend
+        ), "unified memory pool does not support MLA-SWA hybrid yet"
         req_to_token_pool = self._build_req_to_token_pool(max_num_reqs=max_num_reqs)
 
         head_num = self.model_config.get_num_kv_heads(
@@ -1312,9 +1391,9 @@ class KVCacheConfigurator:
                 if quant_method is not None and is_float4_e2m1fn_x2(
                     self.kv_cache_dtype
                 ):
-                    assert not enable_page_major, (
-                        "page-major KV layout is not supported with fp4 KV cache"
-                    )
+                    assert (
+                        not enable_page_major
+                    ), "page-major KV layout is not supported with fp4 KV cache"
                 token_to_kv_pool = self._build_mha_kv_pool(
                     max_total_num_tokens=sizes.max_total_num_tokens,
                     mha_pool_class=mha_pool_class,
@@ -2167,6 +2246,31 @@ class KVCacheConfigurator:
                     )
                     identity_mapping[-1] = -1
                     token_to_kv_pool.register_mapping(identity_mapping)
+                elif self._draft_swa_ring_active(sizes):
+                    # The target allocator is a plain paged one, so there is no
+                    # full->swa mapping to borrow. Own one instead: an entry per
+                    # target loc, rewritten each forward by the draft worker with
+                    # the ring slot that loc's (request, position) maps to. Init
+                    # to the -1 sentinel so an unwritten loc faults loudly in the
+                    # page table rather than silently aliasing ring slot 0.
+                    n = sizes.max_total_num_tokens + self.pool_page_size
+                    ring_mapping = torch.full(
+                        (n + 1,), -1, dtype=torch.int64, device=self.device
+                    )
+                    token_to_kv_pool.register_mapping(ring_mapping)
+                    # Consumed by the DSpark injector to publish (req, pos)
+                    # -> ring slot; stride is per-request, not the whole ring.
+                    token_to_kv_pool.draft_swa_ring_stride = (
+                        # Divisor mirrors draft_swa_ring_slots' (max_reqs + 1):
+                        # req_pool_indices run 1..max_running (row 0 is
+                        # ReqToTokenPool's padding row), so the ring holds
+                        # max_running + 1 rows and the stride is per ROW.
+                        sizes.swa_max_total_num_tokens
+                        // (int(self.memory_pool_config.max_running_requests) + 1)
+                    )
+                    token_to_kv_pool.draft_swa_window = int(
+                        self.model_config.hf_text_config.sliding_window
+                    )
                 elif not uses_unified_virtual_ids:
                     assert isinstance(swa_allocator, SWATokenToKVPoolAllocator)
                     token_to_kv_pool.register_mapping(
@@ -2248,9 +2352,7 @@ class KVCacheConfigurator:
                 else:
                     additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP
             else:
-                assert not get_exec().mamba.enable_mamba_extra_buffer_lazy, (
-                    "Lazy extra buffer requires overlap schedule (--disable-overlap-schedule is incompatible)"
-                )
+                assert not get_exec().mamba.enable_mamba_extra_buffer_lazy, "Lazy extra buffer requires overlap schedule (--disable-overlap-schedule is incompatible)"
                 additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP
         elif skip_decode_lock:
             # no_buffer under skip: add the base drop back so effective stays 3,
@@ -2614,9 +2716,9 @@ def calculate_mla_kv_cache_dim(
     # kv_lora_rank + scale storage (kv_lora_rank // quant_block_size * 4 bytes) + rope dimension storage
     # Note: rope dimension is stored in original dtype (bf16), not quantized to fp8
     if kv_cache_dtype == torch.float8_e4m3fn:
-        assert kv_lora_rank % quant_block_size == 0, (
-            f"kv_lora_rank {kv_lora_rank} must be multiple of quant_block_size {quant_block_size}"
-        )
+        assert (
+            kv_lora_rank % quant_block_size == 0
+        ), f"kv_lora_rank {kv_lora_rank} must be multiple of quant_block_size {quant_block_size}"
 
         return (
             kv_lora_rank

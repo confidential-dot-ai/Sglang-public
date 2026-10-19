@@ -1210,6 +1210,7 @@ class SchedulerPPMixin:
                         else next_draft_input.hidden_states
                     ),
                 ),
+                future_indices_cpu=batch.req_pool_indices_cpu,
             )
         batch.input_ids = None
         output_result = GenerationBatchResult(

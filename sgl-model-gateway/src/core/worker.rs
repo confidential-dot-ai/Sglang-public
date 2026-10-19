@@ -1,7 +1,7 @@
 use std::{
     fmt,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, LazyLock, RwLock as StdRwLock,
     },
     time::Duration,
@@ -171,6 +171,18 @@ pub trait Worker: Send + Sync + fmt::Debug {
     /// Set the worker's health status
     fn set_healthy(&self, healthy: bool);
 
+    /// Whether the worker is being drained out of rotation.
+    ///
+    /// A draining worker takes no new requests but keeps serving the ones it
+    /// already has, so `load()` falls to zero and it can be stopped without
+    /// failing a request.
+    fn is_draining(&self) -> bool {
+        false
+    }
+
+    /// Start or stop draining. Ignored by workers that do not support it.
+    fn set_draining(&self, _draining: bool) {}
+
     /// Perform an async health check on the worker
     async fn check_health_async(&self) -> WorkerResult<()>;
 
@@ -210,6 +222,22 @@ pub trait Worker: Send + Sync + fmt::Debug {
     /// Reset the load counter to 0 (for sync/recovery)
     fn reset_load(&self) {}
 
+    /// Best-effort KV/token-pool occupancy fraction in [0.0, 1.0], updated by
+    /// a background poller (see kv_occupancy_poller.rs) hitting the engine's
+    /// /get_load. `load()` (in-flight request count) is blind to this: a
+    /// worker holding one long-context request can sit near 100% KV occupancy
+    /// while `load()` reads 1, so bounded-load routing never spills it.
+    /// Default 0.0 -- the "no data yet" state -- must never make a worker
+    /// look overloaded (workers without a poller, or polled since startup,
+    /// keep routing purely on request-count load).
+    fn kv_occupancy(&self) -> f64 {
+        0.0
+    }
+
+    /// Set by the KV-occupancy poller; a no-op for worker kinds that don't
+    /// track it.
+    fn set_kv_occupancy(&self, _occupancy: f64) {}
+
     /// Get the worker routing key load tracker
     fn worker_routing_key_load(&self) -> &WorkerRoutingKeyLoad;
 
@@ -227,7 +255,7 @@ pub trait Worker: Send + Sync + fmt::Debug {
 
     /// Check if the worker is available (healthy + circuit closed/half-open)
     fn is_available(&self) -> bool {
-        self.is_healthy() && self.circuit_breaker().can_execute()
+        !self.is_draining() && self.is_healthy() && self.circuit_breaker().can_execute()
     }
 
     /// Record the outcome of a request to this worker
@@ -650,9 +678,17 @@ impl WorkerMetadata {
 pub struct BasicWorker {
     pub metadata: WorkerMetadata,
     pub load_counter: Arc<AtomicUsize>,
+    /// f64 KV-occupancy fraction stored via to_bits/from_bits (no atomic f64
+    /// in std). 0u64 == 0.0f64 bit pattern, so the zero-initialized default
+    /// is exactly the documented "no data yet" state.
+    pub kv_occupancy_bits: Arc<AtomicU64>,
     pub worker_routing_key_load: Arc<WorkerRoutingKeyLoad>,
     pub processed_counter: Arc<AtomicUsize>,
     pub healthy: Arc<AtomicBool>,
+    /// Operator-set: withheld from routing while in-flight work finishes.
+    /// Separate from `healthy` because the health checker owns that flag and
+    /// would clear a drain on its next successful probe.
+    pub draining: Arc<AtomicBool>,
     pub consecutive_failures: Arc<AtomicUsize>,
     pub consecutive_successes: Arc<AtomicUsize>,
     pub circuit_breaker: CircuitBreaker,
@@ -725,9 +761,43 @@ impl Worker for BasicWorker {
         self.healthy.load(Ordering::Acquire)
     }
 
+    fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::Acquire)
+    }
+
+    fn set_draining(&self, draining: bool) {
+        let previous = self.draining.swap(draining, Ordering::AcqRel);
+        Metrics::set_worker_draining(self.url(), draining);
+        if previous != draining {
+            if draining {
+                tracing::info!(
+                    worker = %self.url(),
+                    in_flight = self.load(),
+                    "Worker draining; taking no new requests until in-flight work finishes"
+                );
+            } else {
+                tracing::info!(worker = %self.url(), "Worker drain cleared; eligible for routing");
+            }
+        }
+    }
+
     fn set_healthy(&self, healthy: bool) {
-        self.healthy.store(healthy, Ordering::Release);
+        let previous = self.healthy.swap(healthy, Ordering::AcqRel);
         Metrics::set_worker_health(self.url(), healthy);
+
+        // Log the edge, not the level: the per-attempt failure repeats every
+        // interval for as long as the worker is down, so it sits at debug and
+        // this transition carries the incident.
+        if previous != healthy {
+            if healthy {
+                tracing::info!(worker = %self.url(), "Worker recovered; returning to rotation");
+            } else {
+                tracing::error!(
+                    worker = %self.url(),
+                    "Worker marked UNHEALTHY and removed from rotation; its share of traffic now falls on the remaining workers"
+                );
+            }
+        }
     }
 
     async fn check_health_async(&self) -> WorkerResult<()> {
@@ -783,6 +853,15 @@ impl Worker for BasicWorker {
 
     fn load(&self) -> usize {
         self.load_counter.load(Ordering::Relaxed)
+    }
+
+    fn kv_occupancy(&self) -> f64 {
+        f64::from_bits(self.kv_occupancy_bits.load(Ordering::Relaxed))
+    }
+
+    fn set_kv_occupancy(&self, occupancy: f64) {
+        self.kv_occupancy_bits
+            .store(occupancy.to_bits(), Ordering::Relaxed);
     }
 
     fn increment_load(&self) {
@@ -966,7 +1045,10 @@ impl Worker for BasicWorker {
                 if status.is_success() {
                     Ok(true)
                 } else {
-                    tracing::warn!(
+                    // Repeats every health interval while the worker is down;
+                    // the healthy -> unhealthy transition in `set_healthy` is
+                    // the line that reports the incident.
+                    tracing::debug!(
                         "HTTP health check returned non-success status for {}: {}",
                         health_url,
                         status
@@ -975,7 +1057,7 @@ impl Worker for BasicWorker {
                 }
             }
             Err(err) => {
-                tracing::warn!("HTTP health check failed for {}: {err:?}", health_url);
+                tracing::debug!("HTTP health check failed for {}: {err:?}", health_url);
                 Ok(false)
             }
         }
@@ -1023,6 +1105,14 @@ impl Worker for DPAwareWorker {
         self.base_worker.url()
     }
 
+    fn is_draining(&self) -> bool {
+        self.base_worker.is_draining()
+    }
+
+    fn set_draining(&self, draining: bool) {
+        self.base_worker.set_draining(draining)
+    }
+
     fn api_key(&self) -> &Option<String> {
         self.base_worker.api_key()
     }
@@ -1053,6 +1143,14 @@ impl Worker for DPAwareWorker {
 
     fn load(&self) -> usize {
         self.base_worker.load()
+    }
+
+    fn kv_occupancy(&self) -> f64 {
+        self.base_worker.kv_occupancy()
+    }
+
+    fn set_kv_occupancy(&self, occupancy: f64) {
+        self.base_worker.set_kv_occupancy(occupancy);
     }
 
     fn increment_load(&self) {
@@ -1288,6 +1386,7 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
         cost: worker.cost(),
         worker_type: worker_type_str.to_string(),
         is_healthy: worker.is_healthy(),
+        is_draining: worker.is_draining(),
         load: worker.load(),
         connection_mode: connection_mode.to_string(),
         runtime_type,
@@ -1913,6 +2012,77 @@ mod tests {
 
         worker.record_outcome(true);
         assert_eq!(worker.circuit_breaker().state(), CircuitState::Closed);
+    }
+
+    #[test]
+    fn draining_withholds_a_healthy_worker_from_routing() {
+        use crate::core::BasicWorkerBuilder;
+        let worker = BasicWorkerBuilder::new("http://test:8080")
+            .worker_type(WorkerType::Regular)
+            .build();
+
+        assert!(worker.is_available());
+
+        worker.set_draining(true);
+        assert!(!worker.is_available());
+        // Health is untouched: the worker is serving fine, it is just being
+        // taken out of rotation.
+        assert!(worker.is_healthy());
+
+        worker.set_draining(false);
+        assert!(worker.is_available());
+    }
+
+    /// A health probe must not clear an operator's drain.
+    #[test]
+    fn a_health_check_does_not_lift_a_drain() {
+        use crate::core::BasicWorkerBuilder;
+        let worker = BasicWorkerBuilder::new("http://test:8080")
+            .worker_type(WorkerType::Regular)
+            .build();
+
+        worker.set_draining(true);
+        worker.set_healthy(false);
+        worker.set_healthy(true);
+
+        assert!(worker.is_draining());
+        assert!(!worker.is_available());
+    }
+
+    /// The policy layer filters on its own helper; it must see drains too.
+    #[test]
+    fn the_policy_filter_skips_draining_workers() {
+        use crate::core::BasicWorkerBuilder;
+        let a: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://a:8080")
+                .worker_type(WorkerType::Regular)
+                .build(),
+        );
+        let b: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://b:8080")
+                .worker_type(WorkerType::Regular)
+                .build(),
+        );
+        let workers = vec![a, b];
+
+        assert_eq!(
+            crate::policies::get_healthy_worker_indices(&workers),
+            vec![0, 1]
+        );
+        workers[0].set_draining(true);
+        assert_eq!(crate::policies::get_healthy_worker_indices(&workers), vec![1]);
+    }
+
+    #[test]
+    fn a_dp_aware_worker_delegates_its_drain() {
+        let dp_worker = DPAwareWorkerBuilder::new("http://worker:8080", 0, 2)
+            .worker_type(WorkerType::Regular)
+            .build();
+
+        assert!(dp_worker.is_available());
+        dp_worker.set_draining(true);
+        assert!(dp_worker.is_draining());
+        assert!(!dp_worker.is_available());
     }
 
     #[test]

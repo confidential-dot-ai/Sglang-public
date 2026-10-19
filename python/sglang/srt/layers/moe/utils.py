@@ -31,6 +31,88 @@ from sglang.srt.utils.common import log_info_on_rank0
 
 logger = logging.getLogger(__name__)
 
+# Row cap for the MoE router gate's fp32 upcast (hidden_states.to(torch.float32)
+# before the gate GEMM). That upcast materializes a fresh fp32 COPY of the
+# whole input -- at a 256k-token chunked-prefill batch this OOM'd in
+# production (174/177 GiB already resident, gate cast tried to allocate
+# another ~3 GiB) even though _MOE_FORWARD_ROW_CAP already bounds the actual
+# expert compute one call later in the same forward pass. Different
+# mechanism (a plain dtype-cast allocation, not a kernel workspace), same
+# row-chunking remedy; same cap value for consistency, not because the two
+# are related.
+GATE_LOGITS_ROW_CAP = 32768
+
+
+def compute_gate_logits_chunked(gate, hidden_states: torch.Tensor) -> torch.Tensor:
+    """router_logits = gate(hidden_states.to(torch.float32)), row-chunked so
+    the fp32 upcast never materializes more than GATE_LOGITS_ROW_CAP rows at
+    once. Numerically identical to the unchunked call (each row's logits
+    only depend on that row)."""
+    num_rows = hidden_states.shape[0]
+    if num_rows <= GATE_LOGITS_ROW_CAP:
+        router_logits, _ = gate(hidden_states.to(torch.float32))
+        return router_logits
+    chunks = []
+    for start in range(0, num_rows, GATE_LOGITS_ROW_CAP):
+        end = min(start + GATE_LOGITS_ROW_CAP, num_rows)
+        chunk_logits, _ = gate(hidden_states[start:end].to(torch.float32))
+        chunks.append(chunk_logits)
+    return torch.cat(chunks, dim=0)
+
+
+def try_fused_gate_topk_chunked(gate, topk_op, hidden_states: torch.Tensor):
+    """Chunked gate+topk for huge prefill batches: per row-chunk, upcast to
+    fp32 -> gate GEMM -> topk, keeping only that chunk's (topk_weights,
+    topk_ids) and letting its full router_logits die before the next chunk
+    runs. vs compute_gate_logits_chunked (which still concatenates the full
+    num_rows x num_experts logits for one post-hoc topk call), peak logits
+    memory drops by ~num_rows/GATE_LOGITS_ROW_CAP x, and the returned
+    output carries no full logits at all.
+
+    The returned StandardTopKOutput's router_logits is an EMPTY
+    (0, num_experts) tensor -- ONLY valid when the active MoE runner never
+    reads topk_output.router_logits. flashinfer_cutlass is the one audited
+    backend (its fused funcs read only topk_weights/topk_ids); marlin,
+    flashinfer_trtllm, waterfill, and the triton fused layer all DO read it,
+    so everything except the whitelist falls back.
+
+    Returns None whenever the fusion doesn't apply -- small batch (no memory
+    problem to solve), non-whitelisted runner backend, uninitialized runtime
+    flags, or a topk_op that doesn't produce exactly StandardTopKOutput
+    (e.g. the experimental packed carrier, whose extra tensor this merge
+    doesn't know how to concatenate). Caller must fall back to the unfused
+    gate+topk path on None.
+    """
+    from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+    num_rows = hidden_states.shape[0]
+    if num_rows <= GATE_LOGITS_ROW_CAP:
+        return None
+    try:
+        if not get_moe_runner_backend().is_flashinfer_cutlass():
+            return None
+    except Exception:
+        return None  # flags not initialized (unit tests, tools) -> unfused path
+
+    weights_chunks = []
+    ids_chunks = []
+    num_experts = None
+    for start in range(0, num_rows, GATE_LOGITS_ROW_CAP):
+        end = min(start + GATE_LOGITS_ROW_CAP, num_rows)
+        chunk = hidden_states[start:end]
+        chunk_logits, _ = gate(chunk.to(torch.float32))
+        num_experts = chunk_logits.shape[-1]
+        chunk_out = topk_op(chunk, chunk_logits)
+        if type(chunk_out) is not StandardTopKOutput:
+            return None
+        weights_chunks.append(chunk_out.topk_weights)
+        ids_chunks.append(chunk_out.topk_ids)
+    return StandardTopKOutput(
+        topk_weights=torch.cat(weights_chunks, dim=0),
+        topk_ids=torch.cat(ids_chunks, dim=0),
+        router_logits=hidden_states.new_empty((0, num_experts), dtype=torch.float32),
+    )
+
 
 class MoeA2ABackend(Enum):
     NONE = "none"

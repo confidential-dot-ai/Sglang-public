@@ -270,13 +270,24 @@ class HostKVCache(abc.ABC):
             return
         self._destroyed = True
         buffers = getattr(self, "kv_buffer", None)
-        if buffers is not None and self.pin_memory and (_is_cuda or _is_hip):
+        requires_host_registration = getattr(
+            self.allocator, "requires_host_registration", True
+        )
+        if (
+            buffers is not None
+            and self.pin_memory
+            and requires_host_registration
+            and (_is_cuda or _is_hip)
+        ):
             if not isinstance(buffers, (list, tuple)):
                 buffers = [buffers]
             for buf in buffers:
                 if buf is not None:
                     _cuda_host_unregister(buf)
         self.kv_buffer = None
+        close_allocator = getattr(self.allocator, "close", None)
+        if close_allocator is not None:
+            close_allocator()
 
     @abc.abstractmethod
     def get_size_per_token(self):

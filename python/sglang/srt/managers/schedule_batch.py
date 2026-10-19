@@ -24,6 +24,11 @@ from sglang.srt.utils.weight_versions import (
     WeightVersionEvent,
     truncate_weight_version_events,
 )
+from sglang.srt.utils.host_staging import (
+    HostStagingLease,
+    acquire_host_staging_lease,
+    copy_values_to_device,
+)
 
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -52,6 +57,26 @@ ScheduleBatch -> ForwardBatch
   It is constructed directly from a ScheduleBatch by `ForwardBatch.init_new`.
 """
 
+def _to_device_via_pinned_staging(values, dtype, device):
+    """Build a device tensor through the shared event-gated host pool."""
+    return copy_values_to_device(values, dtype=dtype, device=device)
+
+
+def _build_prefill_input_ids_staging(parts, pin, device):
+    """Flatten input IDs into a persistent pinned slot when pinning is enabled."""
+    source = flatten_arrays_to_pinned_cpu(parts, pin=False)
+    if not pin:
+        return source, None
+    lease = acquire_host_staging_lease(
+        source,
+        dtype=torch.int64,
+        device=device,
+    )
+    if lease is None:
+        return source, None
+    return lease.tensor, lease
+
+
 import copy
 import dataclasses
 import logging
@@ -65,6 +90,7 @@ from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Dict,
     List,
     Literal,
@@ -101,7 +127,11 @@ from sglang.srt.managers.kv_hints import KvHintsEnvelope
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
 )
-from sglang.srt.mem_cache.allocation import alloc_for_decode, alloc_for_extend
+from sglang.srt.mem_cache.allocation import (
+    alloc_for_decode,
+    alloc_for_extend,
+    preallocated_extend_locs,
+)
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -1372,6 +1402,15 @@ class Req(ReqDllmMixin):
         self.start_send_idx: int = 0
         self.disagg_decode_prefix_len: int = 0
 
+        # How many leading tokens decode already holds and did NOT ask us to
+        # send (the PD protocol's `decode_prefix_len`, nonzero only under
+        # --disaggregation-decode-enable-radix-cache). start_send_idx is
+        # SEEDED from this in finalize_bootstrap but is then advanced to
+        # end_idx after every chunk, so it cannot be read back to recover the
+        # original offset -- which the last chunk's request-scoped state
+        # payloads need in order to be trimmed to the same delta as main KV.
+        self.decode_prefix_len: int = 0
+
         # For overlap schedule, we delay the kv transfer until `process_batch_result_disagg_prefill` rather than `process_prefill_chunk` in non-overlap
         # This is because kv is not ready in `process_prefill_chunk`.
         # We use `tmp_end_idx` to store the end index of the kv cache to send.
@@ -1925,6 +1964,18 @@ class Req(ReqDllmMixin):
             self.to_finish = None
             return
 
+        if new_accepted_len == 0:
+            # No new tokens this tick -- nothing to check. Also sidesteps a
+            # Python slicing footgun: output_ids[-0:] is output_ids[0:], the
+            # WHOLE list, not empty (-0 == 0), which would incorrectly rescan
+            # already-checked history for a finish condition below. Only CC
+            # conditional decode's chunk_cap-sized history readback can
+            # produce this (a chunk's WHILE loop may exit before chunk_cap
+            # iterations run, and the unwritten trailing slots are legitimate
+            # zero-commit ticks) -- every other caller commits at least the
+            # bonus token.
+            return
+
         new_accepted_tokens = self.output_ids[-new_accepted_len:]
 
         # Sanitize out-of-range / NaN token ids before any decode.
@@ -2398,6 +2449,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     input_ids: torch.Tensor = None  # shape: [b], int64
     # Staging consumed by resolve_forward_inputs (prefill H2D / mixed gather).
     prefill_input_ids_cpu: Optional[torch.Tensor] = None
+    prefill_input_ids_staging_lease: Optional[HostStagingLease] = None
     mix_running_indices: Optional[torch.Tensor] = None
     # CPU twin of mix_running_indices; lets the overlap tail resolve gather
     # pinned mirrors without a device sync.
@@ -2504,6 +2556,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # === Host metadata crossing to ForwardBatch (CPU lists / mirrors) ===
     seq_lens_cpu: torch.Tensor = None  # shape: [b], int64
+    # Set by FutureMap.resolve_seq_lens_cpu when the blocking exact-mirror
+    # pull is deferred to the tick's first exact consumer (the DSPARK draft
+    # plan or verify prep); seq_lens_cpu/seq_lens_sum are None until
+    # overlap_utils.consume_deferred_seq_lens_cpu runs it.
+    deferred_resolve_seq_lens_cpu: Optional[Callable[[], None]] = None
 
     # For multimodal inputs
     multimodal_inputs: Optional[List] = None
@@ -2652,7 +2709,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Reassign: ED stripping rebuilds prefill_input_ids_cpu (CPU pinned);
         # resolve_forward_inputs will H2D this on forward stream. self.input_ids
         # stays None.
-        self.prefill_input_ids_cpu = flatten_arrays_to_pinned_cpu(input_ids, _pin)
+        if self.prefill_input_ids_staging_lease is not None:
+            self.prefill_input_ids_staging_lease.release()
+        (
+            self.prefill_input_ids_cpu,
+            self.prefill_input_ids_staging_lease,
+        ) = _build_prefill_input_ids_staging(input_ids, _pin, self.device)
         self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, pin_memory=_pin).to(
             self.device, non_blocking=True
         )
@@ -2719,7 +2781,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
             req.logprob_start_len = max(req.logprob_start_len, encoder_len)
 
-    def prepare_for_extend(self):
+    def prepare_for_extend(self, *, preallocated: bool = False):
         self.forward_mode = ForwardMode.EXTEND
 
         if self.is_dllm():
@@ -2747,14 +2809,36 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         _pin = is_pin_memory_available(self.device)
         # Stay on pinned CPU; H2D is deferred to forward stream via
         # resolve_forward_inputs.
-        pinned_input_ids = flatten_arrays_to_pinned_cpu(input_ids, _pin)
-        seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64, pin_memory=_pin).to(
-            self.device, non_blocking=True
+        pinned_input_ids, pinned_input_ids_lease = _build_prefill_input_ids_staging(
+            input_ids, _pin, self.device
         )
+        if _pin:
+            # Stage through a reused, event-gated pinned buffer instead of
+            # pin_memory=True pin-allocating fresh host memory every single
+            # prefill batch -- host_staging.py owns the per-slot CUDA events
+            # that make reuse safe under real overlap.
+            #
+            # Confirmed via a live control test that this pool is NOT the
+            # source of actual_len variance in verify_oracle_forced.py: the
+            # pure pre-pooling original code (fresh pin_memory=True alloc
+            # every call) reproduces the identical run-to-run variance
+            # (actual_len 801-832, one run even flipping finish_reason to
+            # "stop"), so that variance is a pre-existing property of the
+            # live engine/test, unrelated to this pool.
+            seq_lens_tensor = _to_device_via_pinned_staging(
+                seq_lens, torch.int64, self.device
+            )
+            orig_seq_lens_tensor = _to_device_via_pinned_staging(
+                orig_seq_lens, torch.int32, self.device
+            )
+        else:
+            seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64).to(
+                self.device, non_blocking=True
+            )
+            orig_seq_lens_tensor = torch.tensor(orig_seq_lens, dtype=torch.int32).to(
+                self.device, non_blocking=True
+            )
         seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
-        orig_seq_lens_tensor = torch.tensor(
-            orig_seq_lens, dtype=torch.int32, pin_memory=_pin
-        ).to(self.device, non_blocking=True)
 
         # Set batch fields needed by alloc_for_extend
         self.prefix_lens = prefix_lens
@@ -2784,8 +2868,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 r.kv.req_pool_idx is None or r.is_retracted for r in reqs
             ]
         # Allocate memory
-        out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = alloc_for_extend(
-            self
+        out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = (
+            preallocated_extend_locs(self) if preallocated else alloc_for_extend(self)
         )
 
         # Set fields
@@ -2805,6 +2889,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             assert seq_len - pre_len == req.extend_range.length
 
             req.extend_batch_idx += 1
+
+            # update req-level memory management fields
+            # TODO(th4): co-locate this req.kv bookkeeping with the real KV
+            # allocation in alloc_for_extend above; they are currently a few
+            # steps apart and should become one owned-kv allocation step.
+            #
+            # Ring-attention CP: this rank only actually holds
+            # cp_local_total_len tokens' worth of KV (its own shard), not the
+            # full seq_len -- alloc_for_extend sets req.cp_local_total_len
+            # when this request went through the CP-local-shard allocation
+            # path (mem_cache/allocation.py's _cp_shard_info_for_batch).
+            cp_local_total_len = getattr(req, "cp_local_total_len", None)
+            req.kv.kv_committed_len = (
+                cp_local_total_len if cp_local_total_len is not None else seq_len
+            )
 
             # If input_embeds are available, store them
             if req.input_embeds is not None:
@@ -2936,6 +3035,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         self.input_ids = None
         self.prefill_input_ids_cpu = pinned_input_ids
+        self.prefill_input_ids_staging_lease = pinned_input_ids_lease
         self.req_pool_indices = req_pool_indices_tensor
         self.req_pool_indices_cpu = req_pool_indices_cpu
         self.orig_seq_lens = orig_seq_lens_tensor

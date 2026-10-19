@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import itertools
+import json
 import logging
+import time
 from typing import Callable, Iterable, Optional, Tuple
 
 import torch
@@ -13,6 +16,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dflash import DFlashDraftModel
@@ -29,6 +33,45 @@ from sglang.srt.speculative.ragged_verify import (
 logger = logging.getLogger(__name__)
 
 StepSampler = Callable[[torch.Tensor, int], torch.Tensor]
+
+_hidden_dump_ct = itertools.count()
+
+
+def _tensor_stats(t: torch.Tensor) -> dict:
+    tf = t.detach().to(torch.float64)
+    return {
+        "dtype": str(t.dtype),
+        "shape": list(t.shape),
+        "has_nan": bool(torch.isnan(tf).any().item()),
+        "has_inf": bool(torch.isinf(tf).any().item()),
+        "mean": tf.mean().item(),
+        "std": tf.std().item(),
+        "min": tf.min().item(),
+        "max": tf.max().item(),
+        # Value-sensitive, permutation-insensitive summary: cheap to compare
+        # across runs without shipping the full tensor.
+        "sum": tf.sum().item(),
+        "sumsq": (tf * tf).sum().item(),
+    }
+
+
+def _maybe_dump_hidden(
+    *, tag: str, target_hidden: torch.Tensor, ctx_hidden: torch.Tensor, positions: torch.Tensor
+) -> None:
+    path = envs.SGLANG_DSPARK_DEBUG_HIDDEN_DUMP_PATH.get()
+    if not path:
+        return
+    record = {
+        "ct": next(_hidden_dump_ct),
+        "ts": time.time(),
+        "tag": tag,
+        "n_positions": int(positions.shape[0]),
+        "positions_head": positions[:8].tolist(),
+        "target_hidden": _tensor_stats(target_hidden),
+        "ctx_hidden": _tensor_stats(ctx_hidden),
+    }
+    with open(path, "a") as f:
+        f.write(json.dumps(record) + "\n")
 
 
 def gather_and_crop_vocab(
@@ -452,14 +495,39 @@ class DSparkConfidenceHead(nn.Module):
         return torch.sigmoid(confidence_raw.float() / self.sts_temperatures)
 
 
+def resolve_confidence_head_enabled(config) -> Optional[bool]:
+    """Read the checkpoint's confidence-head switch.
+
+    Checked in precedence order: top-level ``enable_confidence_head``, then
+    ``dspark_config`` / ``dflash_config`` ``use_confidence_head`` /
+    ``enable_confidence_head`` (nvidia ModelOpt DSpark exports carry
+    ``dflash_config.use_confidence_head``). None = the checkpoint doesn't say.
+    """
+    enabled = getattr(config, "enable_confidence_head", None)
+    if enabled is not None:
+        return bool(enabled)
+    for cfg_name in ("dspark_config", "dflash_config"):
+        sub_cfg = getattr(config, cfg_name, None)
+        if not isinstance(sub_cfg, dict):
+            continue
+        for key in ("use_confidence_head", "enable_confidence_head"):
+            value = sub_cfg.get(key)
+            if value is not None:
+                return bool(value)
+    return None
+
+
 def build_confidence_head(config) -> Optional[nn.Module]:
     if read_ragged_verify_mode() is RaggedVerifyMode.STATIC:
         return None
-    if not hasattr(config, "enable_confidence_head"):
+    enabled = resolve_confidence_head_enabled(config)
+    if enabled is None:
         logger.warning(
-            "DSpark draft config has no enable_confidence_head field; treating the "
-            "confidence head as enabled."
+            "DSpark draft config has no enable_confidence_head / "
+            "use_confidence_head field; treating the confidence head as enabled."
         )
+    elif not enabled:
+        return None
     hidden_size = int(config.hidden_size)
     markov_rank = int(getattr(config, "markov_rank", 0))
     with_markov = bool(getattr(config, "confidence_head_with_markov", markov_rank > 0))
@@ -741,8 +809,27 @@ class DSparkDraftMixin:
             if target_hidden_is_projected
             else self.project_target_hidden(target_hidden)
         )
+        _maybe_dump_hidden(
+            tag="write_target_hidden_kv",
+            target_hidden=target_hidden,
+            ctx_hidden=ctx_hidden,
+            positions=positions,
+        )
 
         bundle = self._fused_kv_write_bundle(pool)
+        if (
+            bundle is not None
+            and cache_loc_2d is not None
+            and isinstance(cache_loc, KVWriteLoc)
+        ):
+            # Ring-pooled draft with a commit-gated 2D window: the bundle's
+            # meta points at the RING buffers, so the flattened window would
+            # need ring translation against a mapping that is only published
+            # for the committed prefix. set_kv_buffer_prefix_valid (the
+            # per-layer path below) owns exactly that translation and its
+            # commit gate; handing the fused kernel untranslated full-pool
+            # locs would write past the ring silently.
+            bundle = None
         if bundle is not None:
             from sglang.kernels.ops.speculative.dspark.fused_kv_write import (
                 fused_kv_norm_rope_write,
@@ -755,7 +842,14 @@ class DSparkDraftMixin:
                 write_commit_lens = commit_lens
                 locs_row_width = cache_loc_2d.shape[1]
             else:
-                locs = cache_loc
+                # Ring-pooled draft: meta holds the ring buffers, so write at
+                # the pre-translated swa_loc; the kernel skips rows with
+                # loc < 0, which covers the window-gated -1 sentinels.
+                locs = (
+                    cache_loc.swa_loc
+                    if isinstance(cache_loc, KVWriteLoc)
+                    else cache_loc
+                )
                 write_commit_lens = None
                 locs_row_width = None
             fused_kv_norm_rope_write(

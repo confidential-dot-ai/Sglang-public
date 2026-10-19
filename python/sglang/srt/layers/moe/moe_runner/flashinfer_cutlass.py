@@ -8,6 +8,8 @@ small quant_info payload and route through ``MoeRunner``.
 
 from __future__ import annotations
 
+import functools
+import inspect
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -27,6 +29,77 @@ from sglang.srt.layers.moe.moe_runner.base import (
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_flashinfer_available
 from sglang.srt.utils.common import next_power_of_2
+
+# FlashInfer's own default (flashinfer.fused_moe.core.cutlass_fused_moe's
+# tune_max_num_tokens parameter) is 8192 -- this is the top bucket its
+# AutoTuner profiles (MoERunner.refine_tuning_config's dynamic_tensor_specs),
+# and the profiling pass allocates a CUTLASS grouped-GEMM workspace sized for
+# that top bucket. Passing the real batch's next_power_of_2 uncapped (as
+# below) forces that profiling-time workspace to scale with whatever the
+# current --chunked-prefill-size/concurrent-batch happens to be; at 131072+
+# tokens this overflows the workspace allocator inside
+# FusedMoeRunner::getWorkspaceInfo and kills the scheduler process outright
+# (observed live: crashes at both 262144 and 131072 chunk sizes). Capping at
+# FlashInfer's own tested default is safe for correctness: map_to_hybrid_bucket
+# already clamps any real runtime token count down to the nearest tuned
+# bucket for dispatch, so a real batch larger than this cap just reuses the
+# tactic tuned at the cap -- normal, expected MoE-kernel behavior, not a
+# correctness gap.
+_MOE_TUNE_MAX_TOKENS_CAP = 8192
+
+# Real per-forward-call row cap, separate from the tuning cap above.
+# FusedMoeRunner::getWorkspaceInfo (TensorRT-LLM cpp/tensorrt_llm/thop/
+# moeOp.cpp) resizes its CUTLASS grouped-GEMM workspace to fit `num_rows`
+# on EVERY real forward call -- uncapped, freeing the old buffer first --
+# independent of tune_max_num_tokens (which only bounds the AutoTuner's
+# own one-time profiling-pass allocation at startup; a real forward call
+# with a bigger row count still resizes this buffer regardless of what
+# was tuned for). A single call with ~97k-100k rows (25+ concurrent
+# sequences batched together under a large --chunked-prefill-size) crashed
+# the prefill scheduler process outright at both 131072 and 262144, even
+# with the tuning cap above already landed (2026-07-24 investigation, see
+# tdx-checkpoints/128 and its predecessors). Most likely a genuine
+# VRAM-headroom OOM under --mem-fraction-static 0.80 rather than a hard
+# kernel limit, but the original crash's own OOM message was never
+# captured (log truncated by the next relaunch) -- so this is not
+# confirmed root-caused, only worked around.
+#
+# _run_flashinfer_cutlass below splits any real forward call wider than
+# this into sequential <=-this-many-row sub-calls, each independently
+# workspace-bounded, so --chunked-prefill-size can grow for prefill/
+# decode-pipeline throughput without growing what the MoE runner's C++
+# allocator ever has to size for in one shot. Chosen equal to the
+# separately-validated-safe --chunked-prefill-size (32768) from the same
+# investigation, not derived from any workspace-size math -- there is no
+# formula available from the visible (compiled, not patched) C++ for what
+# the *actual* safe bound is, so this reuses the one row count already
+# proven not to crash.
+#
+# UNTESTED as of this comment: written with the host's 8 GPUs held by a
+# separate workload, so no live validation was possible. Before trusting
+# this in production, validate against a real concurrent flood at
+# >32768-token chunk sizes for: (a) no crash, (b) output correctness vs.
+# the known-safe single-call 32768 baseline (chunked-vs-unchunked MoE
+# output should match bit-for-bit modulo kernel nondeterminism -- diff
+# them), and (c) actual throughput gain, since row-chunking trades N
+# sequential kernel launches for the single-shot workspace risk it avoids
+# and could net negative if the sequential overhead dominates.
+#
+# Lowered from 32768 to 8192 (2026-07-27 investigation): at 32768 (equal to
+# our --chunked-prefill-size), this cap never actually triggers the split --
+# every real forward call already fits in one sub-call, so the workspace
+# still gets resized up to whatever real chunk sizes reach as concurrency
+# ramps toward the 32768 cap. Measured live: real c64 traffic against the
+# known-safe 900k-token-cap config grew per-GPU memory.used by a consistent
+# ~2.97-2.98 GiB, monotonically, plateauing once chunk sizes stopped
+# growing -- consistent with the caching allocator retaining the
+# largest-ever workspace resize rather than shrinking back down.
+# _MOE_TUNE_MAX_TOKENS_CAP=8192 is already the AutoTuner's own top tuned
+# bucket, so this reuses a bucket already proven to be profiled/tuned for
+# rather than picking an arbitrary smaller number. Testing whether this
+# actually bounds that growth, and whether (b)/(c) above hold at this
+# cap -- see TODO.md.
+_MOE_FORWARD_ROW_CAP = 8192
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
@@ -63,6 +136,12 @@ class FlashInferCutlassMoeQuantInfo(MoeQuantInfo):
     moe_ep_size: int = 1
     moe_ep_rank: int = 0
     apply_routed_scaling_factor: bool = True
+    # Per-expert [E] float32 tensors for clamped/scaled SwiGLU variants
+    # (e.g. GPT-OSS's swigluoai: alpha != 1, symmetric clamp
+    # limit on both gate and up). None for vanilla unclamped SwiGLU.
+    swiglu_alpha: Optional[torch.Tensor] = None
+    swiglu_beta: Optional[torch.Tensor] = None
+    swiglu_limit: Optional[torch.Tensor] = None
 
 
 def materialize_swiglu_params_for_cutlass(
@@ -166,6 +245,23 @@ def _flashinfer_cutlass_fused_moe():
     return cutlass_fused_moe, ActivationType
 
 
+@functools.lru_cache(maxsize=1)
+def _flashinfer_supports_fused_finalize() -> bool:
+    """cutlass_fused_moe's ``use_fused_finalize`` kwarg needs FlashInfer
+    >=0.6.16 (#28354); older pinned installs (e.g. this repo's validated
+    0.6.14) raise TypeError on an unknown kwarg. Detected once via
+    inspect.signature rather than a hardcoded version cutoff so this tracks
+    whatever FlashInfer build is actually installed."""
+    cutlass_fused_moe, _ = _flashinfer_cutlass_fused_moe()
+    return "use_fused_finalize" in inspect.signature(cutlass_fused_moe).parameters
+
+
+def _fused_finalize_kwargs() -> dict:
+    if not _flashinfer_supports_fused_finalize():
+        return {}
+    return {"use_fused_finalize": envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get()}
+
+
 def _activation_type(runner_config: MoeRunnerConfig):
     from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import get_activation_type
 
@@ -260,6 +356,60 @@ def _prepare_input(
     return x, x_sf, output_dtype, output_col
 
 
+def _run_flashinfer_cutlass_call(
+    *,
+    flashinfer_cutlass_fused_moe,
+    output: torch.Tensor,
+    x: torch.Tensor,
+    x_sf: Optional[torch.Tensor],
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    w13_weight: torch.Tensor,
+    w2_weight: torch.Tensor,
+    output_dtype: torch.dtype,
+    quant_scales,
+    quant_info: FlashInferCutlassMoeQuantInfo,
+    activation_type,
+    enable_alltoall: bool,
+) -> None:
+    """One workspace-bounded call -- `x.shape[0]` must already be
+    <= _MOE_FORWARD_ROW_CAP by the time this is reached.
+
+    Explicitly assigns the kernel's returned tensor into `output` via a
+    slice-copy rather than trusting the `output=` kwarg to have written
+    in place: the original (pre-chunking) call site did
+    `output = flashinfer_cutlass_fused_moe(output=output, ...)[0]` and used
+    THAT return value going forward, not the passed-in buffer directly --
+    so whether this kernel aliases its `output=` argument or returns a
+    fresh tensor is not established here, and an explicit copy is correct
+    either way (a plain kwarg-write assumption would silently no-op if the
+    kernel doesn't alias)."""
+    result = flashinfer_cutlass_fused_moe(
+        output=output,
+        input=x,
+        token_selected_experts=topk_ids.to(torch.int),
+        token_final_scales=topk_weights,
+        fc1_expert_weights=w13_weight,
+        fc2_expert_weights=w2_weight,
+        output_dtype=output_dtype,
+        input_sf=x_sf,
+        quant_scales=quant_scales,
+        ep_size=quant_info.moe_ep_size,
+        ep_rank=quant_info.moe_ep_rank,
+        tp_size=quant_info.moe_tp_size,
+        tp_rank=quant_info.moe_tp_rank,
+        tune_max_num_tokens=min(next_power_of_2(x.shape[0]), _MOE_TUNE_MAX_TOKENS_CAP),
+        activation_type=activation_type,
+        enable_alltoall=enable_alltoall,
+        swiglu_alpha=quant_info.swiglu_alpha,
+        swiglu_beta=quant_info.swiglu_beta,
+        swiglu_limit=quant_info.swiglu_limit,
+        **_fused_finalize_kwargs(),
+    )[0]
+    if result.data_ptr() != output.data_ptr():
+        output.copy_(result)
+
+
 def _run_flashinfer_cutlass(
     *,
     dispatch_output,
@@ -305,28 +455,48 @@ def _run_flashinfer_cutlass(
             quant_scales[5],
         ]
 
-    output = flashinfer_cutlass_fused_moe(
-        output=output,
-        input=x,
-        token_selected_experts=topk_ids.to(torch.int),
-        token_final_scales=topk_weights,
-        fc1_expert_weights=w13_weight,
-        fc2_expert_weights=w2_weight,
-        output_dtype=output_dtype,
-        input_sf=x_sf,
-        quant_scales=quant_scales,
-        swiglu_alpha=quant_info.swiglu_alpha,
-        swiglu_beta=quant_info.swiglu_beta,
-        swiglu_limit=quant_info.swiglu_limit,
-        ep_size=quant_info.moe_ep_size,
-        ep_rank=quant_info.moe_ep_rank,
-        tp_size=quant_info.moe_tp_size,
-        tp_rank=quant_info.moe_tp_rank,
-        tune_max_num_tokens=next_power_of_2(x.shape[0]),
-        activation_type=_activation_type(runner_config),
-        enable_alltoall=enable_alltoall,
-        use_fused_finalize=envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
-    )[0]
+    activation_type = _activation_type(runner_config)
+    num_rows = x.shape[0]
+
+    if num_rows <= _MOE_FORWARD_ROW_CAP:
+        _run_flashinfer_cutlass_call(
+            flashinfer_cutlass_fused_moe=flashinfer_cutlass_fused_moe,
+            output=output,
+            x=x,
+            x_sf=x_sf,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            w13_weight=w13_weight,
+            w2_weight=w2_weight,
+            output_dtype=output_dtype,
+            quant_scales=quant_scales,
+            quant_info=quant_info,
+            activation_type=activation_type,
+            enable_alltoall=enable_alltoall,
+        )
+    else:
+        # Real forward call exceeds the workspace-safe row cap -- split
+        # into sequential sub-calls, each independently bounded, instead
+        # of handing the whole batch to a single CUTLASS grouped-GEMM
+        # call. See _MOE_FORWARD_ROW_CAP's comment for why this exists
+        # and what it trades off.
+        for start in range(0, num_rows, _MOE_FORWARD_ROW_CAP):
+            end = min(start + _MOE_FORWARD_ROW_CAP, num_rows)
+            _run_flashinfer_cutlass_call(
+                flashinfer_cutlass_fused_moe=flashinfer_cutlass_fused_moe,
+                output=output[start:end],
+                x=x[start:end],
+                x_sf=x_sf[start:end] if x_sf is not None else None,
+                topk_ids=topk_ids[start:end],
+                topk_weights=topk_weights[start:end],
+                w13_weight=w13_weight,
+                w2_weight=w2_weight,
+                output_dtype=output_dtype,
+                quant_scales=quant_scales,
+                quant_info=quant_info,
+                activation_type=activation_type,
+                enable_alltoall=enable_alltoall,
+            )
 
     if quant_info.quant_type in ("bf16", "fp8"):
         _maybe_apply_routed_scaling_factor(output, quant_info, runner_config)
@@ -536,9 +706,9 @@ def _fused_experts_flashinfer_mxfp4_cutlass(
             if quant_info.use_swiglu_step
             else ActivationType.Swiglu
         ),
-        tune_max_num_tokens=next_power_of_2(x.shape[0]),
+        tune_max_num_tokens=min(next_power_of_2(x.shape[0]), _MOE_TUNE_MAX_TOKENS_CAP),
         output=out,
-        use_fused_finalize=envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
+        **_fused_finalize_kwargs(),
         **humming_kwargs,
     )
 

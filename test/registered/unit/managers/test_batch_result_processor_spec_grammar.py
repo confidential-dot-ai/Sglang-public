@@ -251,5 +251,23 @@ class TestReasoningTokenAccounting(CustomTestCase):
         self.assertFalse(req._is_reasoning_over)
 
 
+class TestResultCopyCompletion(CustomTestCase):
+    def test_completion_variants_and_failure_propagation(self):
+        """Copy-thread completion owns visibility even when an inline event exists."""
+        from unittest.mock import Mock
+
+        wait = SchedulerBatchResultProcessor._wait_result_copy
+        wait(SimpleNamespace())
+        event = Mock()
+        wait(SimpleNamespace(copy_done=event))
+        event.synchronize.assert_called_once()
+        event.reset_mock()
+        completion = Mock()
+        completion.wait.side_effect = RuntimeError("copy failed")
+        with self.assertRaisesRegex(RuntimeError, "copy failed"):
+            wait(SimpleNamespace(copy_ready_cpu=completion, copy_done=event))
+        event.synchronize.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

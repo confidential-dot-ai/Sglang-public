@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import re
+import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, List, Optional, Union
 
@@ -73,6 +74,9 @@ class GenerationBatchResult:
 
     # For overlap scheduling
     copy_done: Optional[torch.cuda.Event] = None
+    # Set instead of copy_done when the D2H readback is offloaded to the async
+    # copy worker (confidential-compute path). worker-done => copy-done.
+    copy_ready_cpu: Optional[threading.Event] = None
     delay_sample_func: Optional[callable] = None
     future_indices: Optional[torch.Tensor] = None
     speculative_num_draft_tokens: Optional[int] = None
@@ -376,6 +380,9 @@ class EmbeddingBatchResult:
     embeddings: torch.Tensor
     pooled_hidden_states: Optional[torch.Tensor] = None
     copy_done: Optional[torch.cuda.Event] = None
+    # Set instead of copy_done when the D2H readback is offloaded to the async
+    # copy worker (confidential-compute path). worker-done => copy-done.
+    copy_ready_cpu: Optional[threading.Event] = None
     can_run_cuda_graph: bool = False
 
     @torch.profiler.record_function("copy_embedding_to_cpu")

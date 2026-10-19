@@ -52,6 +52,8 @@ import tqdm
 from sglang.kernels.ops.kvcache.kv_indices import (
     create_chunked_prefix_cache_kv_indices,
 )
+from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
+from sglang.srt.configs.deepseek_v41 import DeepseekV41Config
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.bcg import (
@@ -372,6 +374,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # (e.g. a residual-stream merge) writes a wider tensor than
         # `config.hidden_size`, so let it declare that width.
         input_embeds_hidden_size = self._input_embeds_hidden_size()
+        config = self.model_runner.model_config.hf_text_config
+        pp_prev_pre_size = (
+            config.hc_mult
+            if isinstance(config, (DeepSeekV4Config, DeepseekV41Config))
+            and config.hc_pre_from_prev_sublayer
+            else None
+        )
         self.buffers: PrefillInputBuffers = PrefillInputBuffers.create(
             device=self.device,
             max_bs=self.max_bs,
@@ -393,6 +402,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             pp_proxy_dspark_hidden_size=(
                 self.model_runner.get_pp_proxy_dspark_hidden_size()
             ),
+            pp_prev_pre_size=pp_prev_pre_size,
         )
         self.buffers.share_buffers()
         # Token-axis FB-shared slot registry adopting PrefillInputBuffers
@@ -585,6 +595,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self.use_captured_attn_metadata = model_runner.attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph
         else:
             self.use_captured_attn_metadata = False
+        self.bounded_replay = (
+            isinstance(self.backend, BreakableCudaGraphBackend)
+            and model_runner.server_args.enable_decoder_swa_bounded_replay
+            and not model_runner.is_draft_worker
+            and model_runner.pp_group.is_last_rank
+        )
+        self.bounded_replay_states = {}
         self.attn_metadata_buffers: Optional[Dict[ShapeKey, object]] = (
             {} if self.use_captured_attn_metadata else None
         )
@@ -787,7 +804,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     self.layer_model, forward_batch, pp_proxy_tensors
                 )
                 if pp_proxy_tensors is not None:
-                    input_ids = None
+                    # Later stages take hidden states from the proxy but keep the
+                    # token ids: DeepSeek-V4.1's Engram layers hash them mid-stack.
                     for embeds_name in ("input_embeds", "inputs_embeds"):
                         if embeds_name in kwargs:
                             kwargs[embeds_name] = None
@@ -1001,6 +1019,17 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     "prefix batch has no captured FullCG variant"
                 )
                 variant = _chunked_prefix_variant(captured_n)
+        if self.bounded_replay:
+            from sglang.srt.model_executor.runner_utils.dsv41_bounded_replay import (
+                select_tail_bucket,
+            )
+
+            bucket = select_tail_bucket(
+                chunk_bucket=num_tokens,
+                max_requests=self.max_bs,
+                extend_lens=forward_batch.extend_seq_lens_cpu,
+            )
+            return ShapeKey(size=num_tokens, attention_variant=f"tail_{bucket}")
         return ShapeKey(size=num_tokens, variant_label=variant)
 
     def _create_chunked_prefix_buffers(self) -> _ChunkedPrefixCaptureBuffers:
@@ -1207,6 +1236,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             forward_batch,
             static_forward_batch=static_forward_batch,
         )
+        if self.bounded_replay:
+            self.layer_model._check_late_layer_tail_readers(forward_batch)
+            self.bounded_replay_states[shape_key].prepare(
+                backend=attn_backend, batch=forward_batch
+            )
 
     @staticmethod
     def _restore_mha_capture_state(forward_batch: ForwardBatch) -> None:
@@ -1581,7 +1615,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 capture_range.set_description(
                     f"Capturing prefill shape ({num_tokens=} {avail_mem=:.2f} GB)"
                 )
-            self.capture_one_shape(num_tokens)
+            if self.bounded_replay:
+                from sglang.srt.model_executor.runner_utils.dsv41_bounded_replay import (
+                    tail_buckets,
+                )
+
+                for bucket in reversed(tail_buckets(num_tokens, self.max_bs)):
+                    self.capture_one_shape(num_tokens, tail_bucket=bucket)
+            else:
+                self.capture_one_shape(num_tokens)
             if self._capture_chunked_prefix:
                 for captured_n in self._prefix_capture_variants:
                     self.capture_one_shape(
@@ -1589,7 +1631,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                         prefix_num_chunks=captured_n,
                     )
 
-    def capture_one_shape(self, size: int, *, prefix_num_chunks: int = 0) -> None:
+    def capture_one_shape(
+        self, size: int, *, prefix_num_chunks: int = 0, tail_bucket: int = 0
+    ) -> None:
         """Per-shape capture: build dummy ForwardBatch + run_once,
         delegate to backend. size is the prefill token count.
         """
@@ -1620,6 +1664,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 if prefix_num_chunks
                 else None
             ),
+            attention_variant=f"tail_{tail_bucket}" if tail_bucket else None,
         )
         if prefix_num_chunks:
             self._prepare_chunked_prefix_capture(
@@ -1636,6 +1681,17 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             # this path incompatible with the OSS FlashAttention backend.
         else:
             self._init_forward_metadata_for_capture(forward_batch, shape_key)
+        if tail_bucket:
+            from sglang.srt.model_executor.runner_utils.dsv41_bounded_replay import (
+                BoundedReplayGraphState,
+            )
+
+            state = BoundedReplayGraphState(
+                backend=attn_backend, batch=forward_batch, bucket=tail_bucket
+            )
+            self.bounded_replay_states[shape_key] = state
+            attn_backend.bcg_tail_state = state
+            attn_backend.tail_forward_metadata = state.metadata
 
         def run_once():
             # Record LoRA kernels even when capture uses base-model requests.
@@ -2077,6 +2133,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             input_logprobs_copy_done=output.input_logprobs_copy_done,
             customized_info=output.customized_info,
             mm_input_embeds=mm_input_embeds,
+            hidden_states_token_indices=output.hidden_states_token_indices,
         )
 
     def _finalize_execute_output(

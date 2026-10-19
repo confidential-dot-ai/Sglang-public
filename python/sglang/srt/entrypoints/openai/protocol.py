@@ -956,6 +956,11 @@ class ChatCompletionRequest(BaseModel):
     # and tool_call_constraint.
     input_ids: Optional[List[int]] = None
 
+    # Oracle mode: forces decode to emit these exact token ids instead of
+    # sampling, to replay a known dataset trace's real compute profile. See
+    # SamplingParams.forced_token_ids.
+    forced_token_ids: Optional[List[int]] = None
+
     # For request id
     rid: Optional[Union[List[str], str]] = None
     # Extra key for caller-defined request classification
@@ -1148,6 +1153,7 @@ class ChatCompletionRequest(BaseModel):
             "skip_special_tokens": self.skip_special_tokens,
             "logit_bias": self.logit_bias,
             "custom_params": self.custom_params,
+            "forced_token_ids": self.forced_token_ids,
             "sampling_seed": self.seed,
             "spaces_between_special_tokens": spaces_between_special_tokens,
         }

@@ -47,6 +47,7 @@ from sglang.benchmark.datasets.image import (
 from sglang.benchmark.datasets.mmmu import sample_mmmu_requests
 from sglang.benchmark.datasets.mooncake import get_mooncake_request_over_time
 from sglang.benchmark.datasets.openai_dataset import sample_openai_requests
+from sglang.benchmark.datasets.oracle_trace import OracleTraceDataset
 from sglang.benchmark.datasets.random import sample_random_requests
 from sglang.benchmark.datasets.sharegpt import sample_sharegpt_requests
 from sglang.benchmark.serving import (
@@ -499,6 +500,40 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
             json.dump(trace, f)
         return str(path)
 
+    def _write_oracle_trace_json(self):
+        trace = {
+            "metadata": {"source": "test"},
+            "conversations": [
+                [
+                    {
+                        "messages": [
+                            {"role": "system", "content": "You are an agent."},
+                            {"role": "user", "content": "Fix the bug."},
+                        ],
+                        "forced_token_ids": [1, 2, 3],
+                        "max_new_tokens": 11,
+                    },
+                    {
+                        "messages": [{"role": "user", "content": "Tool output: ok."}],
+                        "forced_token_ids": [4, 5],
+                        "max_new_tokens": 10,
+                    },
+                    {"messages": [], "forced_token_ids": []},
+                ],
+                [
+                    {
+                        "messages": [{"role": "user", "content": "Run the tests."}],
+                        "forced_token_ids": [6, 7, 8, 9],
+                        "max_new_tokens": 12,
+                    },
+                ],
+            ],
+        }
+        path = self.tmpdir_path / "oracle_trace.json"
+        with open(path, "w") as f:
+            json.dump(trace, f)
+        return str(path)
+
     async def _collect_mooncake_rows(self, records):
         out = []
         async for row in get_mooncake_request_over_time(
@@ -934,6 +969,66 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         )
         with self.assertRaises(ValueError):
             AgenticTraceDataset.from_args(args).load(self.tokenizer)
+
+    def test_oracle_trace_sampler(self):
+        dataset_path = self._write_oracle_trace_json()
+        args = make_args(
+            dataset_name="oracle-trace",
+            dataset_path=dataset_path,
+            num_prompts=10,
+        )
+        dataset = OracleTraceDataset.from_args(args)
+        rows = dataset.load(self.tokenizer)
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(isinstance(row, DatasetRow) for row in rows))
+        # Multi-turn shape: prompt is a list of per-round {"messages":...,
+        # "extra_request_body":...} dicts, with the empty third turn of the
+        # first conversation dropped (no forced_token_ids).
+        self.assertEqual(len(rows[0].prompt), 2)
+        self.assertEqual(len(rows[1].prompt), 1)
+        round0 = rows[0].prompt[0]
+        self.assertEqual(round0["messages"][0]["role"], "system")
+        self.assertEqual(round0["extra_request_body"]["forced_token_ids"], [1, 2, 3])
+        self.assertEqual(round0["extra_request_body"]["max_new_tokens"], 11)
+        # output_len is the sum of every round's forced_token_ids length.
+        self.assertEqual(rows[0].output_len, 3 + 2)
+        self.assertEqual(rows[1].output_len, 4)
+
+    def test_oracle_trace_offset_and_max_turns(self):
+        dataset_path = self._write_oracle_trace_json()
+        args = make_args(
+            dataset_name="oracle-trace",
+            dataset_path=dataset_path,
+            num_prompts=10,
+            dataset_offset=1,
+            agentic_max_turns=1,
+        )
+        dataset = OracleTraceDataset.from_args(args)
+        rows = dataset.load(self.tokenizer)
+        self.assertEqual(len(rows), 2)
+        # offset=1 rotates the second (single-round) conversation to the front.
+        self.assertEqual(rows[0].output_len, 4)
+        self.assertTrue(all(len(row.prompt) == 1 for row in rows))
+
+    def test_oracle_trace_invalid_input_raises(self):
+        args = make_args(
+            dataset_name="oracle-trace",
+            dataset_path=str(self.tmpdir_path / "missing.json"),
+            num_prompts=1,
+        )
+        with self.assertRaises(FileNotFoundError):
+            OracleTraceDataset.from_args(args).load(self.tokenizer)
+
+        empty_path = self.tmpdir_path / "empty_oracle_trace.json"
+        with open(empty_path, "w") as f:
+            json.dump({"metadata": {}, "conversations": []}, f)
+        args = make_args(
+            dataset_name="oracle-trace",
+            dataset_path=str(empty_path),
+            num_prompts=1,
+        )
+        with self.assertRaises(ValueError):
+            OracleTraceDataset.from_args(args).load(self.tokenizer)
 
     def test_dataset_mapping_and_dispatch(self):
         expected = {

@@ -146,6 +146,16 @@ class AttentionBackend(ABC):
     # batch_size <= req_to_token_pool.size.
     extend_dummy_seqs_capped_by_req_pool: bool = False
 
+    # CCSpec (model_executor/ccspec_decode.py): True ONLY when this backend's
+    # DECODE path is safe to trace inside a CUDA-graph conditional WHILE body
+    # with NO per-tick host metadata refresh: after one
+    # init_forward_metadata_out_graph(fb, in_capture=True) call, every
+    # captured tick must be pure fixed-shape device ops driven by the live
+    # seq_lens device tensor -- no .item()/.cpu()/.tolist(), no H2D copies,
+    # no data-dependent shapes, no collectives. Default False: a backend must
+    # be explicitly audited before opting in.
+    supports_ccspec_capture: bool = False
+
     # Most attention backends can rebuild and replace forward metadata before
     # every forward. BCG capture is different: some backends expose metadata
     # tensors to kernels across graph breaks, so the captured graph depends on

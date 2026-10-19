@@ -9,6 +9,8 @@
 #include <cuda_fp4.h>
 #endif
 
+#include <cstdint>
+
 // FP4 (e2m1) helpers: per-32 UE8M0 for the indexer, per-16 E4M3 for compressed KV.
 
 namespace sglang {
@@ -106,6 +108,55 @@ SGL_DEVICE fp32x2_t fake_quant_x2(fp32x2_t x, float scale, float inv_scale) {
 #endif
   return {grid.x * scale, grid.y * scale};
 }
+
+// The packed FP32 -> E2M1 conversion is an architecture-specific instruction.
+// SM121 (GB10) is deliberately excluded: unlike SM120, it does not implement
+// cvt.rn.satfinite.e2m1x2.f32.
+#if !defined(USE_ROCM) && CUDA_VERSION >= 12080 && \
+    ((SGL_CUDA_ARCH >= 1000 && SGL_CUDA_ARCH < 1200) || SGL_CUDA_ARCH == 1200)
+#define SGL_DSV4_HAS_NATIVE_E2M1X2 1
+#else
+#define SGL_DSV4_HAS_NATIVE_E2M1X2 0
+#endif
+
+SGL_DEVICE uint8_t quant_e2m1(float x) {
+  const float ax = fminf(fabsf(x), 6.0f);
+  uint8_t idx = 0;
+  idx += ax > 0.25f;
+  idx += ax >= 0.75f;
+  idx += ax > 1.25f;
+  idx += ax >= 1.75f;
+  idx += ax > 2.5f;
+  idx += ax >= 3.5f;
+  idx += ax > 5.0f;
+  if (x < 0.0f && idx != 0) idx |= 0x8;
+  return idx;
+}
+
+// Return two E2M1 values in the cache's native byte order: lo in bits [3:0]
+// and hi in bits [7:4]. PTX packs its first source into the high nibble, hence
+// the intentionally reversed source operands below.
+SGL_DEVICE uint8_t quant_e2m1x2(float lo, float hi) {
+#if SGL_DSV4_HAS_NATIVE_E2M1X2
+  // Inline PTX has no 8-bit output constraint. Replicate the packed byte into
+  // a 16-bit register and return its low byte, matching CUTLASS's conversion.
+  uint16_t result;
+  asm volatile(
+      "{\n\t"
+      ".reg .b8 fp4;\n\t"
+      "cvt.rn.satfinite.e2m1x2.f32 fp4, %2, %1;\n\t"
+      "mov.b16 %0, {fp4, fp4};\n\t"
+      "}"
+      : "=h"(result)
+      : "f"(lo), "f"(hi));
+  return static_cast<uint8_t>(result);
+#else
+  return quant_e2m1(lo) | (quant_e2m1(hi) << 4);
+#endif
+}
+
+
+#undef SGL_DSV4_HAS_NATIVE_E2M1X2
 
 }  // namespace deepseek_v4::fp4
 

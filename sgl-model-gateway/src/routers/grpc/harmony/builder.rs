@@ -496,7 +496,7 @@ impl HarmonyBuilder {
                     .filter_map(|part| match part {
                         ResponseContentPart::OutputText { text, .. } => Some(text.clone()),
                         ResponseContentPart::InputText { text } => Some(text.clone()),
-                        ResponseContentPart::Unknown => None,
+                        _ => None,
                     })
                     .collect();
 
@@ -648,7 +648,7 @@ impl HarmonyBuilder {
                             .filter_map(|part| match part {
                                 ResponseContentPart::OutputText { text, .. } => Some(text.clone()),
                                 ResponseContentPart::InputText { text } => Some(text.clone()),
-                                ResponseContentPart::Unknown => None,
+                                _ => None,
                             })
                             .collect::<Vec<_>>()
                             .join("\n")
@@ -696,6 +696,28 @@ impl HarmonyBuilder {
 
         for msg in messages {
             match msg {
+                ChatMessage::Root {
+                    content,
+                    name,
+                    tools: _,
+                } => {
+                    // Harmony has no dedicated root role. `root` is the
+                    // highest-priority system prompt, so it maps to System
+                    // and keeps its content rather than being dropped.
+                    let harmony_msg = HarmonyMessage {
+                        author: Author {
+                            role: Role::System,
+                            name: name.clone(),
+                        },
+                        recipient: None,
+                        content: vec![Content::Text(TextContent {
+                            text: content.to_simple_string(),
+                        })],
+                        channel: None,
+                        content_type: None,
+                    };
+                    harmony_messages.push(harmony_msg);
+                }
                 ChatMessage::System { content, name } => {
                     // System messages stay as-is
                     let harmony_msg = HarmonyMessage {

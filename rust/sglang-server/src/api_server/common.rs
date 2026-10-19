@@ -142,6 +142,7 @@ const INTERNAL_STATE_ALLOWLIST: &[&str] = &[
     "avg_spec_accept_length",
     "step_time_dict",
     "rust_mm_transport",
+    "hardwire_memory",
 ];
 
 fn shape_server_info(msgpack: &[u8], server_args: &ServerArgs) -> Result<Vec<u8>, String> {
@@ -156,6 +157,10 @@ fn shape_server_info(msgpack: &[u8], server_args: &ServerArgs) -> Result<Vec<u8>
 
     // Copy only the allowlisted runtime metrics — never the raw server-args dump.
     let mut state_out = serde_json::Map::new();
+    let hardwire_memory = internal
+        .get("hardwire_memory")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     for &k in INTERNAL_STATE_ALLOWLIST {
         match internal.get(k) {
             Some(v) if !v.is_null() => {
@@ -175,6 +180,7 @@ fn shape_server_info(msgpack: &[u8], server_args: &ServerArgs) -> Result<Vec<u8>
         "max_total_num_tokens": server_args.max_total_num_tokens,
         "version": server_args.version,
         "frontend": "rust",
+        "hardwire_memory": hardwire_memory,
         "internal_states": [serde_json::Value::Object(state_out)],
     });
     serde_json::to_vec(&response).map_err(|e| e.to_string())
@@ -209,6 +215,16 @@ mod tests {
                 rmpv::Value::from("effective_max_running_requests_per_dp"),
                 rmpv::Value::from(32),
             ),
+            (
+                rmpv::Value::from("hardwire_memory"),
+                rmpv::Value::Map(vec![
+                    (rmpv::Value::from("status"), rmpv::Value::from("active")),
+                    (
+                        rmpv::Value::from("total_allocated_bytes"),
+                        rmpv::Value::from(4096),
+                    ),
+                ]),
+            ),
         ]);
         let outer = rmpv::Value::Map(vec![(rmpv::Value::from("internal_state"), internal)]);
         let mut msgpack = Vec::new();
@@ -235,6 +251,8 @@ mod tests {
         let state0 = &v["internal_states"][0];
         assert_eq!(state0["last_gen_throughput"], 1.5);
         assert_eq!(state0["effective_max_running_requests_per_dp"], 32);
+        assert_eq!(state0["hardwire_memory"]["total_allocated_bytes"], 4096);
+        assert_eq!(v["hardwire_memory"]["status"], "active");
         assert!(
             state0.get("internal_state").is_none(),
             "must not re-nest the dump under internal_state"

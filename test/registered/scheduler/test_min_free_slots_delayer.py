@@ -37,6 +37,18 @@ class TestResolveMinFreeSlots(unittest.TestCase):
         self.assertEqual(resolve_min_free_slots(8, 512), 8)
         self.assertEqual(resolve_min_free_slots(16, 512), 16)
 
+    def test_explicit_value_can_exceed_formula(self):
+        # Explicit tuning overrides the conservative DFlash auto-default.
+        self.assertEqual(resolve_min_free_slots(10, 512), 10)
+        self.assertEqual(resolve_min_free_slots(8, 48), 8)
+
+    def test_explicit_value_caps_to_max_running_requests(self):
+        self.assertEqual(resolve_min_free_slots(99, 48), 48)
+
+    def test_respects_smaller_user_value(self):
+        # Below the formula cap is taken as-is.
+        self.assertEqual(resolve_min_free_slots(3, 512), 3)
+
     def test_explicit_value_is_capped_to_max_running_requests(self):
         self.assertEqual(resolve_min_free_slots(16, 8), 8)
 

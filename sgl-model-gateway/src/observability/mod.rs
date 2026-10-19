@@ -2,6 +2,7 @@
 
 pub mod events;
 pub mod gauge_histogram;
+pub mod inference_metrics;
 pub mod inflight_tracker;
 pub mod logging;
 pub mod metrics;

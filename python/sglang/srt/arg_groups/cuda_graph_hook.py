@@ -311,11 +311,6 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
             "decode context parallel (dcp_size > 1)",
             lambda: cfg.dcp_size > 1,
         ),
-        # TBO capture is unsupported.
-        (
-            "two-batch overlap",
-            lambda: cfg.enable_two_batch_overlap,
-        ),
         (
             "unvalidated a2a backend",
             lambda: (
@@ -551,6 +546,12 @@ def handle_cuda_graph_config(server_args: Any):
 
 def validate_cuda_graph_config(server_args: Any):
     cfg = resolving_view(server_args)
+    if cfg.cuda_graph_host_staging_pool_depth <= 0:
+        raise ValueError("--cuda-graph-host-staging-pool-depth must be positive")
+    if cfg.cuda_graph_host_staging_growth_tokens <= 0:
+        raise ValueError("--cuda-graph-host-staging-growth-tokens must be positive")
+    if cfg.cuda_graph_host_memory_backend == "hardwire" and not str(cfg.device).startswith("cuda"):
+        raise ValueError("--cuda-graph-host-memory-backend hardwire requires CUDA")
     if cfg.cuda_graph_config is None:
         return
     for phase in Phase.ALL:

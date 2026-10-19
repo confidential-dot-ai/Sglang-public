@@ -206,7 +206,17 @@ class Router:
             Example: ['x-my-request-id', 'x-custom-trace-id']. Default: None
         bootstrap_port_annotation: Kubernetes annotation name for bootstrap port (PD mode).
             Default: 'sglang.ai/bootstrap-port'
-        request_timeout_secs: Request timeout in seconds. Default: 600
+        request_timeout_secs: Total deadline for a non-streaming request, in seconds.
+            Does not apply to streaming responses. Default: 1800
+        stream_total_timeout_secs: Total deadline for a streaming request, in seconds.
+            0 means unbounded; a healthy stream is bounded by the silence timeouts
+            below instead. Default: 0
+        request_read_timeout_secs: Silence tolerated on the worker socket, in seconds,
+            including the wait for response headers. Must exceed the worst legitimate
+            time-to-first-token. 0 disables. Default: 600
+        stream_idle_timeout_secs: Silence tolerated between SSE frames once a stream
+            has started, in seconds. Must be strictly less than
+            request_read_timeout_secs. 0 disables. Default: 120
         max_concurrent_requests: Maximum number of concurrent requests allowed for rate limiting. Default: 256
         queue_size: Queue size for pending requests when max concurrent limit reached (0 = no queue, return 429 immediately). Default: 100
         queue_timeout_secs: Maximum time (in seconds) a request can wait in queue before timing out. Default: 60

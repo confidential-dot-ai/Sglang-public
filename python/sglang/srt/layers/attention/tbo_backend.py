@@ -32,6 +32,15 @@ class TboAttnBackend(AttentionBackend):
     def supports_prefill_cuda_graph_max_context_size(self) -> bool:
         return self.primary.supports_prefill_cuda_graph_max_context_size
 
+    @property
+    def supports_ragged_verify_graph(self) -> bool:
+        # Compact verify captures/replays the ordinary primary body (the
+        # runner clears TBO split/child state for this graph family). The
+        # outer dispatcher must therefore expose the primary's audited
+        # capability or runner admission would reject an otherwise-safe
+        # graph merely because eager TBO is globally enabled.
+        return bool(self.primary.supports_ragged_verify_graph)
+
     @classmethod
     def init_new(cls, creator: Callable[[], AttentionBackend]):
         return cls(
@@ -75,12 +84,30 @@ class TboAttnBackend(AttentionBackend):
             return
         if in_capture:
             return
+        if getattr(forward_batch, "tbo_split_seq_index", None) is None:
+            # Some graph families (compact ragged verify, DP SUM capture, and
+            # prefill) deliberately capture the ordinary model body while
+            # global TBO remains enabled for eager work. Their replay views
+            # must stay on the primary backend; no child pointers were baked
+            # into the graph.
+            return
         # Replay path: build_replay_fb_view returns a SimpleNamespace and
         # tbo_plugin.replay_prepare does not call prepare_raw, so split the
         # padded buffers here using the same indices the eager path would.
         self._dispatch_children_from_replay_view(forward_batch)
 
     def _dispatch_children_from_replay_view(self, fb_view) -> None:
+        # IDLE replays substitute a do-nothing batch into a captured graph
+        # (DP ranks with no work): the runner assigns spec_info.custom_mask
+        # for them (decode_cuda_graph_runner replay path), which
+        # split_spec_info's DFlash branch rejects by assertion -- and there
+        # is nothing to refresh anyway, since the body's outputs are
+        # discarded. Mirrors deepseek_v4_backend's IDLE short-circuit.
+        actual_forward_mode = getattr(
+            fb_view, "actual_forward_mode", fb_view.forward_mode
+        )
+        if actual_forward_mode is not None and actual_forward_mode.is_idle():
+            return
         bs = fb_view.batch_size
         forward_mode = fb_view.forward_mode
         spec_info = fb_view.spec_info
@@ -158,7 +185,14 @@ class TboAttnBackend(AttentionBackend):
         if not self._children_use_cuda_graph():
             return
         for item in self.children:
-            # TODO for children, maybe can provide *smaller* max_bs to optimize
+            # TODO for children, maybe can provide *smaller* max_bs to optimize.
+            # Not doing so costs each child its own full set of dense-backend
+            # static buffers (kv_indices + custom_mask; ~1.5 GB per child at a
+            # 196K context). Halving is NOT safe unconditionally: decode/
+            # verify splits are even by construction, but an eager EXTEND
+            # split at a sequence boundary can put nearly all tokens in one
+            # child, so a blanket (max+1)//2 could overflow. Needs a
+            # mode-aware bound before optimizing.
             item.init_cuda_graph_state(max_bs=max_bs, max_num_tokens=max_num_tokens)
 
     def on_after_cuda_graph_warmup(self):

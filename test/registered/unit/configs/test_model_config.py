@@ -18,6 +18,8 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.configs.qwen4_exp import Qwen4ExpTextConfig
 from sglang.srt.server_args import ServerArgs
+
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -215,3 +217,78 @@ class TestExternalModelConfig(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDraftSwaRingWindow(CustomTestCase):
+    """Resolution of the draft's KV-pool window.
+
+    Not a question about the model's attention -- the draft's math is
+    untouched. This decides only how far back the KV/hidden pool it reads is
+    allowed to reach, which is a serving trade between memory and accept
+    length.
+    """
+
+    @staticmethod
+    def _config(tmpdir, *, raw_window, parsed_window, layer_types):
+        import json
+        import os
+
+        with open(os.path.join(tmpdir, "config.json"), "w") as handle:
+            json.dump({"sliding_window": raw_window}, handle)
+        cfg = SimpleNamespace(
+            num_hidden_layers=len(layer_types),
+            layer_types=list(layer_types),
+            sliding_window=parsed_window,
+        )
+        return SimpleNamespace(
+            is_draft_model=True,
+            hf_text_config=cfg,
+            model_path=tmpdir,
+            _draft_swa_ring_window=ModelConfig._draft_swa_ring_window,
+        )
+
+    def _resolve(self, holder):
+        return ModelConfig._draft_swa_ring_window(holder)
+
+    def test_recovers_a_window_hf_nulled(self):
+        """The regression that made the flag a silent no-op.
+
+        Qwen3Config rewrites sliding_window to None whenever
+        use_sliding_window is absent. A DSpark draft that declares
+        sliding_window 1024 and six sliding_attention layers but omits that
+        key has the parsed config claim no window and the ring never
+        engaged -- with the flag on, and nothing reporting it.
+        """
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            holder = self._config(
+                tmp, raw_window=1024, parsed_window=None,
+                layer_types=["sliding_attention"] * 6,
+            )
+            with envs.SGLANG_OPT_DRAFT_SWA_RING_WINDOW.override(0):
+                self.assertEqual(self._resolve(holder), 1024)
+
+    def test_explicit_override_wins_over_the_checkpoint(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            holder = self._config(
+                tmp, raw_window=1024, parsed_window=1024,
+                layer_types=["sliding_attention"] * 6,
+            )
+            with envs.SGLANG_OPT_DRAFT_SWA_RING_WINDOW.override(512):
+                self.assertEqual(self._resolve(holder), 512)
+
+    def test_no_window_anywhere_resolves_to_zero(self):
+        """A draft that declares nothing and is given nothing keeps its full
+        pool, rather than being bounded at some invented default."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            holder = self._config(
+                tmp, raw_window=None, parsed_window=None,
+                layer_types=["full_attention"] * 6,
+            )
+            with envs.SGLANG_OPT_DRAFT_SWA_RING_WINDOW.override(0):
+                self.assertEqual(self._resolve(holder), 0)

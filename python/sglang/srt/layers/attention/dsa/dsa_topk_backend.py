@@ -268,6 +268,41 @@ class DSATopKBackend(Enum):
 
         raise RuntimeError(f"Unsupported {self = } for SGLANG_DSA_FUSE_TOPK.")
 
+    def topk_transform_with_histogram(
+        self,
+        logits: torch.Tensor,
+        histograms: torch.Tensor,
+        lengths: torch.Tensor,
+        topk: int,
+        topk_transform_method: TopkTransformMethod,
+        attn_metadata,
+        force_unfused_topk: bool = False,
+    ) -> torch.Tensor:
+        """Consume the fp16-coarse histogram emitted by paged-MQA.
+
+        This entry point is deliberately fail-closed: only the exact v2 PAGED
+        contract understands the histogram ABI. A caller that cannot meet it
+        must use :meth:`topk_transform` and materialize/mask normal logits.
+        """
+        if not (
+            envs.SGLANG_DSA_FUSE_TOPK.get()
+            and not force_unfused_topk
+            and self.should_use_topk_v2()
+            and topk_transform_method == TopkTransformMethod.PAGED
+            and 0 < topk <= 2048
+            and lengths.shape[0]
+            == logits.shape[0]
+            == histograms.shape[0]
+            == attn_metadata.real_page_table.shape[0]
+            and histograms.shape[1] == 1024
+        ):
+            raise RuntimeError(
+                "paged-MQA top-k histogram requires decode-shaped PAGED top-k v2"
+            )
+        return _topk_transform_v2_paged(
+            logits, lengths, topk, attn_metadata, histograms=histograms
+        )
+
 
 def _topk_unfused(
     score: torch.Tensor,
@@ -314,6 +349,7 @@ def _topk_transform_v2_paged(
     lengths: torch.Tensor,
     topk: int,
     attn_metadata,
+    histograms: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fused top-k + page-table transform via the DeepSeek-V4 v2 JIT kernel.
 
@@ -345,7 +381,10 @@ def _topk_transform_v2_paged(
     padded rows to 0 (see ``fused_dsa_draft_extend_metadata`` /
     ``seqlens_expand_kernel``); 0 takes the trivial all-(-1) output path.
     """
-    from sglang.kernels.ops.attention.dsv4.topk import topk_transform_paged_v2
+    from sglang.kernels.ops.attention.dsv4.topk import (
+        topk_transform_paged_v2,
+        topk_transform_paged_v2_with_histogram,
+    )
 
     num_rows = logits.shape[0]
 
@@ -376,7 +415,13 @@ def _topk_transform_v2_paged(
 
     page_size = attn_metadata.page_size
     out = logits.new_empty((num_rows, topk), dtype=torch.int32)
-    topk_transform_paged_v2(logits, lengths, page_table, out, page_size, plan)
+    if histograms is None:
+        topk_transform_paged_v2(logits, lengths, page_table, out, page_size, plan)
+    else:
+        assert histograms.dtype == torch.int32 and histograms.shape == (num_rows, 1024)
+        topk_transform_paged_v2_with_histogram(
+            logits, histograms, lengths, page_table, out, page_size, plan
+        )
     return out
 
 

@@ -22,6 +22,7 @@ tensors remain valid across replays — we don't need Python-managed bridge
 buffers to keep break-point tensors at stable addresses.
 """
 
+import logging
 import threading
 import warnings
 from contextvars import ContextVar
@@ -39,7 +40,28 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.cuda_ut
 )
 from sglang.srt.utils import get_device_module, is_hip, is_xpu
 
+
+def _is_ccd_capturing() -> bool:
+    # Lazy import: full_cuda_graph_backend's package __init__ eagerly imports
+    # breakable_cuda_graph_backend.py, which imports this module -- a
+    # module-level import here would be circular.
+    from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
+        is_ccd_capturing,
+    )
+
+    return is_ccd_capturing()
+
+
+def _ccd_conditional_decode_enabled() -> bool:
+    from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
+        SGLANG_CC_CONDITIONAL_DECODE,
+    )
+
+    return SGLANG_CC_CONDITIONAL_DECODE
+
+
 _is_xpu = is_xpu()
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "eager_on_graph",
@@ -282,6 +304,19 @@ class BreakableCUDAGraph:
         self._deduped_cuda_graph = deduped_cuda_graph
 
     def replay(self) -> None:
+        if _is_ccd_capturing():
+            import os as _os
+
+            if _os.environ.get("SGLANG_CCD_BCG_DEBUG") == "1":
+                import sys as _sys
+
+                _sys.stderr.write(
+                    f"CCD_BCG_DEBUG: replay() during CCD capture, "
+                    f"segments={len(self._segments)} deduped={self._deduped_cuda_graph is not None}\n"
+                )
+                _sys.stderr.flush()
+            self._replay_into_ccd_capture()
+            return
         stream = get_device_module().current_stream()
         token = _current_stream_var.set(stream)
         try:
@@ -291,6 +326,47 @@ class BreakableCUDAGraph:
                     self._break_fns[i]()
         finally:
             _current_stream_var.reset(token)
+
+    def _replay_into_ccd_capture(self) -> None:
+        """Embed this graph as a child node in CC conditional decode's
+        active WHILE-body capture instead of calling .replay() -- the CUDA
+        runtime rejects launching (or lazily instantiating on first replay)
+        an executable graph while already inside an active outer capture.
+        Only supports the single-segment, non-deduped case: eager
+        break_fns between segments assume a host round-trip between GPU
+        work, which has no meaning replayed as a pure-GPU child node
+        inside a WHILE loop; and a DedupedCudaGraph segment's raw graph
+        isn't retained the same way (see cuda_graph_dedup_mixin.py, which
+        instantiates eagerly via raw cudart calls, not torch.cuda.CUDAGraph)."""
+        if self._deduped_cuda_graph is not None:
+            raise RuntimeError(
+                "CC conditional decode: breakable CUDA graph dedup "
+                "(SGLANG_ENABLE_CUDA_GRAPH_DEDUP) is not supported inside a "
+                "CCD capture -- disable dedup, or exclude this shape from "
+                "CCD eligibility."
+            )
+        if len(self._segments) != 1:
+            raise RuntimeError(
+                f"CC conditional decode: breakable CUDA graph has "
+                f"{len(self._segments)} segments (eager break_fns between "
+                "them); only a single-segment graph can be embedded as a "
+                "child node inside CCD's WHILE-body capture."
+            )
+        if not _ccd_conditional_decode_enabled():
+            raise RuntimeError(
+                "CC conditional decode: this breakable CUDA graph segment "
+                "was captured without keep_graph=True (SGLANG_CC_CONDITIONAL_"
+                "DECODE was unset at capture time), so its pre-instantiation "
+                "structure wasn't retained."
+            )
+        from sglang.srt.model_executor.cc_conditional_decode import (
+            add_child_graph_node,
+        )
+
+        add_child_graph_node(
+            torch.cuda.current_stream().cuda_stream,
+            self._segments[0].raw_cuda_graph(),
+        )
 
     def _append_segment(self, graph, needs_instantiate: bool) -> None:
         if self._deduped_cuda_graph is not None:
@@ -363,7 +439,10 @@ class BreakableCUDAGraphCapture:
 
     def _begin_new_segment(self) -> None:
         graph_cls = torch.xpu.XPUGraph if _is_xpu else torch.cuda.CUDAGraph
-        # keep_graph retains the raw graph for dedup; skip it on the plain path.
+        # keep_graph retains the raw graph for dedup, or (SGLANG_CC_CONDITIONAL_
+        # DECODE) so BreakableCUDAGraph._replay_into_ccd_capture can embed it
+        # as a child node instead of calling .replay() -- same tradeoff
+        # FullCudaGraphBackend already makes for the non-breakable path.
         # Dedup is CUDA-only (it introspects the raw graph via cuda-python), so
         # XPU always takes the plain path below.
         if self.cuda_graph._deduped_cuda_graph is not None:
@@ -374,7 +453,10 @@ class BreakableCUDAGraphCapture:
                 graph = graph_cls()
                 self._current_graph_needs_instantiate = False
         else:
-            graph = graph_cls()
+            try:
+                graph = graph_cls(keep_graph=_ccd_conditional_decode_enabled())
+            except TypeError:
+                graph = graph_cls()
             self._current_graph_needs_instantiate = False
         if _is_xpu:
             # torch.xpu.XPUGraph.capture_begin takes only an optional pool.

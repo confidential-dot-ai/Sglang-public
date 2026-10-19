@@ -998,16 +998,22 @@ def apply_custom_logit_processor(
             f"Cached processor rows {rows} are stale for a batch of {batch_size}"
         )
 
-        if token_offsets is not None:
-            indices = (indices[:, None] * num_tokens_in_batch + token_offsets).flatten()
-        selected = logits.index_select(0, indices)
         custom_params = [
             sampling_batch_info.custom_params[i]
             for i in rows
             for _ in range(num_tokens_in_batch)
         ]
-        result = entry.processor(selected, custom_params)
-        logits.index_copy_(0, indices, result.to(logits.dtype))
+        # Cached host rows avoid a device synchronization for full-batch detection.
+        if len(rows) == batch_size and all(row == i for i, row in enumerate(rows)):
+            result = entry.processor(logits, custom_params)
+            if result is not logits:
+                logits.copy_(result)
+        else:
+            if token_offsets is not None:
+                indices = (indices[:, None] * num_tokens_in_batch + token_offsets).flatten()
+            selected = logits.index_select(0, indices)
+            result = entry.processor(selected, custom_params)
+            logits.index_copy_(0, indices, result.to(logits.dtype))
 
         logger.debug(
             f"Custom logit processor {entry.processor.__class__.__name__} is applied."

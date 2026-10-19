@@ -6,6 +6,11 @@ from typing import TYPE_CHECKING, Optional
 import numpy as np
 import torch
 
+try:
+    from flash_attn.cute.interface import _flash_attn_fwd as _cp_ring_attn_fwd
+except ImportError:
+    _cp_ring_attn_fwd = None
+
 from sglang.kernels.ops.attention.metadata import (
     draft_extend_set_metadata,
     normal_decode_set_metadata,

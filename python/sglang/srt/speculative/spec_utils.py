@@ -49,6 +49,9 @@ from sglang.srt.mem_cache.allocation import (
 from sglang.srt.mem_cache.allocation import (
     assign_req_to_token_pool_func as assign_req_to_token_pool_func,
 )
+from sglang.srt.mem_cache.allocation import (
+    assign_req_to_token_pool_padded_func as assign_req_to_token_pool_padded_func,
+)
 from sglang.srt.runtime_context import (
     get_exec,
     get_spec,
@@ -65,7 +68,7 @@ from sglang.srt.utils import (
     next_power_of_2,
 )
 from sglang.srt.utils.async_probe import maybe_detect_oob
-from sglang.srt.utils.common import fast_topk
+from sglang.srt.utils.common import fast_topk, is_host_pinning_effective
 from sglang.srt.utils.nvtx_utils import profile_range
 
 _is_cuda = is_cuda()
@@ -272,6 +275,37 @@ def resolve_draft_decode_window(model_runner) -> Tuple[int, int]:
             )
         return 0, 0
     return window_size, int(cfg.speculative_draft_sink_size or 0)
+
+
+def lens_to_device(*, lens: List[int], device: torch.device) -> torch.Tensor:
+    """Copy a host length list to `device` as int32 without an explicit stream sync.
+
+    `torch.tensor(lens, device=device)` stages through *pageable* host memory, so
+    PyTorch follows the H2D copy with a blocking cudaStreamSynchronize -- the host
+    then waits for every kernel already queued on the stream to drain. The payload
+    is tens of bytes; the stall is the queued backlog behind it, which is why this
+    shows up in profiles as a multi-hundred-millisecond sync on deep prefill batches
+    rather than as copy time.
+
+    Where pinning is real, it is what makes `non_blocking=True` meaningful. Pinned
+    blocks come from PyTorch's caching host allocator, which reuses them after warmup
+    and defers recycling until the recorded copy event completes, so buffer reuse
+    cannot race an in-flight DMA.
+
+    Where it is not -- under GPU confidential compute the driver backs "pinned"
+    allocations with managed memory (see `is_host_pinning_effective`) -- the advice
+    inverts, and a pinned source is the *worst* option: measured on B300 CC behind
+    0.3s of queued work, a 64-int copy blocked the host 305 ms from a pinned source
+    and 0.1 ms from a pageable one. Constructing straight onto the device blocks
+    just as long, so that is not the fallback either.
+    """
+    if is_host_pinning_effective():
+        return torch.tensor(lens, dtype=torch.int32, pin_memory=True).to(
+            device, non_blocking=True
+        )
+    # CUDA stages a pageable source before the copy call returns, so this neither
+    # waits on the queued backlog nor races the temporary's deallocation.
+    return torch.tensor(lens, dtype=torch.int32).to(device, non_blocking=True)
 
 
 def record_stream_each(tensors, stream):
@@ -1152,6 +1186,20 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
             max_speculative_num_draft_tokens(),
         )
     if batch.spec_algorithm.is_dflash_family():
+        if batch.spec_info is None:
+            # A batch can reach decode-side prepare_for_decode() with
+            # spec_info still unset the first time it becomes the running
+            # batch straight from a freshly-built prebuilt batch (PD-handoff
+            # decode.get_next_disagg_decode_batch_to_run: running_batch was
+            # empty, so the new prebuilt batch becomes running_batch directly
+            # with no merge step to inherit spec_info from). Matches the same
+            # idle-input default DFlashWorkerV2 already applies in its own
+            # decode/verify path.
+            from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+
+            batch.spec_info = DFlashDraftInputV2.create_idle_input(
+                device=batch.device
+            )
         batch.spec_info.prepare_for_decode(batch)
     elif batch.spec_algorithm.is_uno():
         from sglang.srt.speculative.uno_info import UnoDraftInput

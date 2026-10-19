@@ -477,6 +477,51 @@ class CudaGraphBufferRegistry:
                 continue
             slot.post_fill(slot.buffer, forward_batch, ctx)
 
+    def copy_from_registry(
+        self,
+        source: "CudaGraphBufferRegistry",
+        *,
+        padded_bs: int,
+        padded_num_tokens: int,
+    ) -> None:
+        """Promote padded contents from an equivalent staging registry.
+
+        GPU copies are enqueued on the caller's current stream. CPU mirrors
+        are copied synchronously because attention backends use them for host
+        launch-shape decisions. Slot specs must match; a mismatch is a startup
+        or programming error, never something to repair on the hot path.
+        """
+        gpu_dsts: List[torch.Tensor] = []
+        gpu_srcs: List[torch.Tensor] = []
+        for name, dst_slot in self._slots.items():
+            if not dst_slot.enabled or dst_slot.buffer is None:
+                continue
+            if not source.has_slot(name):
+                raise RuntimeError(f"staging registry is missing slot {name!r}")
+            src_slot = source.get_slot(name)
+            if src_slot.buffer is None:
+                raise RuntimeError(f"staging slot {name!r} has no buffer")
+            if dst_slot.axis == "bs":
+                n = padded_bs
+            elif dst_slot.axis == "tokens":
+                n = padded_num_tokens
+            else:
+                n = None
+            if dst_slot.slice_fn is not None:
+                dst = dst_slot.slice_fn(dst_slot.buffer, n)
+                src = src_slot.slice_fn(src_slot.buffer, n)
+            elif n is None:
+                dst, src = dst_slot.buffer, src_slot.buffer
+            else:
+                dst, src = dst_slot.buffer[:n], src_slot.buffer[:n]
+            if dst.device.type == "cpu":
+                dst.copy_(src)
+            else:
+                gpu_dsts.append(dst)
+                gpu_srcs.append(src)
+        if gpu_dsts:
+            _grouped_foreach_copy_(gpu_dsts, gpu_srcs)
+
     def extract_buffer(
         self,
         *,
@@ -534,6 +579,7 @@ def build_decode_registry(
     register_global_num_tokens: bool = True,
     share_pool: bool = True,
     source: Optional[Any] = None,
+    dspark_dp_verify_sum_capture_enabled: bool = False,
 ) -> CudaGraphBufferRegistry:
     """Registry mirroring the always-on (+ mamba / mrope) FB-shared decode
     buffers, with the per-slot padding policy that resets the padded tail on
@@ -696,7 +742,26 @@ def build_decode_registry(
 
         def _global_num_tokens_post_fill(buf, fb, ctx):
             # Only the gathered (DP) path writes a value; otherwise left as init.
-            if require_gathered_buffer:
+            if not require_gathered_buffer:
+                return
+            # TODO.md J14c Milestone 1: for a SUM_LEN-mode replay on the
+            # DSPARK-DP-verify-sum-capture path, the captured graph's
+            # gather/scatter kernels read real per-rank offsets via an
+            # on-device cumsum over this buffer (get_dp_local_info,
+            # dp_attention.py:349-364) -- copying the true, already-correct
+            # per-rank distribution (fb.global_num_tokens_gpu, set by
+            # ForwardBatch.prepare_mlp_sync_batch for every DP-attention
+            # extend-in-batch step) preserves that distribution instead of
+            # collapsing it to a single padded scalar. Gated on BOTH the
+            # runner-level opt-in AND this specific replay's own
+            # dp_padding_mode, so every other caller (this flag defaults
+            # False; MAX_LEN replays even when the flag is True) keeps the
+            # exact uniform-fill behavior this replaces.
+            if dspark_dp_verify_sum_capture_enabled and (
+                fb.dp_padding_mode is not None and fb.dp_padding_mode.is_sum_len()
+            ):
+                buf.copy_(fb.global_num_tokens_gpu)
+            else:
                 buf.fill_(ctx.padded_num_tokens)
 
         _global_shape = (

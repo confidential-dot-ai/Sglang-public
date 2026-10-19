@@ -413,7 +413,11 @@ class SamplingBatchInfo:
         return observer_state
 
     def filter_batch(self, keep_indices: List[int], keep_indices_device: torch.Tensor):
-        self.penalizer_orchestrator.filter(keep_indices_device)
+        # None on copy_for_forward() copies (the orchestrator is deliberately
+        # dropped there, penalties pre-accumulated into acc_scaling_penalties)
+        # -- same None-tolerance idiom as apply()'s own orchestrator check.
+        if self.penalizer_orchestrator is not None:
+            self.penalizer_orchestrator.filter(keep_indices_device)
 
         if self.has_custom_logit_processor:
             self._filter_batch_custom_logit_processor(keep_indices)
@@ -484,7 +488,16 @@ class SamplingBatchInfo:
             self.has_custom_logit_processor = False
 
     def merge_batch(self, other: SamplingBatchInfo):
-        self.penalizer_orchestrator.merge(other.penalizer_orchestrator)
+        # None on copy_for_forward() copies (the orchestrator is deliberately
+        # dropped there) -- same None-tolerance idiom as filter_batch/apply.
+        # Both sides of any legitimate merge share a lifecycle (either both
+        # scheduler-side with orchestrators, or both forward copies without),
+        # so guarding on self alone would still crash inside merge on
+        # other's None.
+        if self.penalizer_orchestrator is not None and (
+            other.penalizer_orchestrator is not None
+        ):
+            self.penalizer_orchestrator.merge(other.penalizer_orchestrator)
 
         # Merge the custom logit processors and custom params lists
         if self.has_custom_logit_processor or other.has_custom_logit_processor:

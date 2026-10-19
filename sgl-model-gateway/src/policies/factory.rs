@@ -67,6 +67,7 @@ impl PolicyFactory {
                 let config = PrefixHashConfig {
                     prefix_token_count: *prefix_token_count,
                     load_factor: *load_factor,
+                    ..PrefixHashConfig::default()
                 };
                 Arc::new(PrefixHashPolicy::new(config))
             }

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import (
@@ -26,6 +27,8 @@ from sglang.srt.managers.io_struct import (
     MMInputsProcessError,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    msgpack_decode_list,
+    msgpack_encode_list,
     sock_recv,
 )
 from sglang.srt.managers.mm_utils import (
@@ -65,6 +68,7 @@ class SchedulerRequestReceiver:
     mm_receiver: Any
     tp_group: Any
     tp_cpu_group: Any
+    tp_metadata_nccl_group: Any = None
     attn_tp_group: Any
     attn_tp_cpu_group: Any
     attn_cp_group: Any
@@ -175,6 +179,19 @@ class SchedulerRequestReceiver:
         rank 0 and would overwrite every DP group's aborts but the first.
         """
         local_reqs = local_reqs or []
+        # recv_reqs only ever holds BaseReq/BaseBatchReq msgspec Structs (see
+        # io_struct.py) -- the same objects sock_send/sock_recv already
+        # round-trip through msgpack_encode/msgpack_decode when
+        # SGLANG_USE_PICKLE_IPC is off. Reuse that codec for this hop too,
+        # since pickle.loads (not the collective itself) is the dominant
+        # per-tick cost on every non-src TP rank -- see checkpoint on
+        # broadcast_pyobj timing instrumentation.
+        codec_kwargs = (
+            {}
+            if envs.SGLANG_USE_PICKLE_IPC.get()
+            else {"encode_fn": msgpack_encode_list, "decode_fn": msgpack_decode_list}
+        )
+
         if get_parallel().enable_dp_attention:
             if get_parallel().attn_tp_rank == 0 and get_parallel().attn_cp_rank == 0:
                 work_reqs, control_reqs = self._split_work_and_control_reqs(recv_reqs)
@@ -183,7 +200,23 @@ class SchedulerRequestReceiver:
                 work_reqs = None
                 control_reqs = None
 
-            work_reqs = attn_cp_tp_broadcast_pyobj(work_reqs)
+            if get_parallel().attn_tp_size != 1:
+                work_reqs = broadcast_pyobj(
+                    work_reqs,
+                    self.attn_tp_group.rank,
+                    self.attn_tp_cpu_group,
+                    src=self.attn_tp_group.ranks[0],
+                    **codec_kwargs,
+                )
+
+            if get_parallel().attn_cp_size != 1:
+                work_reqs = broadcast_pyobj(
+                    work_reqs,
+                    self.attn_cp_group.rank,
+                    self.attn_cp_cpu_group,
+                    src=self.attn_cp_group.ranks[0],
+                    **codec_kwargs,
+                )
 
             # When dp_attention_local_control_broadcast is enabled, each DP
             # group leader already receives control messages from the DP
@@ -202,18 +235,39 @@ class SchedulerRequestReceiver:
                     self.tp_group.rank,
                     self.tp_cpu_group,
                     src=self.tp_group.ranks[0],
+                    **codec_kwargs,
                 )
             recv_reqs = work_reqs + control_reqs
         else:
             if recv_reqs is not None:
                 recv_reqs = [*recv_reqs, *local_reqs]
             if get_parallel().tp_size != 1:
-                recv_reqs = broadcast_pyobj(
-                    recv_reqs,
-                    self.tp_group.rank,
-                    self.tp_cpu_group,
-                    src=self.tp_group.ranks[0],
-                )
+                # gloo-vs-nccl-broadcast-bench.py measured ~9x lower per-call
+                # latency for NCCL vs gloo at these message sizes (checkpoint
+                # 098's recv_requests hot path). Falls back to the gloo group
+                # if the dedicated NCCL group wasn't created (e.g. world_size==1
+                # at init, or an older scheduler that hasn't set it up).
+                # Benchmark-only escape hatch (gloo-vs-nccl-broadcast-bench.py
+                # A/B validation) — not meant to stay long-term, just avoids
+                # needing two separate tree states to compare.
+                force_gloo = os.environ.get("SGLANG_FORCE_GLOO_METADATA_BROADCAST")
+                if self.tp_metadata_nccl_group is not None and not force_gloo:
+                    recv_reqs = broadcast_pyobj(
+                        recv_reqs,
+                        self.tp_group.rank,
+                        self.tp_metadata_nccl_group,
+                        src=self.tp_group.ranks[0],
+                        force_cpu_device=False,
+                        **codec_kwargs,
+                    )
+                else:
+                    recv_reqs = broadcast_pyobj(
+                        recv_reqs,
+                        self.tp_group.rank,
+                        self.tp_cpu_group,
+                        src=self.tp_group.ranks[0],
+                        **codec_kwargs,
+                    )
         return recv_reqs
 
     def unwrap_pickle_wrapper(self, recv_reqs: Optional[List]) -> None:

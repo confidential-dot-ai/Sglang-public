@@ -4,13 +4,16 @@
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use axum::response::{IntoResponse, Response};
+use axum::{
+    body::Bytes,
+    response::{IntoResponse, Response},
+};
 use futures::{
     future,
     stream::{self, StreamExt},
 };
 use http::StatusCode;
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::{
     sync::{watch, Mutex},
     task::JoinHandle,
@@ -24,6 +27,14 @@ use crate::{
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+// start_profile/stop_profile can legitimately take a while (stop_profile
+// exports trace data) -- this project has hit a documented stop_profile
+// hang under CUDA-activity export specifically, worked around upstream by
+// using CPU-only profiling activities; a short timeout here would just
+// turn that into a confusing router-side timeout instead of a real answer.
+// 300s matches the timeout this project's own benchmark tooling already
+// uses for the same call.
+const PROFILE_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_CONCURRENT: usize = 32;
 
 /// Result of a fan-out request to a single worker
@@ -65,6 +76,80 @@ async fn fan_out(
         .buffer_unordered(MAX_CONCURRENT)
         .collect()
         .await
+}
+
+/// Fan out requests to workers in parallel, forwarding a JSON body verbatim
+/// and using an explicit (caller-chosen) timeout instead of REQUEST_TIMEOUT
+/// -- used for /start_profile and /stop_profile, which need a much longer
+/// timeout than the quick admin calls fan_out() serves.
+async fn fan_out_with_body(
+    workers: &[Arc<dyn Worker>],
+    client: &reqwest::Client,
+    endpoint: &str,
+    method: reqwest::Method,
+    body: Bytes,
+    timeout: Duration,
+) -> Vec<WorkerResponse> {
+    let futures: Vec<_> = workers
+        .iter()
+        .map(|worker| {
+            let client = client.clone();
+            let url = worker.url().to_string();
+            let full_url = format!("{}/{}", url, endpoint);
+            let api_key = worker.api_key().clone();
+            let method = method.clone();
+            let body = body.clone();
+
+            async move {
+                let mut req = client
+                    .request(method, &full_url)
+                    .timeout(timeout)
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(body);
+                if let Some(key) = api_key {
+                    req = req.bearer_auth(key);
+                }
+                WorkerResponse {
+                    url,
+                    result: req.send().await,
+                }
+            }
+        })
+        .collect();
+
+    stream::iter(futures)
+        .buffer_unordered(MAX_CONCURRENT)
+        .collect()
+        .await
+}
+
+/// Result of broadcasting /start_profile or /stop_profile to every worker.
+pub struct ProfileFanOutResult {
+    pub successful: Vec<String>,
+    pub failed: Vec<(String, String)>,
+    pub total_workers: usize,
+    pub http_workers: usize,
+    pub message: String,
+}
+
+impl IntoResponse for ProfileFanOutResult {
+    fn into_response(self) -> Response {
+        let status = if self.failed.is_empty() {
+            StatusCode::OK
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        let body = json!({
+            "message": self.message,
+            "successful": self.successful,
+            "failed": self.failed.into_iter()
+                .map(|(url, error)| json!({"url": url, "error": error}))
+                .collect::<Vec<_>>(),
+            "total_workers": self.total_workers,
+            "http_workers": self.http_workers,
+        });
+        (status, axum::Json(body)).into_response()
+    }
 }
 
 pub enum EngineMetricsResult {
@@ -149,6 +234,110 @@ impl WorkerManager {
         info!("{}", message);
 
         FlushCacheResult {
+            successful,
+            failed,
+            total_workers,
+            http_workers: http_workers.len(),
+            message,
+        }
+    }
+
+    /// Broadcast /start_profile to every HTTP worker, forwarding the
+    /// client's raw JSON body verbatim (activities/output_dir/num_steps/
+    /// etc.) -- sglang's own Python server already validates and consumes
+    /// that body shape, so the router does not need to parse it, only
+    /// relay it. Prior to this, PD-mode profiling
+    /// (bench_serving's --profile-prefill-url/--profile-decode-url) sent
+    /// this request to the router expecting it to fan out to the
+    /// underlying prefill/decode engines, but the router had no handler
+    /// for it at all -- the request silently landed nowhere.
+    pub async fn start_profile_all(
+        worker_registry: &WorkerRegistry,
+        client: &reqwest::Client,
+        body: Bytes,
+    ) -> ProfileFanOutResult {
+        Self::profile_fan_out(worker_registry, client, "start_profile", body).await
+    }
+
+    /// Broadcast /stop_profile to every HTTP worker. See start_profile_all.
+    pub async fn stop_profile_all(
+        worker_registry: &WorkerRegistry,
+        client: &reqwest::Client,
+        body: Bytes,
+    ) -> ProfileFanOutResult {
+        Self::profile_fan_out(worker_registry, client, "stop_profile", body).await
+    }
+
+    async fn profile_fan_out(
+        worker_registry: &WorkerRegistry,
+        client: &reqwest::Client,
+        endpoint: &str,
+        body: Bytes,
+    ) -> ProfileFanOutResult {
+        let workers = worker_registry.get_all();
+        let total_workers = workers.len();
+
+        let http_workers: Vec<_> = workers
+            .into_iter()
+            .filter(|w| matches!(w.connection_mode(), ConnectionMode::Http))
+            .collect();
+
+        if http_workers.is_empty() {
+            return ProfileFanOutResult {
+                successful: vec![],
+                failed: vec![],
+                total_workers,
+                http_workers: 0,
+                message: format!("No HTTP workers available for {endpoint}"),
+            };
+        }
+
+        info!(
+            "Broadcasting {} to {} HTTP workers (out of {} total)",
+            endpoint,
+            http_workers.len(),
+            total_workers
+        );
+
+        let responses = fan_out_with_body(
+            &http_workers,
+            client,
+            endpoint,
+            reqwest::Method::POST,
+            body,
+            PROFILE_REQUEST_TIMEOUT,
+        )
+        .await;
+
+        let mut successful = Vec::new();
+        let mut failed = Vec::new();
+
+        for resp in responses {
+            match resp.result {
+                Ok(r) if r.status().is_success() => successful.push(resp.url),
+                Ok(r) => failed.push((resp.url, format!("HTTP {}", r.status()))),
+                Err(e) => failed.push((resp.url, e.to_string())),
+            }
+        }
+
+        let message = if failed.is_empty() {
+            format!(
+                "{}: succeeded on all {} HTTP workers",
+                endpoint,
+                successful.len()
+            )
+        } else {
+            format!(
+                "{}: {} succeeded, {} failed",
+                endpoint,
+                successful.len(),
+                failed.len()
+            )
+        };
+
+        info!("{}", message);
+
+        ProfileFanOutResult {
             successful,
             failed,
             total_workers,

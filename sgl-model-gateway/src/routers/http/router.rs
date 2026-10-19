@@ -15,11 +15,12 @@ use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
     core::{
-        is_retryable_status, AttachedBody, ConnectionMode, RetryExecutor, Worker, WorkerLoadGuard,
-        WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID,
+        deadlines, is_retryable_status, AttachedBody, ConnectionMode, RetryExecutor, Worker,
+        WorkerLoadGuard, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID,
     },
     observability::{
         events::{self, Event},
+        inference_metrics,
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
@@ -38,7 +39,7 @@ use crate::{
         error::{self, extract_error_code_from_response},
         grpc::utils::{error_type_from_status, route_to_endpoint},
         header_utils,
-        streaming_utils::BreakerTrackedStream,
+        streaming_utils::guarded_tracked_stream,
         RouterTrait,
     },
 };
@@ -52,6 +53,15 @@ pub struct Router {
     enable_igw: bool,
     retry_config: RetryConfig,
 }
+
+/// Exception text raised by the multimodal preprocessing OOM guard.
+///
+/// Kept in one place because it is load-bearing: the guard raises a plain
+/// RuntimeError, which FastAPI renders as a 500, and this is the only signal
+/// that distinguishes "the GPU was momentarily full" from a genuine fault.
+/// If the Python side changes this string, change it here too.
+const IMAGE_PREPROCESS_OOM_MARKER: &[u8] =
+    b"not enough device memory to preprocess the images in this request";
 
 impl std::fmt::Debug for Router {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -308,7 +318,19 @@ impl Router {
         let headers = Some(&headers_with_trace);
 
         let response = self
-            .send_typed_request(headers, typed_req, route, &worker, is_stream, load_guard)
+            .send_typed_request(
+                headers,
+                typed_req,
+                route,
+                &worker,
+                is_stream,
+                load_guard,
+                // Label value, so it must be a bounded string; requests that
+                // reach here without a resolved model are grouped under the
+                // shared sentinel rather than dropped, so their tokens still
+                // show up in the distributions.
+                model_id.unwrap_or(UNKNOWN_MODEL_ID),
+            )
             .await;
 
         events::RequestReceivedEvent {}.emit();
@@ -492,9 +514,14 @@ impl Router {
         worker: &Arc<dyn Worker>,
         is_stream: bool,
         load_guard: Option<WorkerLoadGuard>,
+        model_id: &str,
     ) -> Response {
         let worker_url = worker.url();
         let api_key = worker.api_key().clone();
+
+        // Anchor for TTFT. Taken before the upstream request is built so the
+        // measurement spans prefill; see StreamObserver::new.
+        let dispatch_start = Instant::now();
 
         // Static key string to avoid per-request allocations
         const DP_RANK_KEY: &str = "data_parallel_rank";
@@ -563,6 +590,12 @@ impl Router {
             }
         }
 
+        // Streaming responses must not inherit the non-streaming total
+        // deadline, which would cancel a long generation mid-stream.
+        if is_stream {
+            request_builder = deadlines::apply_stream_deadline(request_builder);
+        }
+
         let res = match request_builder.send().await {
             Ok(res) => res,
             Err(e) => {
@@ -593,10 +626,50 @@ impl Router {
 
         if !is_stream {
             // For non-streaming requests, preserve headers
-            let response_headers = header_utils::preserve_response_headers(res.headers());
+            let mut response_headers = header_utils::preserve_response_headers(res.headers());
 
             let response = match res.bytes().await {
                 Ok(body) => {
+                    // The body is already buffered and about to be forwarded;
+                    // observing it costs one serde pass over bytes that are
+                    // already resident, and never copies or blocks.
+                    inference_metrics::observe_non_streaming(model_id, status.is_success(), &body);
+                    // Without this every worker-side rejection records an empty
+                    // error_code and the whole class is indistinguishable.
+                    if !status.is_success()
+                        && !response_headers.contains_key(error::HEADER_X_SMG_ERROR_CODE)
+                    {
+                        let code = error::upstream_error_code(&body, status);
+                        if let Ok(value) = HeaderValue::from_str(&code) {
+                            response_headers.insert(error::HEADER_X_SMG_ERROR_CODE, value);
+                        }
+                    }
+                    // A vision-path out-of-memory is a capacity condition, not a
+                    // server fault, but the worker can only report it as a 500:
+                    // the exception surfaces through FastAPI's generic handler and
+                    // there is no route for it to say "try again later". Translate
+                    // it here, where 429 and Retry-After already live -- the image
+                    // ceilings emit exactly that for the same underlying condition,
+                    // and the provider spec requires a refused request to be a 429
+                    // so the client backs off instead of reading it as a defect.
+                    //
+                    // Matched on our own exception text from the multimodal
+                    // preprocessing guard, not on arbitrary CUDA output.
+                    let mut status = status;
+                    if status == StatusCode::INTERNAL_SERVER_ERROR
+                        && body
+                            .windows(IMAGE_PREPROCESS_OOM_MARKER.len())
+                            .any(|w| w == IMAGE_PREPROCESS_OOM_MARKER)
+                    {
+                        status = StatusCode::TOO_MANY_REQUESTS;
+                        response_headers.insert(
+                            axum::http::header::RETRY_AFTER,
+                            HeaderValue::from_static("5"),
+                        );
+                        tracing::warn!(
+                            "worker reported an image-preprocessing OOM; returning 429 so the client retries rather than reading it as a server fault"
+                        );
+                    }
                     let mut response = Response::new(Body::from(body));
                     *response.status_mut() = status;
                     *response.headers_mut() = response_headers;
@@ -627,11 +700,20 @@ impl Router {
             // stream cleanly to `None` and Drop would record a spurious
             // success (and the streaming branch also skips the eager
             // `record_outcome` above).
-            let mut tracked = BreakerTrackedStream::new(
-                res.bytes_stream(),
-                worker.clone(),
-                worker_url.to_string(),
-            );
+            // Observe chunks as they pass through, without buffering the
+            // response. `inspect` takes an FnMut, so the observer is owned by
+            // the closure; when the stream is dropped -- clean end, mid-stream
+            // error, or client disconnect -- the closure drops with it and
+            // StreamObserver::drop finalises the per-response histograms. That
+            // is why no explicit completion callback is needed here.
+            let mut observer = inference_metrics::StreamObserver::new(model_id, dispatch_start);
+            let observed = res.bytes_stream().inspect(move |item| {
+                if let Ok(chunk) = item {
+                    observer.on_chunk(chunk);
+                }
+            });
+            let mut tracked =
+                guarded_tracked_stream(observed, worker.clone(), worker_url.to_string());
             if !status.is_success() {
                 tracked.mark_errored();
             }

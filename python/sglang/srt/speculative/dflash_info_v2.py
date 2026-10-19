@@ -1,6 +1,7 @@
 """DFLASH spec-v2 overlap scheduling data structures."""
 
 import contextlib
+import os
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -68,11 +69,27 @@ class DFlashDraftInputV2(SpecInput):
     ) -> None:
         pin_memory = is_pin_memory_available(device)
 
+        # Resolve to the concrete per-rank device (e.g. "cuda:2") before
+        # comparing against buf.device (task #142): torch.empty(...,
+        # device="cuda") lands on whatever this process's current CUDA
+        # device is and reports that concrete device on the resulting
+        # tensor, but the unresolved string "cuda" never equals "cuda:N" --
+        # so comparing str(buf.device) against the caller's raw (often
+        # unindexed) `device` arg was true on literally every call
+        # regardless of real growth need, doubling capacity every single
+        # prepare_for_decode() tick forever. Confirmed live: bs stayed
+        # single digits/teens for the whole run while capacity still
+        # doubled 32 -> 64 -> ... -> 4294967296, OOMing on the next
+        # doubling's 18.25 GiB int32 allocation.
+        resolved_device = torch.device(device)
+        if resolved_device.type == "cuda" and resolved_device.index is None:
+            resolved_device = torch.device("cuda", torch.cuda.current_device())
+
         def needs_cpu_alloc(buf: Optional[torch.Tensor]) -> bool:
             return buf is None or buf.numel() < bs
 
         def needs_gpu_alloc(buf: Optional[torch.Tensor]) -> bool:
-            return buf is None or buf.numel() < bs or str(buf.device) != str(device)
+            return buf is None or buf.numel() < bs or buf.device != resolved_device
 
         def grown_capacity(buf: Optional[torch.Tensor]) -> int:
             current = 0 if buf is None else int(buf.numel())
@@ -94,6 +111,17 @@ class DFlashDraftInputV2(SpecInput):
 
         if needs_gpu_alloc(self._prepare_cur_kv_lens_gpu_buf):
             capacity = grown_capacity(self._prepare_cur_kv_lens_gpu_buf)
+            if os.environ.get("SGLANG_PREPARE_BUF_DEBUG") == "1":
+                _old = self._prepare_cur_kv_lens_gpu_buf
+                import sys as _sys_pbdbg
+
+                _sys_pbdbg.stderr.write(
+                    f"PREPARE_BUF_DEBUG: bs={bs} device={device!r} "
+                    f"old_numel={None if _old is None else _old.numel()} "
+                    f"old_device={None if _old is None else str(_old.device)!r} "
+                    f"new_capacity={capacity}\n"
+                )
+                _sys_pbdbg.stderr.flush()
             self._prepare_cur_kv_lens_gpu_buf = torch.empty(
                 (capacity,), dtype=torch.int32, device=device
             )
@@ -111,7 +139,7 @@ class DFlashDraftInputV2(SpecInput):
             hidden_states=torch.empty((0, 0), device=device, dtype=torch.float16),
         )
 
-    def prepare_for_decode(self, batch: ScheduleBatch):
+    def prepare_for_decode(self, batch: ScheduleBatch, num_blocks: int = 1):
         """Allocate headroom in the shared req_to_token pool for the next DFLASH step.
 
         DFLASH spec-v2 uses overlap scheduling's "over-allocation" approach: we reserve
@@ -119,6 +147,13 @@ class DFlashDraftInputV2(SpecInput):
         from `req_to_token` without allocator backup/restore. CPU metadata intentionally
         lags by one iteration; keep it separate from the reserved upper bound that backs
         the overallocated mapping.
+
+        num_blocks: how many verify blocks ahead to reserve, plus the usual
+        one-block safety margin (so num_blocks=1, the default, reproduces
+        today's `committed_len + 2 * block_size` exactly). CC conditional
+        decode passes chunk_cap here to reserve a whole chunk's worth of KV
+        slots in this one host-side call, since the chunk's captured WHILE
+        loop can't allocate more mid-chunk.
         """
         plan_stream, plan_stream_ctx = _get_overlap_plan_stream(batch.device)
 
@@ -144,7 +179,7 @@ class DFlashDraftInputV2(SpecInput):
             raise ValueError(
                 f"DFLASH invalid speculative_num_draft_tokens={block_size}."
             )
-        reserve = 2 * block_size
+        reserve = (num_blocks + 1) * block_size
         page_size = batch.token_to_kv_pool_allocator.page_size
 
         cur_kv_lens, nxt_kv_lens, num_needed_tokens = page_aligned_decode_alloc_lens(
@@ -232,7 +267,34 @@ class DFlashDraftInputV2(SpecInput):
             self.nxt_kv_lens_sum = int(self.nxt_kv_lens_cpu.sum().item())
 
         if self.future_indices is not None:
+            prev_bs = int(self.future_indices.shape[0])
             self.future_indices = self.future_indices[new_indices]
+            # The Eagle-shaped fields below are documented as "unused" on the
+            # FutureMap relay path -- true for DFLASH, which resolves them out
+            # of the future map. DSPARK does NOT: dspark_worker_v2's
+            # _forward_decode reads draft_input.bonus_tokens directly
+            # (draft_block_ids[:, 0].copy_(bonus_tokens.view(-1))). Returning
+            # here without filtering them left every one at the PRE-filter
+            # width, so any row-filtering of a DSpark batch desynced them from
+            # batch.reqs. CCD's split path (try_split_ccd_batch) is what makes
+            # this reachable in practice -- it filter_batch()es the batch into
+            # eligible/ineligible halves mid-tick, and the next decode tick
+            # crashed with e.g. "size of tensor a (4) must match tensor b (67)".
+            #
+            # Filter by matching first-dim only: these are legitimately
+            # zero-width placeholders on some construction paths (see
+            # DFlashDraftInputV2 construction with torch.empty((0,))), and
+            # indexing those would raise instead of no-op.
+            for _name in (
+                "topk_p",
+                "topk_index",
+                "bonus_tokens",
+                "new_seq_lens",
+                "hidden_states",
+            ):
+                _t = getattr(self, _name, None)
+                if _t is not None and _t.dim() > 0 and _t.shape[0] == prev_bs:
+                    setattr(self, _name, _t[new_indices])
             return
 
         self.topk_p = self.topk_p[new_indices]

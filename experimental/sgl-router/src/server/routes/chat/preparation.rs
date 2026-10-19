@@ -521,6 +521,78 @@ fn build_outgoing_body(
     Ok(Bytes::from(bytes))
 }
 
+const TOKENIZATION_NEUTRAL_FIELDS: &[&str] = &[
+    // Value-checked separately; listed so presence alone does not block.
+    "messages",
+    "tools",
+    "functions",
+    "tool_choice",
+    "parallel_tool_calls",
+    "continue_final_message",
+    // Identity and transport.
+    "model",
+    "stream",
+    "stream_options",
+    "user",
+    "rid",
+    "priority",
+    "cache_salt",
+    "extra_key",
+    // Sampling.
+    "temperature",
+    "top_p",
+    "top_k",
+    "min_p",
+    "n",
+    "seed",
+    "frequency_penalty",
+    "presence_penalty",
+    "repetition_penalty",
+    "logit_bias",
+    "custom_logit_processor",
+    "custom_params",
+    "thinking_bias_rate",
+    "thinking_bias_threshold",
+    "thinking_bias_max",
+    // Output length and stopping.
+    "max_tokens",
+    "max_completion_tokens",
+    "min_tokens",
+    "stop",
+    "stop_token_ids",
+    "stop_regex",
+    "no_stop_trim",
+    "ignore_eos",
+    // Output shaping and reporting. These constrain or annotate what comes
+    // back; none of them re-render the prompt.
+    "response_format",
+    "regex",
+    "ebnf",
+    "logprobs",
+    "top_logprobs",
+    "skip_special_tokens",
+    "separate_reasoning",
+    "stream_reasoning",
+    "reasoning_split",
+    "return_hidden_states",
+    "return_routed_experts",
+    "routed_experts_start_len",
+    "return_cached_tokens_details",
+    "return_spec_tokens_details",
+    "return_prompt_token_ids",
+    "return_token_ids",
+    "return_meta_info",
+    "return_sampling_mask",
+    // Placement and disaggregation.
+    "bootstrap_host",
+    "bootstrap_port",
+    "bootstrap_room",
+    "routed_dp_rank",
+    "disagg_prefill_dp_rank",
+    "data_parallel_rank",
+];
+
+
 /// Forward generated IDs only for request shapes verified against the engine.
 /// The engine uses `input_ids` verbatim, bypassing its chat-template processing.
 ///
@@ -546,15 +618,28 @@ fn can_forward_chat_tokens(value: &Value) -> bool {
     {
         return false;
     }
-    // Request controls whose rendering has not been verified against the engine.
-    for key in [
-        "chat_template",
-        "chat_template_kwargs",
-        "reasoning",
-        "reasoning_effort",
-        "task",
-    ] {
-        if value.get(key).is_some_and(|v| !v.is_null()) {
+    // Allowlist, not denylist. A denylist is fail-OPEN: a request field the
+    // router has never heard of looks plain, so the offload fires and the
+    // engine runs the router's ids -- silently serving a different prompt than
+    // the request asked for, with a 200 and plausible output. That is how M3's
+    // `thinking` was ignored. Unknown field -> withhold the offload; the engine
+    // tokenizes from `messages`, which is always correct and merely slower.
+    let Some(obj) = value.as_object() else {
+        return false;
+    };
+    for (key, field) in obj {
+        // Absent == null == default, matching the engine's own treatment.
+        if field.is_null() {
+            continue;
+        }
+        if !TOKENIZATION_NEUTRAL_FIELDS.contains(&key.as_str()) {
+            tracing::debug!(
+                field = %key,
+                "withholding ingress input_ids offload: request field is not \
+                 known to be tokenization-neutral; engine will tokenize from \
+                 messages. Classify it in TOKENIZATION_NEUTRAL_FIELDS if it \
+                 does not affect template rendering."
+            );
             return false;
         }
     }
@@ -985,6 +1070,7 @@ mod tests {
             json!({"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high"}),
             json!({"messages":[{"role":"user","content":"hi"}],"reasoning":{"enabled":true}}),
             json!({"messages":[{"role":"user","content":"hi"}],"task":"generate"}),
+            json!({"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"disabled"}}),
             json!({"messages":[{"role":"user","content":"hi"}],"continue_final_message":true}),
             json!({"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"partial"}]}),
         ];
@@ -997,6 +1083,31 @@ mod tests {
     }
 
     #[test]
+    fn can_forward_chat_tokens_blocks_unknown_fields() {
+        assert!(!can_forward_chat_tokens(&serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "some_future_template_knob": {"type": "disabled"}
+        })));
+    }
+
+    #[test]
+    fn can_forward_chat_tokens_allows_ordinary_sampling_fields() {
+        assert!(can_forward_chat_tokens(&serde_json::json!({
+            "model": "m3",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true,
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "max_tokens": 128,
+            "stop": ["\n"],
+            "seed": 1,
+            "response_format": {"type": "json_object"},
+            "separate_reasoning": true,
+            "user": "u1"
+        })));
+    }
+
+    #[test]
     fn can_forward_chat_tokens_ignores_null_and_false_fields() {
         assert!(can_forward_chat_tokens(&json!({
             "messages": [{"role": "user", "content": "hi"}],
@@ -1004,6 +1115,7 @@ mod tests {
             "chat_template": null,
             "reasoning_effort": null,
             "chat_template_kwargs": null,
+            "thinking": null,
             "continue_final_message": false
         })));
     }

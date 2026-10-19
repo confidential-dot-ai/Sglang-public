@@ -1,4 +1,4 @@
-"""Unified radix tree backed by the LMCache multiprocess service.
+"""Unified radix tree backed by LMCache in-process or multiprocess storage.
 
 LMCache owns external storage; retrieved KV is published after reaching GPU.
 """
@@ -11,14 +11,6 @@ from array import array
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
-from lmcache.integration.sglang.lmcache_mp_metadata import (
-    LMCacheExternalFlow,
-    LMCachePendingStore,
-)
-from lmcache.integration.sglang.unified_lmcache_mp_connector import (
-    UnifiedLMCacheMPConnector,
-)
-
 from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
     UnifiedSWAAllocatorBase,
 )
@@ -31,6 +23,10 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.storage.lmcache.metadata import (
+    LMCacheExternalFlow,
+    LMCachePendingStore,
+)
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import NodeId, UnifiedRadixCache
 
@@ -43,7 +39,7 @@ logger = logging.getLogger(__name__)
 
 
 class LMCacheUnifiedRadixCache(UnifiedRadixCache):
-    """Unified radix tree with device-direct LMCache MP KV/state I/O."""
+    """Unified radix tree with LMCache KV/state I/O."""
 
     def __init__(
         self,
@@ -55,11 +51,40 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         lmcache_config_file: Optional[str],
         forward_stream: Any,
     ) -> None:
+        from sglang.srt.mem_cache.storage.lmcache import resolve_connector_mode
+        from sglang.srt.runtime_context import get_memory
+
+        memory = get_memory()
+        mode = resolve_connector_mode(
+            memory.lmcache_mode, memory.lmcache_host_memory_backend
+        )
+        self._in_process_lmcache = mode == "ip"
+        connector_options = {}
+        if self._in_process_lmcache:
+            if params.attn_cp_size != 1 or params.mtp_draft_device_pools:
+                raise ValueError(
+                    "In-process LMCache does not support context parallelism "
+                    "or auxiliary draft KV pools."
+                )
+            from sglang.srt.mem_cache.storage.lmcache.in_process_connector import (
+                UnifiedLMCacheIPConnector,
+            )
+
+            connector_class = UnifiedLMCacheIPConnector
+            connector_options["host_memory_backend"] = (
+                memory.lmcache_host_memory_backend
+            )
+        else:
+            from lmcache.integration.sglang.unified_lmcache_mp_connector import (
+                UnifiedLMCacheMPConnector,
+            )
+
+            connector_class = UnifiedLMCacheMPConnector
         # The parent constructor calls reset() before the connector exists.
-        self.lmcache_connector: Optional[UnifiedLMCacheMPConnector] = None
+        self.lmcache_connector = None
         super().__init__(params)
         self._mamba_component = self._find_mamba_component()
-        self.lmcache_connector = UnifiedLMCacheMPConnector(
+        self.lmcache_connector = connector_class(
             config_file=lmcache_config_file,
             model_config=model_config,
             tp_size=tp_size,
@@ -74,6 +99,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             tree_components=self.tree_components,
             mamba_component=self._mamba_component,
             sliding_window_size=self._sliding_window_size,
+            **connector_options,
         )
         self._external_flows: dict[str, LMCacheExternalFlow] = {}
         self._forward_stream = forward_stream
@@ -225,6 +251,15 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             )
             total_hit = min(total_hit, len(flow.key))
             local_hit_tokens = int(local_hit.item())
+            if self._in_process_lmcache and total_hit > local_hit_tokens:
+                # The public IP connector transfers whole chunks. Reload a
+                # partial local chunk into private slots; normal shadow-slot
+                # retirement releases any overlap with the existing tree.
+                local_hit_tokens = (
+                    local_hit_tokens
+                    // self.lmcache_connector.chunk_size
+                    * self.lmcache_connector.chunk_size
+                )
             release_end = min(
                 total_hit,
                 local_hit_tokens
@@ -638,9 +673,9 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         return device_indices[flow.loaded_skip_tokens :]
 
     def _release_flow_anchor(self, flow: LMCacheExternalFlow) -> None:
-        assert (flow.anchor_node is None) == (flow.anchor_lock is None), (
-            "LMCache flow anchor node and lock must be set together"
-        )
+        assert (flow.anchor_node is None) == (
+            flow.anchor_lock is None
+        ), "LMCache flow anchor node and lock must be set together"
         if flow.anchor_node is not None:
             assert flow.anchor_lock is not None
             self.dec_lock_ref(flow.anchor_node, flow.anchor_lock)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Optional
 
 import msgspec
@@ -26,8 +27,10 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     build_unified_commit_inject_layout,
     scatter_compact_to_strided_into,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.overlap_utils import consume_deferred_seq_lens_cpu
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -54,6 +57,26 @@ _is_npu = is_npu()
 # Draft proposal probs feeding rejection sampling; the data layer is the
 # in-kernel NaN-q guard in reject_sampling.py, so this is signal-only.
 _VERIFY_DRAFT_PROBS = Invariant("dspark.verify.draft_probs", Bucket.GUARD, NotNaN())
+
+
+def _idle_ragged_seq_lens_cpu(
+    layout: RaggedVerifyLayout,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return committed and effective CPU K lengths for idle participation."""
+    num_slots = int(layout.verify_lens.numel())
+    committed = torch.ones((num_slots,), dtype=torch.int64)
+    verify_lens_cpu = (
+        layout.verify_lens_cpu
+        if layout.verify_lens_cpu is not None
+        else layout.verify_lens.cpu().tolist()
+    )
+    verify_lens = torch.tensor(verify_lens_cpu, dtype=committed.dtype)
+    if verify_lens.numel() != num_slots:
+        raise RuntimeError(
+            "idle ragged verify layout length mismatch: "
+            f"{verify_lens.numel()} CPU widths for {num_slots} device slots"
+        )
+    return committed, committed + verify_lens
 
 
 def verify_logits_adjustments_are_noop(sampling_info) -> bool:
@@ -228,6 +251,7 @@ class TargetVerifyExecutor:
         *,
         batch: ScheduleBatch,
         idle_layout: Optional[RaggedVerifyLayout],
+        force_eager_decode: bool = False,
     ) -> None:
         """Run a dummy target-verify forward so an idle DP rank joins the
         token-keyed collective ops of the busy ranks' verify step."""
@@ -249,9 +273,13 @@ class TargetVerifyExecutor:
             capture_hidden_mode=CaptureHiddenMode.FULL,
             ragged_verify_layout=idle_layout,
         )
+        # Marks every row as padding so KV-write prep can skip the
+        # device-to-host plan resolution entirely (see SpecInput).
+        verify_input.is_idle_participation = True
         batch.out_cache_loc = torch.zeros(
             (num_dummy_tokens,), dtype=torch.int64, device=device
         )
+        live_seq_lens_cpu = batch.seq_lens_cpu
         if idle_layout is not None:
             num_dummy_slots = int(idle_layout.verify_lens.numel())
             batch.seq_lens = torch.ones(
@@ -260,12 +288,19 @@ class TargetVerifyExecutor:
             batch.req_pool_indices = torch.zeros(
                 (num_dummy_slots,), dtype=torch.int64, device=device
             )
-            batch.seq_lens_cpu = torch.ones((num_dummy_slots,), dtype=torch.int64)
-            batch.seq_lens_sum = num_dummy_slots
+            # Keep the device lengths as committed one-token dummy prefixes,
+            # but expose effective prefix+verify K lengths to CUDA-graph
+            # admission and sequence-tier selection. Busy compact verify does
+            # this in _run_ragged; idle DP participation must obey the same
+            # contract or a small first tier can under-cover the verify K span.
+            live_seq_lens_cpu, batch.seq_lens_cpu = _idle_ragged_seq_lens_cpu(
+                idle_layout
+            )
+            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
             batch.forward_mode = ForwardMode.TARGET_VERIFY
-        verify_input.live_seq_lens_cpu = batch.seq_lens_cpu
+        verify_input.live_seq_lens_cpu = live_seq_lens_cpu
         verify_forward_batch, _ = verify_input.prepare_for_verify(
-            batch, self.target_worker
+            batch, self.target_worker, force_eager_decode=force_eager_decode
         )
         self.target_worker.forward_batch_generation(
             batch=None,
@@ -282,6 +317,7 @@ class TargetVerifyExecutor:
         verify_ids_2d: torch.Tensor,
         verify_window: VerifyWindow,
         sampling_info,
+        force_eager_decode: bool = False,
     ) -> TargetVerifyResult:
         verify_w = self.verify_num_draft_tokens
         positions_2d = verify_window.positions_2d
@@ -296,6 +332,7 @@ class TargetVerifyExecutor:
             live_seq_lens_cpu=batch.seq_lens_cpu,
         )
         batch.out_cache_loc = verify_cache_loc
+        consume_deferred_seq_lens_cpu(batch)
         seq_lens_cpu_backup = batch.seq_lens_cpu
         seq_lens_sum_backup = batch.seq_lens_sum
         if not self._verify_backend_self_adds_seq_lens():
@@ -311,6 +348,7 @@ class TargetVerifyExecutor:
             verify_input=verify_input,
             seq_lens_cpu_backup=seq_lens_cpu_backup,
             seq_lens_sum_backup=seq_lens_sum_backup,
+            force_eager_decode=force_eager_decode,
         )
 
         if sampling_info is not None:
@@ -329,13 +367,14 @@ class TargetVerifyExecutor:
         verify_input: DFlashVerifyInput,
         seq_lens_cpu_backup,
         seq_lens_sum_backup,
+        force_eager_decode: bool = False,
     ) -> TargetVerifyResult:
         if verify_input.live_seq_lens_cpu is None and self._target_is_dsv41:
             verify_input.candidate_max_seq_len_upper_bound = (
                 candidate_request_length_bound(batch.reqs, self.verify_num_draft_tokens)
             )
         verify_forward_batch, _ = verify_input.prepare_for_verify(
-            batch, self.target_worker
+            batch, self.target_worker, force_eager_decode=force_eager_decode
         )
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
@@ -346,6 +385,9 @@ class TargetVerifyExecutor:
             is_verify=True,
             skip_attn_backend_init=True if not _is_npu else None,
         )
+        graph_runner = self.target_worker.model_runner.decode_cuda_graph_runner
+        if graph_runner is not None:
+            graph_runner.finish_metadata_timing_sample()
         return TargetVerifyResult(
             logits_output=target_out.logits_output,
             can_run_cuda_graph=target_out.can_run_cuda_graph,
@@ -377,7 +419,14 @@ class TargetVerifyExecutor:
             raise RuntimeError("DSpark verify requires target hidden states, got None.")
         hidden = hidden.view(bs, self.verify_num_draft_tokens, -1)
         state_slot = None
-        if is_unified_kv_triton():
+        # A ring-pooled draft needs the same per-token req slot as unified_kv:
+        # _maybe_publish_ring_mapping publishes (req, pos) -> ring slot for THIS
+        # tick's locs, and it raises without state_slot. Verify is where decode
+        # tokens enter the draft's KV, so leaving it out left every decode loc
+        # at the -1 sentinel.
+        draft_pool = self.kv_injector.draft_model_runner.token_to_kv_pool
+        ring_active = getattr(draft_pool, "draft_swa_ring_stride", None) is not None
+        if is_unified_kv_triton() or ring_active:
             # unified_kv needs the per-token draft req slot to address the SWA ring
             # (state_slot * ring + pos % ring). Verify tokens are the latest in each
             # req so they always fall in the window; the commit gate (via commit_lens
@@ -402,6 +451,7 @@ class TargetVerifyExecutor:
         layout: RaggedVerifyLayout,
         ragged_window: RaggedVerifyWindow,
         sampling_info,
+        force_eager_decode: bool = False,
     ) -> TargetVerifyResult:
         verify_input = DFlashVerifyInput(
             draft_token=ragged_window.verify_ids,
@@ -413,6 +463,7 @@ class TargetVerifyExecutor:
             live_seq_lens_cpu=batch.seq_lens_cpu,
         )
         batch.out_cache_loc = ragged_window.verify_cache_loc
+        consume_deferred_seq_lens_cpu(batch)
         seq_lens_cpu_backup = batch.seq_lens_cpu
         seq_lens_sum_backup = batch.seq_lens_sum
         if seq_lens_cpu_backup is not None:
@@ -431,6 +482,7 @@ class TargetVerifyExecutor:
             verify_input=verify_input,
             seq_lens_cpu_backup=seq_lens_cpu_backup,
             seq_lens_sum_backup=seq_lens_sum_backup,
+            force_eager_decode=force_eager_decode,
         )
 
     def run_compact(
@@ -444,6 +496,7 @@ class TargetVerifyExecutor:
         device: str,
         sampling_info,
         inject_gate: bool = False,
+        force_eager_decode: bool = False,
     ) -> tuple[TargetVerifyResult, torch.Tensor]:
         ragged_window = BuildRaggedVerifyWindow.execute(
             batch=batch,
@@ -462,6 +515,7 @@ class TargetVerifyExecutor:
             layout=layout,
             ragged_window=ragged_window,
             sampling_info=sampling_info,
+            force_eager_decode=force_eager_decode,
         )
         logits_output = target_verify.logits_output
 
@@ -811,6 +865,49 @@ class DsparkVerifyEpilogue:
             )
 
 
+_accept_paths_seen: set = set()
+
+
+def _maybe_dump_accept_path(*, sampling_info, all_greedy: bool) -> None:
+    """Record which accept branch runs, once per distinct sampling config.
+
+    The two branches verify differently (exact argmax match vs. rejection
+    sampling), so a dump that stays empty is ambiguous -- it could mean the
+    sampling path is clean, or that it never ran. Keying on the config rather
+    than logging once per process matters: the server's own health probe is
+    greedy and would otherwise be the only thing ever recorded, hiding the
+    real request's config behind it.
+    """
+    path = envs.SGLANG_DSPARK_DEBUG_ACCEPT_DUMP_PATH.get()
+    if not path:
+        return
+    temp = (
+        None if sampling_info is None else round(float(sampling_info.temperatures.view(-1)[0]), 4)
+    )
+    top_k = None if sampling_info is None else int(sampling_info.top_ks.view(-1)[0])
+    key = (bool(all_greedy), temp, top_k)
+    if key in _accept_paths_seen:
+        return
+    _accept_paths_seen.add(key)
+    rec = {
+        "kind": "path",
+        "all_greedy": bool(all_greedy),
+        "is_any_greedy": (
+            None if sampling_info is None else bool(sampling_info.is_any_greedy)
+        ),
+        "temperatures": (
+            None
+            if sampling_info is None
+            else sampling_info.temperatures.view(-1)[:4].tolist()
+        ),
+        "top_ks": (
+            None if sampling_info is None else sampling_info.top_ks.view(-1)[:4].tolist()
+        ),
+    }
+    with open(path, "a") as f:
+        f.write(json.dumps(rec) + "\n")
+
+
 def accept_draft_tokens(
     *,
     candidates: torch.Tensor,
@@ -826,6 +923,7 @@ def accept_draft_tokens(
     greedy_mask = draft_block.greedy_mask
     cutoff_verify_lens = None if cutoff_layout is None else cutoff_layout.verify_lens
     all_greedy = sampling_info is None or sampling_info.is_all_greedy
+    _maybe_dump_accept_path(sampling_info=sampling_info, all_greedy=all_greedy)
     if all_greedy:
         return AcceptGreedy.execute(
             candidates=candidates,

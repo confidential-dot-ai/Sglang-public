@@ -4,6 +4,7 @@
 
 import dataclasses
 import logging
+import os
 from contextlib import ExitStack
 from typing import Any, Callable, Optional
 from unittest.mock import patch
@@ -25,6 +26,34 @@ from sglang.srt.model_executor.runner_utils.pool import (
 from sglang.srt.utils.common import print_warning_once
 
 logger = logging.getLogger(__name__)
+
+
+# Fault-localization aid (SGLANG_PCG_SYNC_DEBUG=1): synchronize around every
+# captured piecewise-segment replay so an async illegal access is attributed
+# to either the segment itself ("post") or the eager region before it
+# ("pre"), instead of surfacing at an arbitrary later CUDA call. Debug only.
+_PCG_SYNC_DEBUG = os.environ.get("SGLANG_PCG_SYNC_DEBUG", "0") == "1"
+
+
+def _pcg_sync_checkpoint(
+    phase: str, index: int, total: int, runtime_shape
+) -> None:
+    try:
+        torch.cuda.synchronize()
+    except RuntimeError as e:
+        raise RuntimeError(
+            f"PCG_SYNC_DEBUG[{phase}] segment {index}/{total} "
+            f"shape={runtime_shape}: {e}"
+        ) from e
+
+
+def _pcg_general_call(fn, args, index, total, tag):
+    if not _PCG_SYNC_DEBUG or torch.cuda.is_current_stream_capturing():
+        return fn(*args)
+    _pcg_sync_checkpoint(f"general-pre:{tag}", index, total, -1)
+    out = fn(*args)
+    _pcg_sync_checkpoint(f"general-post:{tag}", index, total, -1)
+    return out
 
 
 @dataclasses.dataclass
@@ -114,15 +143,27 @@ class CUDAPiecewiseBackend:
         if not self.first_run_finished:
             self.first_run_finished = True
             self.check_for_ending_compilation()
-            return self.compiled_graph_for_general_shape(*args)
+            return _pcg_general_call(
+                self.compiled_graph_for_general_shape, args,
+                self.piecewise_compile_index, self.total_piecewise_compiles,
+                "first_run",
+            )
 
         if len(self.sym_shape_indices) == 0:
-            return self.compiled_graph_for_general_shape(*args)
+            return _pcg_general_call(
+                self.compiled_graph_for_general_shape, args,
+                self.piecewise_compile_index, self.total_piecewise_compiles,
+                "no_sym",
+            )
 
         runtime_shape = args[self.sym_shape_indices[0]]
         if runtime_shape not in self.concrete_size_entries:
             # we don't need to do anything for this shape
-            return self.compiled_graph_for_general_shape(*args)
+            return _pcg_general_call(
+                self.compiled_graph_for_general_shape, args,
+                self.piecewise_compile_index, self.total_piecewise_compiles,
+                f"uncaptured:{runtime_shape}",
+            )
 
         entry = self.concrete_size_entries[runtime_shape]
 
@@ -164,6 +205,17 @@ class CUDAPiecewiseBackend:
             # their captured graphs.
             stream = get_pcg_capture_stream()
             if stream is None:
+                # Also covers ring-attention CP: its zigzag split derives an
+                # unbacked SymInt shard-length symbol per capture
+                # (cp_utils.py's cp_split_and_rebuild_data_pcg / communicator.py's
+                # _moe_cp_pad_and_allgather), and a runtime-triggered dynamo
+                # recompile on a shape outside the captured set can land here
+                # the same way the general case below does. Falling back to
+                # eager for this subgraph instead of asserting is slower for
+                # that one subgraph, but never a crash, and (unlike
+                # re-entering graph_capture() to force a fresh CUDA-graph
+                # recapture here) this can't corrupt the shared graph pool on
+                # a later replay.
                 print_warning_once(
                     "PCG capture stream is not set. This can be a Dynamo runtime "
                     "recompilation or an optional VLM branch pre-warmed outside "
@@ -224,6 +276,16 @@ class CUDAPiecewiseBackend:
                 "Input addresses for cudagraphs are different during replay."
                 f" Expected {entry.input_addresses}, got {new_input_addresses}"
             )
+        if _PCG_SYNC_DEBUG:
+            _pcg_sync_checkpoint(
+                "pre", self.piecewise_compile_index, self.total_piecewise_compiles,
+                runtime_shape,
+            )
         with graph_pool_replay_scope():
             entry.cudagraph.replay()
+        if _PCG_SYNC_DEBUG:
+            _pcg_sync_checkpoint(
+                "post", self.piecewise_compile_index, self.total_piecewise_compiles,
+                runtime_shape,
+            )
         return entry.output

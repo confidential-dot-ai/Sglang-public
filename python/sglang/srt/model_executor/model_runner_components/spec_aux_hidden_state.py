@@ -234,7 +234,7 @@ def _resolve_dflash_draft_cell_size(
             model=None,
             model_dtype=draft_model_config.dtype,
             is_draft_worker=True,
-            is_dflash=True,
+            is_dflash_family=True,
             speculative_draft_attention_backend=(
                 get_spec().speculative_draft_attention_backend
             ),

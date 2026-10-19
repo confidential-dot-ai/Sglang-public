@@ -177,6 +177,21 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn stream_total_timeout_secs(mut self, timeout: u64) -> Self {
+        self.config.stream_total_timeout_secs = timeout;
+        self
+    }
+
+    pub fn request_read_timeout_secs(mut self, timeout: u64) -> Self {
+        self.config.request_read_timeout_secs = timeout;
+        self
+    }
+
+    pub fn stream_idle_timeout_secs(mut self, timeout: u64) -> Self {
+        self.config.stream_idle_timeout_secs = timeout;
+        self
+    }
+
     pub fn worker_startup_timeout_secs(mut self, timeout: u64) -> Self {
         self.config.worker_startup_timeout_secs = timeout;
         self
@@ -238,6 +253,46 @@ impl RouterConfigBuilder {
 
     pub fn api_key<S: Into<String>>(mut self, key: S) -> Self {
         self.config.api_key = Some(key.into());
+        self
+    }
+
+    pub fn maybe_admin_api_key<S: AsRef<str>>(mut self, key: Option<S>) -> Self {
+        self.config.admin_api_key = key.map(|k| k.as_ref().to_string());
+        self
+    }
+
+    pub fn maybe_ops_api_key<S: AsRef<str>>(mut self, key: Option<S>) -> Self {
+        self.config.ops_api_key = key.map(|k| k.as_ref().to_string());
+        self
+    }
+
+    pub fn maybe_api_key_store<S: AsRef<str>>(mut self, path: Option<S>) -> Self {
+        self.config.api_key_store = path.map(|p| p.as_ref().to_string());
+        self
+    }
+
+    pub fn reject_video(mut self, reject: bool) -> Self {
+        self.config.reject_video = reject;
+        self
+    }
+
+    pub fn max_inflight_images(mut self, max: i64) -> Self {
+        self.config.max_inflight_images = max;
+        self
+    }
+
+    pub fn max_inflight_megapixels(mut self, max: i64) -> Self {
+        self.config.max_inflight_megapixels = max;
+        self
+    }
+
+    pub fn max_images_per_request(mut self, max: i64) -> Self {
+        self.config.max_images_per_request = max;
+        self
+    }
+
+    pub fn unmeasured_image_megapixels(mut self, megapixels: i64) -> Self {
+        self.config.unmeasured_image_megapixels = megapixels;
         self
     }
 

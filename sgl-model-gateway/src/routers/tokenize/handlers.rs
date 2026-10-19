@@ -72,6 +72,60 @@ fn get_tokenizer(registry: &TokenizerRegistry, model: &str) -> Result<Arc<dyn To
     }
 }
 
+/// Rough upper bound on characters-per-token, used to bound how much of the
+/// request text we tokenize below -- never an exact token boundary, just
+/// generous enough that we practically never undershoot `max_tokens`.
+const CHARS_PER_TOKEN_SAFETY_MARGIN: usize = 8;
+
+/// Tokenize a bounded prefix of `text` for HTTP-path routing policies (e.g.
+/// `PrefixHashPolicy`) that need real token ids but only ever look at the
+/// first `max_tokens` of them.
+///
+/// Truncates `text` to `max_tokens * CHARS_PER_TOKEN_SAFETY_MARGIN` bytes
+/// before calling `encode()`, so tokenization cost stays bounded regardless
+/// of total prompt length -- a real prompt can be tens of KB, but a
+/// prefix-hash policy typically only needs a couple hundred leading tokens.
+///
+/// Returns `None` (never an error) whenever there's nothing useful to do:
+/// empty input, `max_tokens == 0`, or no tokenizer registered yet for
+/// `model_id`. This mirrors the caller's pre-existing `tokens: None`
+/// behavior exactly, so a missing/not-yet-loaded tokenizer degrades to
+/// today's behavior rather than failing the request.
+pub(crate) fn tokenize_bounded_prefix(
+    registry: &TokenizerRegistry,
+    model_id: &str,
+    text: &str,
+    max_tokens: usize,
+) -> Option<Vec<u32>> {
+    if text.is_empty() || max_tokens == 0 {
+        return None;
+    }
+
+    let tokenizer = get_tokenizer(registry, model_id).ok()?;
+
+    let char_budget = max_tokens.saturating_mul(CHARS_PER_TOKEN_SAFETY_MARGIN);
+    let mut boundary = text.len().min(char_budget);
+    while boundary > 0 && !text.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    let bounded_text = &text[..boundary];
+
+    match tokenizer.encode(bounded_text, false) {
+        Ok(encoding) => {
+            let ids = encoding.token_ids();
+            let take = max_tokens.min(ids.len());
+            Some(ids[..take].to_vec())
+        }
+        Err(e) => {
+            warn!(
+                "tokenize_bounded_prefix: encode failed for model '{}': {}",
+                model_id, e
+            );
+            None
+        }
+    }
+}
+
 // ============================================================================
 // Tokenize / Detokenize Handlers
 // ============================================================================

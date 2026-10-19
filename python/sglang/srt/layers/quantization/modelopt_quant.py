@@ -1051,6 +1051,8 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return ModelOptFp4LinearMethod(self.nvfp4_config)
             if quant_algo == "W4A16_NVFP4":
                 return ModelOptNvFp4A16LinearMethod(self.nvfp4a16_config)
+            if quant_algo == "MXFP8":
+                return Fp8LinearMethod(self.mxfp8_config)
             return UnquantizedLinearMethod()
 
         # Must stay after the ParallelLMHead branch: ParallelLMHead subclasses

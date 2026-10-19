@@ -149,6 +149,29 @@ SGL_DEVICE T reduce_min(T value, mask_t active_mask = kFullMask) {
   return reduce<ReductionOp::MIN, kStart, kFinish>(value, active_mask);
 }
 
+/// Broadcast one 32-bit value from ``src_lane`` within each ``kNumThreads``
+/// subgroup. Use the live CUDA mask so a valid subgroup in the final warp may
+/// broadcast after sibling subgroups have returned.
+template <uint32_t kNumThreads = kWarpThreads>
+SGL_DEVICE uint32_t broadcast_u32(uint32_t value, uint32_t src_lane = 0) {
+  static_assert(kNumThreads >= 1 && kNumThreads <= kWarpThreads);
+  static_assert(host::is_pow2(kNumThreads), "must be pow of 2");
+#ifndef USE_ROCM
+  return __shfl_sync(__activemask(), value, src_lane, kNumThreads);
+#else
+  return __shfl(value, src_lane, kNumThreads);
+#endif
+}
+
+/// Bit-exact signed 64-bit broadcast built from the native 32-bit shuffle.
+template <uint32_t kNumThreads = kWarpThreads>
+SGL_DEVICE int64_t broadcast_i64(int64_t value, uint32_t src_lane = 0) {
+  const auto bits = static_cast<uint64_t>(value);
+  const auto low = broadcast_u32<kNumThreads>(static_cast<uint32_t>(bits), src_lane);
+  const auto high = broadcast_u32<kNumThreads>(static_cast<uint32_t>(bits >> 32), src_lane);
+  return static_cast<int64_t>((static_cast<uint64_t>(high) << 32) | low);
+}
+
 /**
  * \brief Inclusive scan within each segment of `kWidth` lanes.
  *

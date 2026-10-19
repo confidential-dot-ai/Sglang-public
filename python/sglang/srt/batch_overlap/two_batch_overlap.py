@@ -46,7 +46,7 @@ from sglang.srt.runtime_context import (
     get_device,
     get_parallel,
 )
-from sglang.srt.speculative.spec_info import SpecInput
+from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.utils import BumpAllocator, empty_context, get_bool_env_var, is_hip
 
 if TYPE_CHECKING:
@@ -214,6 +214,62 @@ def _compute_mask_offset(seq_index: int, spec_info: Optional[EagleVerifyInput]) 
     return offset
 
 
+def _split_dflash_verify_input(
+    spec_info,  # DFlashVerifyInput (duck-typed; see split_spec_info dispatch)
+    start_seq_index: int,
+    end_seq_index: int,
+    start_token_index: int,
+    end_token_index: int,
+):
+    """TBO split for a DFlash/DSPARK verify input.
+
+    Static DFlash verify is linear with a flat
+    ``[bs * draft_token_num]`` layout. Compact verify is still linear, but its
+    request widths vary; callers provide token bounds resolved from the
+    parent's ragged ``qo_indptr``. The child layout must therefore be sliced
+    by request and have both indptr arrays rebased to the child's token zero.
+    """
+    assert spec_info.custom_mask is None, (
+        "TBO split for DFlash verify does not support a custom attention "
+        "mask; the flat (q, k) mask cannot be sliced by token range alone"
+    )
+    layout = spec_info.ragged_verify_layout
+    child_layout = (
+        layout.slice_requests(
+            start_request=start_seq_index,
+            end_request=end_seq_index,
+            start_token=start_token_index,
+            end_token=end_token_index,
+        )
+        if layout is not None
+        else None
+    )
+    live_seq_lens_cpu = spec_info.live_seq_lens_cpu
+    if live_seq_lens_cpu is not None:
+        live_seq_lens_cpu = live_seq_lens_cpu[start_seq_index:end_seq_index]
+    # CUDA-graph capture synthesizes the verify input with draft_token=None /
+    # positions=None (decode_cuda_graph_runner builds them as None; the graph
+    # body reads the static capture buffers instead), so the children keep
+    # None too. Live eager batches always carry both tensors.
+    draft_tokens = spec_info.draft_token
+    spec_positions = spec_info.positions
+    return replace(
+        spec_info,
+        draft_token=(
+            None
+            if draft_tokens is None
+            else draft_tokens[start_token_index:end_token_index]
+        ),
+        positions=(
+            None
+            if spec_positions is None
+            else spec_positions[start_token_index:end_token_index]
+        ),
+        ragged_verify_layout=child_layout,
+        live_seq_lens_cpu=live_seq_lens_cpu,
+    )
+
+
 def split_spec_info(
     spec_info: Optional[EagleVerifyInput],
     start_seq_index: int,
@@ -223,6 +279,14 @@ def split_spec_info(
 ):
     if spec_info is None:
         return None
+    if spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY:
+        return _split_dflash_verify_input(
+            spec_info,
+            start_seq_index=start_seq_index,
+            end_seq_index=end_seq_index,
+            start_token_index=start_token_index,
+            end_token_index=end_token_index,
+        )
     if spec_info.draft_token is not None:
         draft_token = spec_info.draft_token[start_token_index:end_token_index]
     else:
@@ -293,6 +357,7 @@ def compute_split_token_index(
     forward_mode: ForwardMode,
     extend_seq_lens: Optional[Sequence[int]],
     token_num_per_seq: Optional[int],
+    ragged_verify_layout=None,
 ) -> int:
     if forward_mode == ForwardMode.EXTEND or forward_mode == ForwardMode.MIXED:
         assert extend_seq_lens is not None
@@ -300,6 +365,8 @@ def compute_split_token_index(
             return sum(extend_seq_lens) // 2
         return sum(extend_seq_lens[:split_seq_index])
     elif forward_mode.is_target_verify() or forward_mode.is_decode():
+        if forward_mode.is_target_verify() and ragged_verify_layout is not None:
+            return ragged_verify_layout.request_token_offset(split_seq_index)
         assert token_num_per_seq is not None
         return split_seq_index * token_num_per_seq
     elif forward_mode.is_idle():
@@ -320,17 +387,27 @@ def compute_split_indices_for_cuda_graph_replay(
     token_num_per_seq = get_token_num_per_seq(
         forward_mode=forward_mode, spec_info=spec_info
     )
-    tbo_split_seq_index = compute_split_seq_index(
-        forward_mode=forward_mode_for_tbo_split,
-        num_tokens=cuda_graph_num_tokens,
-        extend_lens=None,
-        token_num_per_seq=token_num_per_seq,
-    )
+    ragged_verify_layout = getattr(spec_info, "ragged_verify_layout", None)
+    if ragged_verify_layout is not None:
+        # A compact token bucket is not ``bs * draft_width``. Its request
+        # count lives in the layout, while its token split is the request
+        # boundary in qo_indptr. Decode CUDA graphs currently capture compact
+        # batches as non-TBO because this boundary varies between replays; the
+        # exact helper remains useful for eager and admission tests.
+        tbo_split_seq_index = ragged_verify_layout.bs // 2
+    else:
+        tbo_split_seq_index = compute_split_seq_index(
+            forward_mode=forward_mode_for_tbo_split,
+            num_tokens=cuda_graph_num_tokens,
+            extend_lens=None,
+            token_num_per_seq=token_num_per_seq,
+        )
     tbo_split_token_index = compute_split_token_index(
         split_seq_index=tbo_split_seq_index,
         forward_mode=forward_mode_for_tbo_split,
         extend_seq_lens=None,
         token_num_per_seq=token_num_per_seq,
+        ragged_verify_layout=ragged_verify_layout,
     )
     return tbo_split_seq_index, tbo_split_token_index
 
@@ -346,7 +423,19 @@ class TboCudaGraphRunnerPlugin:
 
     def capture_one_batch_size(self, batch: ForwardBatch, num_tokens: int):
         if not is_tbo_enabled():
-            return
+            return False
+        # Prefill EXTEND request geometry (extend_lens and token-to-request
+        # boundaries) is live data, not part of the current graph key. Compact
+        # verify has the analogous problem: qo_indptr[split] varies among
+        # batches sharing one total-token bucket, while the model's child
+        # tensor views are baked at capture. Capture both as ordinary non-TBO
+        # graphs; eager fallbacks still use exact TBO splitting.
+        if batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED) or getattr(
+            getattr(batch, "spec_info", None), "ragged_verify_layout", None
+        ) is not None:
+            batch.tbo_split_seq_index = None
+            batch.tbo_children = None
+            return False
         token_num_per_seq = get_token_num_per_seq(
             forward_mode=batch.forward_mode, spec_info=batch.spec_info
         )
@@ -368,6 +457,7 @@ class TboCudaGraphRunnerPlugin:
             batch,
             tbo_children_num_token_non_padded=self._tbo_children_num_token_non_padded,
         )
+        return True
 
     def replay_prepare(
         self,
@@ -376,6 +466,11 @@ class TboCudaGraphRunnerPlugin:
         num_token_non_padded: int,
         spec_info: Optional[SpecInput],
     ):
+        if getattr(spec_info, "ragged_verify_layout", None) is not None:
+            # The matching compact graph was deliberately captured without a
+            # TBO body. Do not mutate the persistent child-length buffer or
+            # synthesize child metadata for a graph that cannot consume it.
+            return False
         token_num_per_seq = get_token_num_per_seq(
             forward_mode=forward_mode, spec_info=spec_info
         )
@@ -393,6 +488,7 @@ class TboCudaGraphRunnerPlugin:
                 num_token_non_padded=num_token_non_padded,
             )
         )
+        return True
 
 
 class TboDPAttentionPreparer:
@@ -598,6 +694,31 @@ class TboForwardBatchPreparer:
         assert batch.tbo_children is None
         batch.tbo_children = [child_a, child_b]
 
+        # Stale-child-metadata fix (2026-08-18, measured DSPARK accept-length
+        # collapse 5.16 -> 2.91-3.43): spec-decode workers pre-plan attention
+        # metadata out-of-forward and mark_forward_metadata_ready() BEFORE
+        # this method creates the children. The in-forward init -- the normal
+        # child planning site (TboAttnBackend.init_forward_metadata) -- is
+        # then skipped on the PARENT's flag alone, so the children silently
+        # keep the previous tick's metadata (wrong cu_seqlens / max_seqlen_q
+        # / K spans on cached-state backends). Usually that is silently wrong
+        # attention (verify logits/aux garbage -> drafts rejected).
+        # filter_batch's forward_metadata_ready=False on each child already
+        # documents this hazard, but nothing reads the children's flags --
+        # needs_forward_metadata_init() judges only the parent. So: whenever
+        # the in-forward init WILL be skipped, plan the children here, at the
+        # only point that knows both that they were just created and which
+        # backend instance serves each. Empty children are skipped exactly as
+        # TboAttnBackend.init_forward_metadata skips them (an empty ubatch
+        # never runs attention, so its staleness is unreachable this tick).
+        if not batch.needs_forward_metadata_init():
+            for child_backend, child_fb in zip(
+                attn_backend.children, batch.tbo_children, strict=True
+            ):
+                if child_fb.batch_size > 0:
+                    child_backend.init_forward_metadata(child_fb)
+                    child_fb.mark_forward_metadata_ready()
+
     @classmethod
     def derive_fields_related_to_seq_len_for_two_chunk(
         cls,
@@ -768,6 +889,7 @@ class TboForwardBatchPreparer:
             "orig_seq_lens",  # only used by qwen-1m, thus not care
             "return_pooled_hidden_states",
             "reuse_dsa_topk_indices",  # forward-level flag, inherited by both child batches
+            "force_eager_decode",  # forward-level flag, inherited by both child batches
         ]:
             output_dict[key] = getattr(batch, key)
 
@@ -862,13 +984,24 @@ class TboForwardBatchPreparer:
 
     @classmethod
     def compute_tbo_children_num_token_non_padded(cls, batch: ForwardBatch):
+        ragged_layout = getattr(
+            getattr(batch, "spec_info", None), "ragged_verify_layout", None
+        )
+        if ragged_layout is not None:
+            # Compact inputs may retain a graph-tier ghost tail even when the
+            # forward falls back to eager. Collective masks/counts describe
+            # live query rows, not len(input_ids); the final child owns the
+            # ghost tail in its tensor slice but must not publish it as real.
+            num_token_non_padded = (
+                int(ragged_layout.total_verify_tokens)
+                if ragged_layout.total_verify_tokens is not None
+                else ragged_layout.request_token_offset(ragged_layout.bs)
+            )
+        else:
+            num_token_non_padded = cls._get_num_token_non_padded_cpu(batch)
         return cls.compute_tbo_children_num_token_non_padded_raw(
             tbo_split_token_index=cls._compute_split_token_index(batch),
-            # Prefer the parent CPU count: len(input_ids) is the padded
-            # (MAX_LEN) count and would undo the idle-rank dummy-token mask.
-            # The resolver falls back to physical rows only for capture
-            # batches that intentionally leave the CPU mirror unset.
-            num_token_non_padded=cls._get_num_token_non_padded_cpu(batch),
+            num_token_non_padded=num_token_non_padded,
         )
 
     @staticmethod
@@ -911,6 +1044,9 @@ class TboForwardBatchPreparer:
             forward_mode=batch.forward_mode,
             extend_seq_lens=batch.extend_seq_lens_cpu,
             token_num_per_seq=token_num_per_seq,
+            ragged_verify_layout=getattr(
+                getattr(batch, "spec_info", None), "ragged_verify_layout", None
+            ),
         )
 
 
@@ -1098,25 +1234,29 @@ def _model_forward_filter_inputs(
     )
 
 
-def _model_forward_tbo_merge_outputs(output_a, output_b, original_len):
-    def _handle_key(name):
-        value_a = output_a[name]
-        value_b = output_b[name]
-        assert (value_a is None) == (value_b is None)
-        if value_a is None:
-            return None
-        s0, t0 = output_a["forward_batch"].tbo_parent_token_range
-        s1, t1 = output_b["forward_batch"].tbo_parent_token_range
-        res = torch.zeros(
-            (original_len, *value_a.shape[1:]),
-            dtype=value_a.dtype,
-            device=value_a.device,
-        )
-        res[slice(s0, t0)] = value_a[: t0 - s0]
-        res[slice(s1, t1)] = value_b[: t1 - s1]
-        return res
+def _model_forward_tbo_merge_value(output_a, output_b, name, original_len):
+    """Restore one tensor from two padded TBO children to parent token order."""
+    value_a = output_a[name]
+    value_b = output_b[name]
+    assert (value_a is None) == (value_b is None)
+    if value_a is None:
+        return None
+    s0, t0 = output_a["forward_batch"].tbo_parent_token_range
+    s1, t1 = output_b["forward_batch"].tbo_parent_token_range
+    res = torch.zeros(
+        (original_len, *value_a.shape[1:]),
+        dtype=value_a.dtype,
+        device=value_a.device,
+    )
+    res[slice(s0, t0)] = value_a[: t0 - s0]
+    res[slice(s1, t1)] = value_b[: t1 - s1]
+    return res
 
-    return _handle_key("hidden_states"), _handle_key("residual")
+
+def _model_forward_tbo_merge_outputs(output_a, output_b, original_len):
+    return _model_forward_tbo_merge_value(
+        output_a, output_b, "hidden_states", original_len
+    ), _model_forward_tbo_merge_value(output_a, output_b, "residual", original_len)
 
 
 # -------------------------------- Utilities and wrappers ---------------------------------------

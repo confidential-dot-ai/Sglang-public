@@ -43,15 +43,13 @@ def _make_req(origin_input_ids=None, output_ids=None):
 
 
 class TestApplyCustomLogitProcessor(CustomTestCase):
-    def test_repeats_request_params_for_each_token(self):
+    def _check_repeated_request_params(self, rows, expected_params, expected_rows):
         batch_size = 3
         num_tokens = 2
         params = [{"value": 1.0}, {"value": 2.0}, {"value": 3.0}]
 
         def processor(logits, custom_params):
-            self.assertEqual(
-                custom_params, [params[0], params[0], params[2], params[2]]
-            )
+            self.assertEqual(custom_params, [params[i] for i in expected_params])
             for row, param in zip(logits, custom_params, strict=True):
                 row.fill_(param["value"])
             return logits
@@ -71,7 +69,7 @@ class TestApplyCustomLogitProcessor(CustomTestCase):
             custom_params=params,
             custom_logit_processor={
                 0: ProcessorEntry(
-                    processor=processor, rows=[0, 2], indices=torch.tensor([0, 2])
+                    processor=processor, rows=rows, indices=torch.tensor(rows)
                 )
             },
             device="cpu",
@@ -82,10 +80,18 @@ class TestApplyCustomLogitProcessor(CustomTestCase):
             logits, sampling_info, num_tokens_in_batch=num_tokens
         )
 
-        expected = torch.tensor(
-            [[1.0] * 4, [1.0] * 4, [0.0] * 4, [0.0] * 4, [3.0] * 4, [3.0] * 4]
-        )
+        expected = torch.tensor([[value] * 4 for value in expected_rows])
         self.assertTrue(torch.equal(logits, expected))
+
+    def test_repeats_request_params_for_each_token(self):
+        self._check_repeated_request_params(
+            [0, 2], [0, 0, 2, 2], [1.0, 1.0, 0.0, 0.0, 3.0, 3.0]
+        )
+
+    def test_full_batch_fast_path_preserves_speculative_row_attribution(self):
+        self._check_repeated_request_params(
+            [0, 1, 2], [0, 0, 1, 1, 2, 2], [1.0, 1.0, 2.0, 2.0, 3.0, 3.0]
+        )
 
 
 # Serialization round-trip

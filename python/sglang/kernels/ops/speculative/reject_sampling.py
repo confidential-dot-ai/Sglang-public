@@ -27,6 +27,11 @@ def speculative_sampling_classic_kernel(
     stride_dp_b,
     stride_dp_s,
     stride_dp_v,
+    # Relaxed-acceptance knobs (see the accept condition below). Runtime
+    # scalars, not constexpr, so changing them does not retrigger a JIT
+    # compile of this kernel.
+    threshold_single,
+    threshold_acc,
     # Constants
     NUM_SLOTS: tl.constexpr,
     VOCAB_SIZE: tl.constexpr,
@@ -76,7 +81,23 @@ def speculative_sampling_classic_kernel(
         # from the target, which is the safe direction to fail in.
         q_is_prob = (q > 0.0) & (q <= 1.0)
 
-        if q_is_prob & (coin * q < p):
+        # Relaxed acceptance (lossy above the defaults).
+        #
+        #   threshold_acc scales the rejection-sampling bar: the exact rule
+        #   accepts with probability min(1, p/q), i.e. coin*q < p. Dividing q
+        #   by threshold_acc raises that to min(1, p/(q*threshold_acc)), so
+        #   threshold_acc < 1 accepts strictly more often.
+        #
+        #   threshold_single is an unconditional accept for tokens the target
+        #   already likes: any draft token with target probability >= it is
+        #   taken regardless of the coin.
+        #
+        # At the 1.0/1.0 defaults this is byte-for-byte the previous rule:
+        # coin*q*1.0 < p, and p >= 1.0 only when the target is fully
+        # saturated on that token (in which case coin*q < p accepts anyway).
+        accept_relaxed = coin * q * threshold_acc < p
+        accept_single = p >= threshold_single
+        if q_is_prob & (accept_relaxed | accept_single):
             num_accept += 1
             cur_prob_row = step
             tl.store(Predicts + last_accepted_global_idx, draft_token)
@@ -106,7 +127,14 @@ def speculative_sampling_classic_kernel(
     # dereferences this pointer; on rejection cur_prob_row <= num_steps - 1.
     dp_base_ptr_safe = DraftProbs + (pid * stride_dp_b) + (cur_prob_row * stride_dp_s)
 
-    # Pass 1: Sum
+    # Pass 1: sum and track a deterministic fallback. Pass 1 and the CDF pass
+    # use different reduction trees, so a final uniform sample near 1 can
+    # expose a rounding gap where the CDF never becomes strictly greater than
+    # target_u. Returning the last vocabulary id in that case is arbitrary and
+    # can select a zero-probability token; the largest residual is a safe,
+    # deterministic fallback.
+    best_idx = VOCAB_SIZE - 1
+    best_val = -1.0
     for v_start in range(0, VOCAB_SIZE, BLOCK_V):
         v_offsets = v_start + tl.arange(0, BLOCK_V)
         mask = v_offsets < VOCAB_SIZE
@@ -128,12 +156,16 @@ def speculative_sampling_classic_kernel(
 
         norm_sum += tl.sum(val)
 
-    # Pass 2: CDF. Degenerate residual (norm_sum == 0, i.e. p == q everywhere on
-    # rejection) leaves the cumsum at 0 <= target_u, so final_token falls back to
-    # VOCAB_SIZE - 1; acceptable since this case is numerically near-impossible.
+        block_max = tl.max(val, axis=0)
+        if block_max > best_val:
+            best_val = block_max
+            best_idx = v_start + tl.argmax(val, axis=0)
+
+    # Pass 2: CDF. Use pass 1's argmax if independent floating-point reductions
+    # leave the CDF just below target_u, or if the residual is degenerate.
     target_u = coin_final * norm_sum
     cum_sum = 0.0
-    final_token = VOCAB_SIZE - 1
+    final_token = best_idx
     found = 0
 
     for v_start in range(0, VOCAB_SIZE, BLOCK_V):
@@ -212,6 +244,11 @@ def chain_speculative_sampling_triton(
         draft_probs.stride(0),
         draft_probs.stride(1),
         draft_probs.stride(2),
+        float(threshold_single),
+        # Guard against a zero/negative divisor turning the accept test into
+        # "accept everything" by accident; callers already clamp, this is
+        # defence in depth for direct kernel users.
+        max(float(threshold_acc), 1e-9),
         NUM_SLOTS=num_slots,
         VOCAB_SIZE=vocab_size,
         BLOCK_V=4096,

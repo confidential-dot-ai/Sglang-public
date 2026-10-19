@@ -52,6 +52,14 @@ def handle_hicache(server_args: Any):
     ):
         return
 
+    if cfg.hicache_host_memory_backend == "hardwire" and cfg.hicache_storage_backend in (
+        "mooncake", "mori", "shm", "tensorcast",
+    ):
+        raise ValueError(
+            "--hicache-host-memory-backend hardwire cannot replace the special "
+            f"allocator required by --hicache-storage-backend {cfg.hicache_storage_backend}."
+        )
+
     validate_hicache_host_memory_mode(server_args)
 
     if cfg.disaggregation_decode_host_receive_threshold > 0:

@@ -45,7 +45,8 @@ class Selection(msgspec.Struct, frozen=True):
 
 
 class PrefillInputs(msgspec.Struct, frozen=True, kw_only=True):
-    """An eager extend: the backend projects the queries and gathers the index K."""
+    """An eager extend: the backend gathers the index K and, unless ``q`` and
+    ``weights`` are given, projects the queries."""
 
     indexer: DeepseekV41Indexer
     layer_id: int
@@ -67,6 +68,11 @@ class PrefillInputs(msgspec.Struct, frozen=True, kw_only=True):
     seq_lens_cpu: Optional[List[int]]
     rows_per_request: Optional[List[int]]
     rows_per_request_device: Optional[torch.Tensor]
+
+    # The prefill graph's projection break already computed these for the live
+    # rows; None projects them from x / q_lora.
+    q: Optional[torch.Tensor] = None  # [rows, heads, 128] bf16, roped
+    weights: Optional[torch.Tensor] = None  # [rows, heads] bf16 head weights
 
 
 class DecodeInputs(msgspec.Struct, frozen=True, kw_only=True):

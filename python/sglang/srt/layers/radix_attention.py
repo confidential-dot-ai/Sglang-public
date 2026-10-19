@@ -188,7 +188,15 @@ class RadixAttention(nn.Module):
             and (torch.compiler.is_compiling() or not _force_eager_attn.get())
         ):
             if kwargs.get("idx_q") is not None:
-                if is_in_breakable_cuda_graph():
+                in_bcg = is_in_breakable_cuda_graph()
+                if in_bcg and forward_batch.forward_mode.is_target_verify():
+                    # TARGET_VERIFY may record into the captured segment: its
+                    # metadata is address-stable and refreshed in place at
+                    # replay-prep (_verify_meta_cg). Extend metadata is
+                    # re-allocated fresh each tick, so prefill takes the eager
+                    # break below instead -- recording it would bake stale
+                    # metadata pointers, a capture-bs grid, and bucket-sized
+                    # K coverage into the graph.
                     return get_attn_backend().forward(
                         q, k, v, self, forward_batch, save_kv_cache, **kwargs
                     )
@@ -199,7 +207,12 @@ class RadixAttention(nn.Module):
                     (q.shape[0], self.tp_q_head_num * self.v_head_dim)
                 )
                 idx_out = q.new_empty((q.shape[0], idx_q.shape[1] * idx_q.shape[2]))
-                unified_sparse_attention_with_output(
+                sparse_attention_op = (
+                    breakable_unified_sparse_attention_with_output
+                    if in_bcg
+                    else unified_sparse_attention_with_output
+                )
+                sparse_attention_op(
                     q,
                     k,
                     v,
@@ -587,6 +600,9 @@ def unified_sparse_attention_with_output(
 
 breakable_unified_attention_with_output = eager_on_graph(True)(
     unified_attention_with_output
+)
+breakable_unified_sparse_attention_with_output = eager_on_graph(True)(
+    unified_sparse_attention_with_output
 )
 breakable_unified_attention_with_output_and_lse = eager_on_graph(True)(
     unified_attention_with_output_and_lse

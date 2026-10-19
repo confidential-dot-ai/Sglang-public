@@ -418,19 +418,46 @@ class DSparkVerifyPlanner:
     ) -> Optional[RaggedVerifyLayout]:
         if self._ragged_verify_mode is RaggedVerifyMode.STATIC:
             return None
+        if (
+            self._ragged_verify_mode is RaggedVerifyMode.COMPACT
+            and compact_dp_sum_capture_enabled(self.model_runner)
+            and dp_tier_num_tokens is None
+        ):
+            # SUM capture needs the shared gathered token vector to make both
+            # graph admission and eager DP padding agree with the physical
+            # packed-row count on every rank.  Falling through to compact's
+            # legacy DP-max layout here can produce (for example) 72 physical
+            # rows on a small rank while spec_scale_global_num_tokens falls
+            # back to that rank's 9/18 static rows.  The eager fallback then
+            # tries to pad a larger tensor to a smaller size.  A shared miss
+            # therefore falls all ranks back to the ordinary static layout.
+            return None
         if self._is_verify_all and self._ragged_verify_mode is RaggedVerifyMode.COMPACT:
             # Verify-all: the uniform layout (or None, past the captured grid)
             # is constant per (bs, tier); serve it from cache instead of paying
             # the per-step schedule and its host<->device round-trips.
-            key = (int(req_pool_indices.shape[0]), global_num_reqs)
+            local_bs = int(req_pool_indices.shape[0])
+            use_local_sum_bucket = (
+                compact_dp_sum_capture_enabled(self.model_runner)
+                and dp_tier_num_tokens is not None
+            )
+            key = (
+                local_bs,
+                dp_tier_num_tokens if use_local_sum_bucket else global_num_reqs,
+            )
             if key not in self._uniform_layout_cache:
                 self._uniform_layout_cache[key] = uniform_ragged_layout(
-                    bs=key[0],
+                    bs=local_bs,
                     device=device,
                     verify_num_draft_tokens=self.verify_num_draft_tokens,
                     ragged_verify_mode=self._ragged_verify_mode,
                     model_runner=self.model_runner,
-                    tier_num_reqs=global_num_reqs,
+                    tier_num_reqs=(
+                        local_bs if use_local_sum_bucket else global_num_reqs
+                    ),
+                    tier_num_tokens=(
+                        dp_tier_num_tokens if use_local_sum_bucket else None
+                    ),
                 )
             return self._uniform_layout_cache[key]
         verify_lens = self._schedule_verify_lens(
@@ -676,6 +703,84 @@ def dp_global_verify_tier_num_tokens(
     return max_tier_num_tokens if max_tier_num_tokens > 0 else None
 
 
+def compact_dp_sum_graph_token_buckets(
+    *,
+    model_runner,
+    global_tier_num_tokens: Optional[list[int]],
+    global_num_reqs: Optional[list[int]] = None,
+) -> Optional[list[int]]:
+    """Return the per-rank compact graph-token buckets for SUM capture.
+
+    The scheduler gathers token requirements before target verify.  MAX_LEN
+    compact replay intentionally collapses that vector to its maximum so all
+    ranks select one graph shape.  SUM_LEN capture instead retains one rounded
+    bucket per rank and uses their sum to select the shared covering collective
+    specialization.
+
+    An idle rank still executes a captured dummy row to participate in the DP
+    collectives, so a gathered zero maps to the smallest token bucket rather
+    than remaining zero.  A negative sentinel means at least one rank has no
+    usable budget yet; returning ``None`` makes every rank take the existing
+    pinned/eager fallback together.
+    """
+    if not compact_dp_sum_capture_enabled(model_runner):
+        return None
+    runner = model_runner.decode_cuda_graph_runner
+    if not global_tier_num_tokens or any(
+        num_tokens < 0 for num_tokens in global_tier_num_tokens
+    ):
+        return None
+    capture_num_tokens = runner.capture_num_tokens
+    if not capture_num_tokens:
+        return None
+    expected_dp_size = getattr(runner, "dp_size", None)
+    if expected_dp_size is not None and len(global_tier_num_tokens) != int(
+        expected_dp_size
+    ):
+        return None
+    try:
+        graph_buckets = [
+            round_up_grid(max(1, int(num_tokens)), capture_num_tokens)
+            for num_tokens in global_tier_num_tokens
+        ]
+    except ValueError:
+        # The gathered vector is identical on every rank, so an out-of-grid
+        # requirement is a rank-consistent graph miss.
+        return None
+    if global_num_reqs is not None:
+        max_bs = getattr(runner, "max_bs", None)
+        capture_slots = getattr(runner, "_ragged_capture_slots", None)
+        if (
+            max_bs is None
+            or len(global_num_reqs) != len(graph_buckets)
+            or any(
+                int(num_reqs) < 0
+                or int(num_reqs)
+                > (
+                    int(capture_slots(int(num_tokens)))
+                    if callable(capture_slots)
+                    else min(int(num_tokens), int(max_bs))
+                )
+                for num_reqs, num_tokens in zip(global_num_reqs, graph_buckets)
+            )
+        ):
+            # Token-budget buckets can be valid while exposing fewer captured
+            # request slots than a rank needs. Treat that as the same shared
+            # miss here, before compact packing makes static eager fallback
+            # impossible without reconstructing the full verify block.
+            return None
+    return graph_buckets
+
+
+def compact_dp_sum_capture_enabled(model_runner) -> bool:
+    runner = getattr(model_runner, "decode_cuda_graph_runner", None)
+    return bool(
+        runner is not None
+        and getattr(runner, "ragged_verify_mode", False)
+        and getattr(runner, "dspark_dp_verify_sum_capture_enabled", False)
+    )
+
+
 def idle_ragged_layout(
     *,
     tier_num_reqs: int,
@@ -723,12 +828,14 @@ def uniform_ragged_layout(
     ragged_verify_mode: RaggedVerifyMode,
     model_runner,
     tier_num_reqs: Optional[int] = None,
+    tier_num_tokens: Optional[int] = None,
 ) -> Optional[RaggedVerifyLayout]:
     tier_num_reqs = bs if tier_num_reqs is None else tier_num_reqs
     if ragged_layout_exceeds_captured_grid(
         num_reqs=tier_num_reqs,
         verify_num_draft_tokens=verify_num_draft_tokens,
         model_runner=model_runner,
+        tier_tokens_hint=tier_num_tokens,
     ):
         return None
     verify_lens_cpu = [verify_num_draft_tokens] * bs
@@ -742,6 +849,7 @@ def uniform_ragged_layout(
         ragged_verify_mode=ragged_verify_mode,
         verify_num_draft_tokens=verify_num_draft_tokens,
         model_runner=model_runner,
+        tier_num_tokens=tier_num_tokens,
     )
     return RaggedVerifyLayout.from_verify_lens(
         verify_lens_cpu=verify_lens_cpu,

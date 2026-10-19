@@ -3694,6 +3694,39 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
         args = self._args(moe_a2a_backend="deepep", enable_dp_attention=False)
         check_two_batch_overlap(args)
 
+    def test_prefill_cuda_graph_backends_can_coexist_with_tbo(self):
+        # Prefill graph capture deliberately records the ordinary (non-TBO)
+        # model body; eager prefill fallbacks and decode may still overlap.
+        for backend in (Backend.FULL, Backend.BREAKABLE, Backend.TC_PIECEWISE):
+            with self.subTest(backend=backend):
+                args = self._args(enable_dp_attention=True)
+                args.cuda_graph_config = CudaGraphConfig(
+                    prefill=PhaseConfig(backend=backend)
+                )
+                check_two_batch_overlap(args)
+
+        args = self._args(enable_dp_attention=True)
+        args.cuda_graph_config = CudaGraphConfig(
+            prefill=PhaseConfig(backend=Backend.DISABLED)
+        )
+        check_two_batch_overlap(args)
+
+    def test_dspark_compact_ragged_tbo_is_accepted(self):
+        args = self._args(
+            enable_dp_attention=True,
+            speculative_algorithm="DSPARK",
+        )
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"):
+            check_two_batch_overlap(args)
+
+    def test_dspark_static_verify_remains_supported(self):
+        args = self._args(
+            enable_dp_attention=True,
+            speculative_algorithm="DSPARK",
+        )
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            check_two_batch_overlap(args)
+
 
 class TestDcpKvEventContract(CustomTestCase):
     """DCP widens the radix-tree page to page_size * dcp_size, which the

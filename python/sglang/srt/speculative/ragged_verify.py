@@ -89,6 +89,132 @@ class RaggedVerifyLayout(msgspec.Struct, frozen=True):
     def bs(self) -> int:
         return int(self.verify_lens.shape[0])
 
+    def request_token_offset(self, request_index: int) -> int:
+        """Return the packed-token offset at a request boundary.
+
+        TBO has to slice compact verify tensors at request boundaries rather
+        than at ``request_index * draft_token_num``. Prefer host metadata so
+        the eager split does not synchronize the device. Device-only layouts
+        are still supported outside CUDA capture; their one-scalar D2H read is
+        unavoidable because Python must construct concrete tensor views.
+        """
+        if not 0 <= request_index <= self.bs:
+            raise IndexError(
+                f"request boundary {request_index} outside layout bs={self.bs}"
+            )
+        if self.verify_lens_cpu is not None:
+            return sum(int(v) for v in self.verify_lens_cpu[:request_index])
+        if self.qo_indptr_host is not None:
+            return int(self.qo_indptr_host[request_index].item())
+        if self.qo_indptr_device.is_cuda and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "compact ragged TBO cannot resolve a live request boundary "
+                "during CUDA graph capture; capture a non-TBO graph instead"
+            )
+        return int(self.qo_indptr_device[request_index].item())
+
+    def slice_requests(
+        self,
+        *,
+        start_request: int,
+        end_request: int,
+        start_token: Optional[int] = None,
+        end_token: Optional[int] = None,
+    ) -> RaggedVerifyLayout:
+        """Build a child layout for a contiguous request range.
+
+        ``qo_indptr`` and ``extend_start_loc`` are rebased to zero for the
+        child's sliced query tensor. ``end_token`` may extend past the last
+        real query row for the final child, preserving a compact graph/eager
+        bucket's ghost tail in ``graph_num_tokens`` without assigning those
+        rows to a request.
+
+        The returned layout owns every newly-created rebased tensor. Callers
+        that capture its pointers must retain the layout for the graph's full
+        lifetime; the current decode graph path intentionally captures compact
+        batches without TBO because its live split boundary is dynamic.
+        """
+        if not 0 <= start_request <= end_request <= self.bs:
+            raise ValueError(
+                "invalid ragged request slice "
+                f"[{start_request}, {end_request}) for bs={self.bs}"
+            )
+
+        real_start = self.request_token_offset(start_request)
+        real_end = self.request_token_offset(end_request)
+        start_token = real_start if start_token is None else int(start_token)
+        end_token = real_end if end_token is None else int(end_token)
+        if start_token != real_start:
+            raise ValueError(
+                f"ragged child starts at token {start_token}, but request "
+                f"{start_request} starts at {real_start}"
+            )
+        if end_token < real_end:
+            raise ValueError(
+                f"ragged child ends at token {end_token}, before request "
+                f"{end_request} ends at {real_end}"
+            )
+
+        verify_lens = self.verify_lens[start_request:end_request]
+        qo_indptr_device = (
+            self.qo_indptr_device[start_request : end_request + 1] - real_start
+        )
+        extend_start_loc = (
+            self.extend_start_loc[start_request:end_request] - real_start
+        )
+        verify_lens_cpu = (
+            [int(v) for v in self.verify_lens_cpu[start_request:end_request]]
+            if self.verify_lens_cpu is not None
+            else None
+        )
+        # A one-request TBO batch splits as 0 + 1. Empty children never run
+        # attention, and the base layout intentionally rejects an empty host
+        # request list, so represent that child with device geometry only.
+        if start_request == end_request:
+            verify_lens_cpu = None
+
+        qo_indptr_host = None
+        if self.qo_indptr_host is not None:
+            qo_indptr_host = (
+                self.qo_indptr_host[start_request : end_request + 1] - real_start
+            )
+        kv_indptr_host = None
+        if self.kv_indptr_host is not None:
+            kv_base = self.kv_indptr_host[start_request]
+            kv_indptr_host = (
+                self.kv_indptr_host[start_request : end_request + 1] - kv_base
+            )
+        kv_lens_host = (
+            self.kv_lens_host[start_request:end_request]
+            if self.kv_lens_host is not None
+            else None
+        )
+
+        max_q_len = (
+            max(verify_lens_cpu, default=0)
+            if verify_lens_cpu is not None
+            else self.max_q_len
+        )
+        max_kv_len = (
+            int(kv_lens_host.max().item())
+            if kv_lens_host is not None and kv_lens_host.numel() > 0
+            else self.max_kv_len
+        )
+        return RaggedVerifyLayout(
+            verify_lens=verify_lens,
+            graph_num_tokens=end_token - start_token,
+            extend_start_loc=extend_start_loc,
+            qo_indptr_device=qo_indptr_device,
+            verify_lens_cpu=verify_lens_cpu,
+            total_verify_tokens=real_end - real_start,
+            qo_indptr_host=qo_indptr_host,
+            kv_indptr_host=kv_indptr_host,
+            kv_lens_host=kv_lens_host,
+            max_q_len=max_q_len,
+            max_kv_len=max_kv_len,
+            cap=self.cap,
+        )
+
     @classmethod
     def _assemble_device(
         cls,

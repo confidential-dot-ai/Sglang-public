@@ -1,5 +1,8 @@
+import itertools
+import json
 import logging
-from contextlib import nullcontext
+import os
+from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Callable, Optional, Protocol, runtime_checkable
 
 import torch
@@ -60,6 +63,8 @@ from sglang.srt.speculative.dspark_components.dspark_observability import (
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     DSparkVerifyPlanner,
     alloc_verify_window,
+    compact_dp_sum_capture_enabled,
+    compact_dp_sum_graph_token_buckets,
     dp_global_verify_tier_num_tokens,
     idle_ragged_layout,
 )
@@ -75,13 +80,13 @@ from sglang.srt.speculative.spec_utils import (
     build_grammar_vocab_mask,
     draft_pp_context,
     draft_tp_context,
+    lens_to_device,
     prepare_mamba_track_for_verify,
 )
 from sglang.srt.utils import (
     is_cuda,
     is_cuda_alike,
     is_npu,
-    is_pin_memory_available,
 )
 
 if TYPE_CHECKING:
@@ -89,7 +94,181 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Oracle-mode fixed commit length: > 0 replaces DSpark's own verify/accept
+# outcome with an unconditional N-forced-tokens-per-tick commit from
+# SamplingParams.forced_token_ids, the same knob dflash_worker_v2.py reads.
+# 0 (default) leaves oracle mode off -- DSpark has no confidence-gated
+# variant (compute_oracle_commit_via_draft_logprob) wired here: that would
+# need a DSpark-specific draft-hidden-state log-prob scorer, which doesn't
+# exist. Only the fixed-length path is supported; see the eligibility check
+# in _forward_decode's oracle block for why (only the eager, non-compact
+# accept path can apply this override at all).
+SGLANG_ORACLE_FIXED_COMMIT_LEN = int(
+    os.environ.get("SGLANG_ORACLE_FIXED_COMMIT_LEN", "0")
+)
 _is_npu = is_npu()
+
+_verify_dump_ct = itertools.count()
+
+
+def _maybe_dump_verify_forward(
+    *,
+    can_run_cuda_graph: bool,
+    verify_ids_2d: torch.Tensor,
+    next_token_logits: Optional[torch.Tensor],
+    seq_lens: torch.Tensor,
+    bs: int,
+    graph_positions: Optional[torch.Tensor] = None,
+    graph_input_ids: Optional[torch.Tensor] = None,
+    kv_probe_slots: Optional[torch.Tensor] = None,
+    kv_pool=None,
+    graph_seq_lens: Optional[torch.Tensor] = None,
+    graph_out_cache_loc: Optional[torch.Tensor] = None,
+    shadow_logits: Optional[torch.Tensor] = None,
+    plan_info_main: Optional[dict] = None,
+    plan_info_shadow: Optional[dict] = None,
+) -> None:
+    """Record the target verify forward's inputs and its top prediction,
+    tagged by whether a captured cuda graph served it.
+
+    Eager and graph runs use identical accept code, so if the graph-served
+    calls predict garbage while the eager-served ones predict sensible
+    continuations *within the same process*, the fault is the captured graph
+    rather than anything downstream. Tagging by can_run_cuda_graph gives that
+    comparison without needing two servers with different random trajectories.
+    """
+    path = envs.SGLANG_DSPARK_DEBUG_ACCEPT_DUMP_PATH.get()
+    if not path or next_token_logits is None:
+        return
+    ct = next(_verify_dump_ct)
+    if ct > 400:
+        return
+    stride = verify_ids_2d.shape[1]
+    row_logits = next_token_logits.view(bs, stride, -1)[0].float()
+    top = row_logits.topk(3, dim=-1)
+    # Per-verify-position breakdown (stride == 1 anchor/bonus token + verify_w
+    # draft tokens). custom_mask is always None for DSpark (no tree structure;
+    # linear window), so causal visibility for positions 1..verify_w is
+    # derived implicitly by each attention backend from positions/seqlen
+    # alone -- unlike position 0 (a plain single-token case, same shape as
+    # ordinary decode). If corruption is isolated to positions >= 1, that
+    # points at the multi-query causal alignment specifically, not a
+    # position-independent fault (KV, workspace, collective, ...) that would
+    # damp every position uniformly.
+    absmax_per_pos = row_logits.abs().max(dim=-1).values
+    # What the captured graph actually consumed this tick: the runner's static
+    # input buffers (refreshed per replay via copy_ in load_batch). Recorded
+    # for eager ticks too (tagged cuda_graph=False; buffers are then stale
+    # leftovers, ignore offline). positions must be exactly
+    # arange(prefix, prefix + stride) and input_ids must equal verify_ids --
+    # any divergence under cuda_graph=True is input-side corruption upstream
+    # of the model forward.
+    graph_positions_row0 = (
+        [int(v) for v in graph_positions[:stride]]
+        if graph_positions is not None
+        else None
+    )
+    graph_input_ids_row0 = (
+        [int(v) for v in graph_input_ids[:stride]]
+        if graph_input_ids is not None
+        else None
+    )
+    topk_candidates = None
+    kv_probe = None
+    if kv_probe_slots is not None and kv_pool is not None:
+        probe_layer = len(kv_pool.k_buffer) // 2
+        k_rows = kv_pool.k_buffer[probe_layer][kv_probe_slots]
+        ks_rows = kv_pool.k_scale_buffer[probe_layer][kv_probe_slots]
+        kv_probe = {
+            "layer": probe_layer,
+            "slots": [int(s) for s in kv_probe_slots],
+            "k_zero_frac": round(float((k_rows == 0).float().mean()), 4),
+            "k_scale_zero_frac": round(float((ks_rows == 0).float().mean()), 4),
+            # Per-slot content fingerprint (sum of packed bytes). Consecutive
+            # verify windows overlap in absolute slots and every tick rewrites
+            # its whole window, so an overlapping slot whose fingerprint stays
+            # frozen across ticks means the captured graph's KV write did not
+            # land -- regardless of whether the slot holds recycled nonzero
+            # bytes (which defeats the zero-frac check above).
+            "k_row_sums": [int(v) for v in k_rows.long().sum(dim=(1, 2))],
+        }
+    shadow_diff = None
+    if shadow_logits is not None:
+        shadow_rows = shadow_logits.view(bs, stride, -1)[0].float()
+        shadow_top = shadow_rows.argmax(dim=-1)
+        graph_top = row_logits.argmax(dim=-1)
+        shadow_diff = {
+            "max_absdiff_per_pos": [
+                round(float(v), 3)
+                for v in (shadow_rows - row_logits).abs().max(dim=-1).values
+            ],
+            "shadow_absmax_per_pos": [
+                round(float(v), 3) for v in shadow_rows.abs().max(dim=-1).values
+            ],
+            "top1_agree_per_pos": [bool(a == b) for a, b in zip(graph_top, shadow_top)],
+            "shadow_top1_row0": [int(t) for t in shadow_top],
+        }
+    with open(path, "a") as f:
+        f.write(
+            json.dumps(
+                {
+                    "kind": "verify_fwd",
+                    "ct": ct,
+                    "cuda_graph": bool(can_run_cuda_graph),
+                    "bs": int(bs),
+                    "seq_len0": int(seq_lens[0]),
+                    "verify_ids_row0": [int(t) for t in verify_ids_2d[0]],
+                    "top1_row0": [int(t) for t in top.indices[:, 0]],
+                    "top1_logit_row0": [round(float(v), 3) for v in top.values[:, 0]],
+                    "has_nan": bool(torch.isnan(row_logits).any()),
+                    "logit_absmax": round(float(row_logits.abs().max()), 3),
+                    "logit_absmax_per_pos": [
+                        round(float(v), 3) for v in absmax_per_pos
+                    ],
+                    "graph_positions_row0": graph_positions_row0,
+                    "graph_input_ids_row0": graph_input_ids_row0,
+                    "topk_candidates": topk_candidates,
+                    "kv_probe": kv_probe,
+                    "shadow_diff": shadow_diff,
+                    # The value the captured sparse metadata actually reads.
+                    # Must equal seq_len0 after the seq_lens-refresh fix; was
+                    # the capture fill value (1) before it.
+                    "graph_seq_len0": (
+                        int(graph_seq_lens[0]) if graph_seq_lens is not None else None
+                    ),
+                    # The KV-write locations the captured scatter actually
+                    # reads (graph buffer) vs where the page table says this
+                    # tick's window KV must land (kv_probe_slots). A mismatch
+                    # means every replay writes the window's K/V somewhere
+                    # else (slot 0 = the padded-token dumping ground when the
+                    # buffer was never refreshed), leaving the real slots
+                    # zero/stale -- the all-families-zero signature in the
+                    # replay_view prev_kv records.
+                    "graph_out_cache_loc": (
+                        [int(v) for v in graph_out_cache_loc[:stride]]
+                        if graph_out_cache_loc is not None
+                        else None
+                    ),
+                    "expected_write_slots": (
+                        [int(v) for v in kv_probe_slots]
+                        if kv_probe_slots is not None
+                        else None
+                    ),
+                    # FlashInfer PrefillPlanInfo scalars for the graph-served
+                    # plan() call (plan_info_main) vs the shadow eager
+                    # verify's own plan() call (plan_info_shadow), same
+                    # (bs, window) shape. A mismatch here (cta_tile_q,
+                    # padded_batch_size, split_kv) means the two forwards
+                    # aren't even running the same kernel schedule, which
+                    # would explain a graph-only-vs-eager-only divergence
+                    # that survived forcing split_kv off and disabling
+                    # fast_prefill_plan individually.
+                    "plan_info_main": plan_info_main,
+                    "plan_info_shadow": plan_info_shadow,
+                }
+            )
+            + "\n"
+        )
 
 
 @runtime_checkable
@@ -231,6 +410,33 @@ class DSparkWorkerV2(BaseSpecWorker):
             if self._draft_dp_context_enabled
             else parallel.tp_group
         )
+
+        # --- CC conditional decode (CCD) worker contract --------------------
+        # scheduler.py's CCD branches gate on `spec_algorithm.is_dflash_family()`,
+        # which includes DSPARK, so dflash_cc_conditional_decode.py's
+        # check_ccd_eligible / DflashCCDChunk read these attributes off THIS
+        # worker too. Without explicit values every read would fall into
+        # __getattr__'s target-worker delegation and raise AttributeError.
+        #
+        # block_size: the per-tick token stride of this worker's decode
+        # results. DflashCCDChunk views next_token_ids as [bs, block_size]
+        # and hands block_size to the finish kernel /
+        # build_synthetic_result(speculative_num_draft_tokens=...); DSpark's
+        # decode result is out_tokens [bs, verify_num_draft_tokens] flattened,
+        # and DFlashDraftInputV2.prepare_for_decode reserves chunk KV in units
+        # of server_args.speculative_num_draft_tokens (== gamma + 1 ==
+        # verify_num_draft_tokens, enforced by _handle_dspark) -- so the
+        # verify window IS DSpark's block, on both the result and the KV axis.
+        self.block_size = int(self.verify_num_draft_tokens)
+        # DSpark has no windowed/compact draft-KV rebuild (the DFLASH-only
+        # --speculative-draft-window-size feature tdx-checkpoints/120-125
+        # hardened for capture): the draft-visible KV is written once per
+        # tick by TargetHiddenKvInjector at the verify-window slots, with no
+        # per-tick host-side remapping. These two are genuinely False/None,
+        # not merely defaults.
+        self.use_compact_draft_cache = False
+        self.draft_window_size = None
+        self._need_mamba_verify_commit = False  # set in init_attention_backends
 
         if self.model_runner.tp_rank == 0:
             logger.info(
@@ -456,12 +662,110 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "DSpark prefill target-hidden projection runs before "
                 "sequence-parallel gather."
             )
+        # Same condition DFlashWorkerV2 computes here: CCD's gate must know
+        # whether the target model would need a mamba/linear-attention state
+        # commit after verify (which the captured chunk cannot do).
         self._need_mamba_verify_commit = mambaish_config(
             self.model_runner.model_config
         ) is not None and hasattr(
             self.model_runner.attn_backend,
             "update_mamba_state_after_mtp_verify",
         )
+
+    def ccd_lm_head_requires_collective(self) -> bool:
+        """CCD gate hook (see DFlashWorkerV2's namesake): would the LM-head
+        paths CCD captures fall through to an NCCL collective recorded
+        DIRECTLY in the WHILE body (illegal event nodes -->
+        cudaErrorInvalidValue at instantiation, tdx-checkpoints/122)?
+
+        DSpark's exposure is the draft base-logits path: with the
+        graph-folded draft sampler, models/dspark.py's
+        compute_base_logits/gather_and_crop_vocab all-gather runs INSIDE the
+        pre-captured draft cuda graph (legal as an embedded child node, same
+        as the target verify graph's own logits all-gather at TP>1); without
+        it, DraftBlockProposer.propose's eager fallback would record that
+        all-gather straight into the body. Unlike DFlash there is no
+        replicated-weight CCD fallback here. The sampler-is-None case is
+        already fully gated by ccd_capture_incompatible_reason (with a more
+        precise reason), so this only needs to answer for the remaining
+        configs: folded sampler present -> no in-body collective.
+        """
+        if self._draft_sampler is not None:
+            return False
+        return int(get_parallel().tp_size) > 1
+
+    def ccd_capture_incompatible_reason(self) -> Optional[str]:
+        """Worker-capability hook read by check_ccd_eligible /
+        partition_ccd_eligible: a static-config reason this worker's
+        forward_batch_generation cannot run inside CCD's captured WHILE
+        body, or None when it can. Every reason names the real blocker.
+        """
+        if self._verify_planner.schedules_verify_budget:
+            # Non-static ragged verify schedules per-tick verify lengths on
+            # the host: verify_lens D2H + .tolist() in schedule_layout, an
+            # attn-TP broadcast of verify_lens inside the body
+            # (dspark_planner._schedule_verify_lens), and per-tick
+            # confidence-relay publishes CCD's chunk never issues -- host
+            # syncs and collectives inside the captured region.
+            return (
+                "CCD with DSpark requires SGLANG_RAGGED_VERIFY_MODE=static "
+                f"(got {self._verify_planner.mode_value!r}: per-tick verify "
+                "lens are scheduled on the host and broadcast across TP "
+                "inside the captured body)"
+            )
+        if self._observers.has_capture_unsafe_sink:
+            # Segment timing records CUDA events per tick (event nodes are
+            # illegal in a conditional body), REQS staging issues a per-tick
+            # D2H, block-accept/STS recorders .tolist() on flush.
+            return (
+                "CCD with DSpark requires all step observers disabled "
+                "(SGLANG_DSPARK_DEBUG_DUMP / SGLANG_DSPARK_ENABLE_SPS_RECORD "
+                "/ SGLANG_DSPARK_BLOCK_ACCEPT_ESTIMATE_PATH / "
+                "SGLANG_DSPARK_STS_COLLECT_PATH / "
+                "SGLANG_DSPARK_DEBUG_CONFIDENCE_METRICS): active sinks record "
+                "CUDA events and issue D2H copies every tick"
+            )
+        if self._draft_sampler is None:
+            # Eager proposal path: compute_base_logits runs OUTSIDE the
+            # pre-captured draft graph -- under TP>1 that records an NCCL
+            # all-gather of the shared LM head directly in the body
+            # (tdx-checkpoints/122 crash class), and it only ever runs when
+            # the draft forward itself could not replay its captured graph
+            # (eager attention-metadata host ops in the body).
+            return (
+                "CCD with DSpark requires the graph-folded draft sampler "
+                "(cuda graphs enabled, markov-head draft): the eager "
+                "proposal fallback computes draft base logits outside the "
+                "captured draft graph, all-gathering the shared LM head "
+                "across TP inside the body under TP>1"
+            )
+        return None
+
+    def log_ccd_capability(self) -> None:
+        """Report, once at startup, whether CCD can actually run here.
+
+        CCD is strictly opt-in and its eligibility is evaluated per batch, so
+        a misconfigured deployment silently serves with CCD off and looks
+        identical to one where it is on. ccd_capture_incompatible_reason
+        already names the real blocker; surfacing it turns "is CCD running?"
+        into something an operator reads off the log instead of inferring
+        from throughput.
+        """
+        from sglang.srt.speculative.dflash_cc_conditional_decode import (
+            SGLANG_CC_CONDITIONAL_DECODE,
+        )
+
+        if not SGLANG_CC_CONDITIONAL_DECODE:
+            logger.info("[CCD] disabled (SGLANG_CC_CONDITIONAL_DECODE unset)")
+            return
+        reason = self.ccd_capture_incompatible_reason()
+        if reason is None:
+            logger.info(
+                "[CCD] enabled; this DSpark worker is capture-eligible "
+                "(per-batch gates in check_ccd_eligible still apply)"
+            )
+        else:
+            logger.warning("[CCD] enabled but INELIGIBLE: %s", reason)
 
     def init_cuda_graphs(self):
         if not self._hosts_draft:
@@ -498,9 +802,44 @@ class DSparkWorkerV2(BaseSpecWorker):
                             make_draft_sampler_capture_hook(self._draft_sampler)
                         )
                 self._proposer.attach_draft_sampler(self._draft_sampler)
-            self._draft_worker.init_cuda_graphs(
-                capture_decode_cuda_graph=capture_decode_cuda_graph
-            )
+            with self._ring_mapping_capture_safe():
+                self._draft_worker.init_cuda_graphs(
+                    capture_decode_cuda_graph=capture_decode_cuda_graph
+                )
+        # After the draft sampler is built -- ccd_capture_incompatible_reason
+        # reads self._draft_sampler, which is assigned above, so calling this
+        # any earlier reports a spurious 'eager proposal fallback'.
+        self.log_ccd_capability()
+
+    @contextmanager
+    def _ring_mapping_capture_safe(self):
+        """Make the draft's full->SWA ring mapping readable during capture.
+
+        The mapping is initialised to -1 everywhere on purpose, so that a loc
+        no forward has published faults loudly instead of silently aliasing
+        ring slot 0. Graph capture then walks straight into that: its warmup
+        forwards write at synthetic out_cache_loc values that no injector has
+        published, translate_loc_from_full_to_swa hands back -1, and
+        store_kvcache dies on `index >= 0 && index < size_limit` -- a
+        device-side assert from inside BatchPrefillWithPagedKVCache, tens of
+        minutes into a boot.
+
+        Capture only needs the indices to be IN RANGE; the values are dummy
+        either way, no request is live, and replay reads the mapping tensor
+        fresh each tick, so what is captured here is the load, not the value.
+        Point every entry at slot 0 for the duration and restore the sentinel
+        afterwards, so the loud-fault property still holds at runtime.
+        """
+        pool = getattr(self.draft_model_runner, "token_to_kv_pool", None)
+        mapping = getattr(pool, "full_to_swa_index_mapping", None)
+        if getattr(pool, "draft_swa_ring_stride", None) is None or mapping is None:
+            yield
+            return
+        mapping.fill_(0)
+        try:
+            yield
+        finally:
+            mapping.fill_(-1)
 
     def _maybe_build_draft_sampler(self, *, available_memory_gb: float):
         return maybe_build_draft_sampler(
@@ -552,6 +891,33 @@ class DSparkWorkerV2(BaseSpecWorker):
             return
         self._observers.note_request_finished(rid=rid, natural_stop=natural_stop)
 
+    def _append_target_hidden_to_draft_kv_by_loc(
+        self,
+        *,
+        target_hidden: torch.Tensor,
+        cache_loc: torch.Tensor,
+        positions: torch.Tensor,
+        cache_loc_2d: Optional[torch.Tensor] = None,
+        commit_lens: Optional[torch.Tensor] = None,
+    ) -> None:
+        """DFlash-named entry point for the PD hidden-state fast path.
+
+        disaggregation/decode.py's _materialize_dflash_draft_kv_for_prebuilt
+        calls this name on model_worker when prefill shipped real hidden
+        states. DSpark performs the same injection via _kv_injector, and the
+        two signatures match exactly, so delegate rather than duplicate.
+
+        Without this, __getattr__ forwards the lookup to target_worker (which
+        also lacks it) and the decode scheduler dies with AttributeError.
+        """
+        self._kv_injector.inject_target_hidden(
+            target_hidden=target_hidden,
+            cache_loc=cache_loc,
+            positions=positions,
+            cache_loc_2d=cache_loc_2d,
+            commit_lens=commit_lens,
+        )
+
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,
@@ -559,7 +925,12 @@ class DSparkWorkerV2(BaseSpecWorker):
         grammar_barrier=None,
         *,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        capture_hidden_mode: Optional[CaptureHiddenMode] = None,
+        force_eager_decode: bool = False,
     ) -> GenerationBatchResult:
+        """force_eager_decode: run this step's forwards eagerly -- see
+        ForwardBatch.force_eager_decode. Only meaningful for the decode
+        path."""
         if not self._hosts_draft:
             batch_output = self.target_worker.forward_batch_generation(
                 batch,
@@ -573,15 +944,27 @@ class DSparkWorkerV2(BaseSpecWorker):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             self._verify_planner.note_non_decode_step()
             self._observers.note_prefill_step()
-            return self._forward_prefill(batch, on_publish, pp_proxy_tensors)
+            return self._forward_prefill(
+                batch,
+                on_publish,
+                pp_proxy_tensors=pp_proxy_tensors,
+                capture_hidden_mode=capture_hidden_mode,
+            )
 
-        return self._forward_decode(batch, on_publish, grammar_barrier)
+        return self._forward_decode(
+            batch,
+            on_publish,
+            grammar_barrier,
+            force_eager_decode=force_eager_decode,
+        )
 
     def _forward_prefill(
         self,
         batch: ScheduleBatch,
         on_publish,
+        *,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        capture_hidden_mode: Optional[CaptureHiddenMode] = None,
     ) -> GenerationBatchResult:
         if batch.forward_mode.is_idle():
             if get_parallel().enable_dp_attention:
@@ -626,13 +1009,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         # Must inject before prefill returns: the scheduler may update radix
         # afterward, invalidating out_cache_loc.
         device = next_token_ids.device
-        pin_memory = is_pin_memory_available(device)
-        ctx_lens = torch.tensor(
-            batch.extend_lens, dtype=torch.int32, pin_memory=pin_memory
-        ).to(device, non_blocking=True)
-        draft_seq_lens = torch.tensor(
-            batch.prefix_lens, dtype=torch.int32, pin_memory=pin_memory
-        ).to(device, non_blocking=True)
+        ctx_lens = lens_to_device(lens=batch.extend_lens, device=device)
+        draft_seq_lens = lens_to_device(lens=batch.prefix_lens, device=device)
         positions, _ = compute_position(
             self.model_runner.prefill_attention_backend_str,
             draft_seq_lens,
@@ -644,7 +1022,20 @@ class DSparkWorkerV2(BaseSpecWorker):
         # injector keeps only the last SWA window (older prefill tokens share a
         # ring slot and would race). Cheap; only consumed under unified_kv.
         state_slot = final_pos = None
-        if is_unified_kv_triton():
+        # A ring-pooled draft needs the same (req slot, final position) pair to
+        # publish its mapping, so compute it whenever either consumer is active.
+        # The DRAFT's pool, not the target's: draft_swa_ring_stride is set on
+        # the ring-pooled draft pool (kv_cache_configurator's
+        # _draft_swa_ring_active branch), and TargetHiddenKvInjector reads that
+        # same draft pool. Gating on self.model_runner (which is the TARGET
+        # worker's runner, assigned in __init__) always found the attribute
+        # missing, so state_slot stayed None and _maybe_publish_ring_mapping
+        # raised for exactly the configuration the ring exists to serve.
+        pool = self.draft_model_runner.token_to_kv_pool
+        needs_ring_keys = is_unified_kv_triton() or (
+            getattr(pool, "draft_swa_ring_stride", None) is not None
+        )
+        if needs_ring_keys:
             repeats = ctx_lens.to(torch.int64)
             num_tokens = sum(batch.extend_lens)
             state_slot = torch.repeat_interleave(
@@ -673,9 +1064,16 @@ class DSparkWorkerV2(BaseSpecWorker):
             final_pos=final_pos,
             target_hidden_is_projected=target_hidden_is_projected,
         )
-        # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
-        logits_output.hidden_states = None
-        logits_output.hidden_states_token_indices = None
+        # Normally nulled to keep large hidden-state buffers out of
+        # overlap scheduling's D2H path. Under PD hidden-state transfer the
+        # scheduler reads this tensor immediately after we return (see
+        # scheduler.py's write_target_hidden_states call), so nulling it
+        # would make the transfer deliver nothing and silently fall back to
+        # _recompute_dflash_draft_kv_inplace -- the exact work this feature
+        # removes. Keep it only when the caller asked to capture.
+        if capture_hidden_mode is None:
+            logits_output.hidden_states = None
+            logits_output.hidden_states_token_indices = None
 
         batch_output.next_draft_input = make_next_draft_input(
             bonus_tokens=next_token_ids,
@@ -689,6 +1087,33 @@ class DSparkWorkerV2(BaseSpecWorker):
         global_bs = max(batch.global_num_tokens)
         if global_bs <= 0:
             return None
+        sum_graph_buckets = compact_dp_sum_graph_token_buckets(
+            model_runner=self.model_runner,
+            global_tier_num_tokens=getattr(
+                batch, "global_spec_verify_tier_num_tokens", None
+            ),
+            global_num_reqs=batch.global_num_tokens,
+        )
+        if compact_dp_sum_capture_enabled(self.model_runner):
+            if sum_graph_buckets is None:
+                # Keep the busy and idle ranks on the same static/eager
+                # fallback when the gathered SUM token vector is unavailable
+                # or outside the captured grid.  Building the legacy DP-max
+                # compact dummy here would make its physical row count exceed
+                # the zero local contribution used by eager DP padding.
+                return None
+            # SUM capture permits a different local graph on every rank.  An
+            # idle rank still executes one dummy row and contributes the
+            # smallest captured token bucket to the collective vector; it no
+            # longer fabricates `global_bs` rows merely to match MAX_LEN's
+            # cross-rank graph key.
+            return idle_ragged_layout(
+                tier_num_reqs=1,
+                dp_tier_num_tokens=sum_graph_buckets[get_parallel().attn_dp_rank],
+                device=self.device,
+                verify_num_draft_tokens=self.verify_num_draft_tokens,
+                model_runner=self.model_runner,
+            )
         return idle_ragged_layout(
             tier_num_reqs=global_bs,
             dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
@@ -705,8 +1130,28 @@ class DSparkWorkerV2(BaseSpecWorker):
             and self._verify_planner.is_compact_mode
         ):
             return None
+        sum_graph_buckets = compact_dp_sum_graph_token_buckets(
+            model_runner=self.model_runner,
+            global_tier_num_tokens=getattr(
+                batch, "global_spec_verify_tier_num_tokens", None
+            ),
+            global_num_reqs=batch.global_num_tokens,
+        )
+        if compact_dp_sum_capture_enabled(self.model_runner):
+            # A missing/sentinel/out-of-grid gathered vector is a shared graph
+            # miss.  Do not fall through to MAX_LEN's scalar max here: in
+            # compact SUM mode the planner interprets a non-None value as this
+            # rank's graph-token bucket, and an out-of-grid max can reach
+            # round_up_grid before admission gets a chance to reject it.
+            return (
+                None
+                if sum_graph_buckets is None
+                else sum_graph_buckets[get_parallel().attn_dp_rank]
+            )
         return dp_global_verify_tier_num_tokens(
-            global_tier_num_tokens=batch.global_spec_verify_tier_num_tokens
+            global_tier_num_tokens=getattr(
+                batch, "global_spec_verify_tier_num_tokens", None
+            )
         )
 
     def _decode_idle_result(
@@ -732,7 +1177,12 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def _forward_decode(
-        self, batch: ScheduleBatch, on_publish, grammar_barrier=None
+        self,
+        batch: ScheduleBatch,
+        on_publish,
+        grammar_barrier=None,
+        *,
+        force_eager_decode: bool = False,
     ) -> GenerationBatchResult:
         if batch.spec_info is None:
             batch.spec_info = DFlashDraftInputV2.create_idle_input(device=self.device)
@@ -746,9 +1196,13 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._observers.note_idle_decode_step()
             if get_parallel().enable_dp_attention:
                 if self._draft_is_moe:
-                    self._proposer.run_idle_participation(batch)
+                    self._proposer.run_idle_participation(
+                        batch, force_eager_decode=force_eager_decode
+                    )
                 self._verify_executor.run_idle_participation(
-                    batch=batch, idle_layout=self._idle_verify_ragged_layout(batch)
+                    batch=batch,
+                    idle_layout=self._idle_verify_ragged_layout(batch),
+                    force_eager_decode=force_eager_decode,
                 )
             return self._decode_idle_result(on_publish=on_publish)
 
@@ -758,6 +1212,26 @@ class DSparkWorkerV2(BaseSpecWorker):
         bs = len(batch.seq_lens)
         device = self.device
         prefix_lens = batch.seq_lens
+
+        from sglang.srt.oracle_decode.forced_token_pool import (
+            compute_oracle_commit_fixed_len,
+            gather_oracle_window,
+            resolve_ccd_forced_lookup,
+        )
+
+        oracle_lookup = resolve_ccd_forced_lookup(batch, device)
+        oracle_commit = envs.SGLANG_ORACLE_FIXED_COMMIT_LEN.get()
+        if oracle_lookup is not None and (
+            oracle_commit <= 0
+            or oracle_commit > self.verify_num_draft_tokens
+            or self._verify_planner.mode_value != "static"
+            or batch.has_grammar
+            or batch.return_logprob
+        ):
+            raise ValueError(
+                "DSpark oracle requires static verification, a valid fixed "
+                "commit length, and no grammar or logprobs"
+            )
 
         self._observers.begin_step()
 
@@ -781,6 +1255,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 device=device,
                 target_model=target_model,
                 sampling_info=sampling_info,
+                force_eager_decode=force_eager_decode,
             )
         draft_block_ids = proposal.draft_block_ids
         draft_block = proposal.draft_block
@@ -824,6 +1299,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             [draft_block_ids[:, :1], draft_tokens], dim=1
         ).contiguous()
 
+        # Draft computation still runs in full. Teacher-force target inputs so
+        # committed KV and Engram history describe the emitted oracle sequence.
+        if oracle_lookup is not None:
+            oracle_verify, oracle_valid = gather_oracle_window(
+                prefix_lens, self.verify_num_draft_tokens, oracle_lookup
+            )
+            verify_ids_2d = torch.where(oracle_valid, oracle_verify, verify_ids_2d)
+
         # Must stay ahead of the target verify launch below.
         grammar_tree = (
             GrammarTree.from_linear_chain(verify_ids_2d) if batch.has_grammar else None
@@ -840,6 +1323,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             and (sampling_info is None or sampling_info.is_all_greedy)
             and verify_logits_adjustments_are_noop(sampling_info)
             and self._simulate_acc_len <= 0
+            and oracle_lookup is None
             and not batch.has_grammar
         )
         prepare_mamba_track_for_verify(batch)
@@ -854,6 +1338,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     device=device,
                     sampling_info=sampling_info,
                     inject_gate=fold_eligible,
+                    force_eager_decode=force_eager_decode,
                 )
             else:
                 if (
@@ -867,10 +1352,70 @@ class DSparkWorkerV2(BaseSpecWorker):
                     verify_ids_2d=verify_ids_2d,
                     verify_window=verify_window,
                     sampling_info=sampling_info,
+                    force_eager_decode=force_eager_decode,
                 )
                 hidden_strided = None
         logits_output = target_verify.logits_output
         can_run_cuda_graph = target_verify.can_run_cuda_graph
+        shadow_logits = None
+        plan_info_main = None
+        plan_info_shadow = None
+        if (
+            envs.SGLANG_DSPARK_DEBUG_SHADOW_EAGER_VERIFY.get()
+            and can_run_cuda_graph
+            and not run_compact
+        ):
+            from sglang.srt.layers.attention.flashinfer_backend import (
+                get_last_dspark_verify_plan_info,
+            )
+
+            plan_info_main = get_last_dspark_verify_plan_info()
+            shadow = self._verify_executor.run_non_compact(
+                batch=batch,
+                draft_input=draft_input,
+                verify_ids_2d=verify_ids_2d,
+                verify_window=verify_window,
+                sampling_info=sampling_info,
+                force_eager_decode=True,
+            )
+            shadow_logits = shadow.logits_output.next_token_logits
+            plan_info_shadow = get_last_dspark_verify_plan_info()
+        target_graph_runner = self.model_runner.decode_cuda_graph_runner
+        kv_probe_slots = None
+        kv_pool = None
+        _maybe_dump_verify_forward(
+            can_run_cuda_graph=can_run_cuda_graph,
+            verify_ids_2d=verify_ids_2d,
+            next_token_logits=logits_output.next_token_logits,
+            seq_lens=batch.seq_lens,
+            bs=bs,
+            graph_positions=(
+                target_graph_runner.buffers.positions
+                if target_graph_runner is not None
+                else None
+            ),
+            graph_input_ids=(
+                target_graph_runner.buffers.input_ids
+                if target_graph_runner is not None
+                else None
+            ),
+            kv_probe_slots=kv_probe_slots,
+            kv_pool=kv_pool,
+            graph_seq_lens=(
+                target_graph_runner.buffers.seq_lens
+                if target_graph_runner is not None
+                else None
+            ),
+            graph_out_cache_loc=(
+                target_graph_runner.buffers.out_cache_loc
+                if target_graph_runner is not None
+                else None
+            ),
+            shadow_logits=shadow_logits,
+            plan_info_main=plan_info_main,
+            plan_info_shadow=plan_info_shadow,
+        )
+
         if batch.has_grammar:
             # run_compact scatters its rows back to (bs * chain_len), so the mask
             # lines up with the logits on both verify paths.
@@ -902,24 +1447,107 @@ class DSparkWorkerV2(BaseSpecWorker):
             prefix_lens=prefix_lens,
             draft_tokens=draft_tokens,
         )
+        if oracle_lookup is not None:
+            forced_tokens, forced_lens, override = compute_oracle_commit_fixed_len(
+                prefix_lens + 1,
+                self.verify_num_draft_tokens,
+                oracle_commit,
+                oracle_lookup,
+            )
+            accept.out_tokens = torch.where(
+                override[:, None], forced_tokens, accept.out_tokens
+            )
+            accept.commit_lens = torch.where(override, forced_lens, accept.commit_lens)
+            last_forced = forced_tokens.gather(
+                1, (forced_lens.long() - 1).clamp(min=0)[:, None]
+            ).squeeze(1)
+            accept.bonus = torch.where(override, last_forced, accept.bonus)
+            accept.correct_len = accept.commit_lens - 1
+            accept.new_seq_lens = prefix_lens + accept.commit_lens.to(prefix_lens.dtype)
+
         self.model_runner.ngram_embedding_manager.update_after_verify(
             verify_ids_2d=verify_ids_2d,
             req_pool_indices=batch.req_pool_indices,
             commit_lens=accept.commit_lens,
         )
+        out_tokens = accept.out_tokens
+        commit_lens = accept.commit_lens
+        bonus = accept.bonus
+        new_seq_lens = accept.new_seq_lens
+
+        # Oracle mode (SamplingParams.forced_token_ids replay). Only the
+        # eager, non-folded accept path can apply this override: the folded
+        # path's commit (DsparkVerifyEpilogue._commit_inject) runs INSIDE
+        # the captured target-verify cuda graph, before this Python code
+        # gets a chance to see accept.commit_lens at all -- overriding it
+        # here would be a no-op for that path's actual KV write, silently
+        # diverging the served token stream from what got committed to KV.
+        # folded_accept is unconditionally False under the
+        # SGLANG_RAGGED_VERIFY_MODE=static config (should_run_compact
+        # requires RaggedVerifyMode.COMPACT, and verify_epilogue is only
+        # built under is_compact_mode) -- true today, but checked explicitly
+        # rather than assumed, so a future config change fails loudly
+        # instead of silently serving unforced tokens.
+        forced_lookup = resolve_ccd_forced_lookup(batch, device)
+        if forced_lookup is not None:
+            if folded_accept:
+                raise RuntimeError(
+                    "DSpark oracle mode (forced_token_ids) is not supported "
+                    "under the folded/compact accept path (verify_epilogue "
+                    "commits KV inside the captured cuda graph, before this "
+                    "override point). Run with SGLANG_RAGGED_VERIFY_MODE=static "
+                    "to keep the eager accept path this override needs."
+                )
+            if SGLANG_ORACLE_FIXED_COMMIT_LEN <= 0:
+                raise RuntimeError(
+                    "DSpark oracle mode requires SGLANG_ORACLE_FIXED_COMMIT_LEN "
+                    "> 0: DSpark has no confidence-gated oracle variant "
+                    "(compute_oracle_commit_via_draft_logprob) wired -- that "
+                    "would need a DSpark-specific draft-hidden-state log-prob "
+                    "scorer, which doesn't exist here."
+                )
+            # Same +1 convention as DFlash (dflash_worker_v2.py): prefix_lens
+            # is the position of the last-streamed token (the pending bonus),
+            # out_tokens[:, j] streams at prefix_lens + 1 + j.
+            out_positions = prefix_lens + 1
+            forced = compute_oracle_commit_fixed_len(
+                out_positions,
+                int(self.verify_num_draft_tokens),
+                SGLANG_ORACLE_FIXED_COMMIT_LEN,
+                forced_lookup,
+            )
+            if forced is not None:
+                forced_tokens, forced_commit_lens, override_mask = forced
+                out_tokens = torch.where(
+                    override_mask.unsqueeze(1), forced_tokens, out_tokens
+                )
+                commit_lens = torch.where(
+                    override_mask, forced_commit_lens, commit_lens
+                )
+                # Re-seed the next tick's bonus with the last committed forced
+                # token, not the target's own prediction -- same rationale as
+                # DFlash's bonus reseed: otherwise conditioning context
+                # diverges from the trace at every position.
+                last_forced = forced_tokens.gather(
+                    1,
+                    (forced_commit_lens.to(torch.int64) - 1).clamp(min=0).unsqueeze(1),
+                ).squeeze(1)
+                bonus = torch.where(override_mask, last_forced, bonus)
+                new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
+
         if batch.return_logprob:
             compute_spec_logprobs(
                 batch,
                 logits_output,
-                accept.out_tokens.reshape(-1),
+                out_tokens.reshape(-1),
                 chain_stride=self.verify_num_draft_tokens,
             )
 
         if on_publish is not None:
             if confidence is not None:
-                on_publish(accept.new_seq_lens, confidence=confidence)
+                on_publish(new_seq_lens, confidence=confidence)
             else:
-                on_publish(accept.new_seq_lens)
+                on_publish(new_seq_lens)
 
         self._commit_target_mamba_states_after_verify(
             batch=batch,
@@ -936,7 +1564,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 hidden_strided=hidden_strided,
                 verify_window=verify_window,
                 logits_output=logits_output,
-                commit_lens=accept.commit_lens,
+                commit_lens=commit_lens,
                 bs=bs,
                 run_compact=run_compact,
             )
@@ -957,22 +1585,24 @@ class DSparkWorkerV2(BaseSpecWorker):
             sampling_info=sampling_info,
             correct_len=accept.correct_len,
             cap_trim_lens=accept.cap_trim_lens,
-            bonus=accept.bonus,
-            commit_lens=accept.commit_lens,
+            bonus=bonus,
+            commit_lens=commit_lens,
             verify_token_budget=verify_token_budget,
             req_pool_indices=batch.req_pool_indices,
             verify_tier_num_tokens=int(batch.spec_verify_tier_num_tokens),
             dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
+            can_run_cuda_graph=can_run_cuda_graph,
+            folded_accept=folded_accept,
         )
 
         next_draft_input = make_next_draft_input(
-            bonus_tokens=accept.bonus,
-            new_seq_lens=accept.new_seq_lens,
+            bonus_tokens=bonus,
+            new_seq_lens=new_seq_lens,
         )
         return GenerationBatchResult(
             logits_output=logits_output,
-            next_token_ids=accept.out_tokens.reshape(-1),
-            accept_lens=accept.commit_lens,
+            next_token_ids=out_tokens.reshape(-1),
+            accept_lens=commit_lens,
             block_accept_lens=accept.commit_lens + accept.cap_trim_lens,
             cap_lens=(
                 layout.verify_lens.to(torch.int32) if layout is not None else None
@@ -980,7 +1610,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
             speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
-            new_seq_lens=accept.new_seq_lens,
+            new_seq_lens=new_seq_lens,
         )
 
     def _commit_target_mamba_states_after_verify(

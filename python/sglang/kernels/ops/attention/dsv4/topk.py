@@ -54,6 +54,7 @@ def _jit_topk_v2_module():
         ("topk_transform_paged", f"{kernel}::transform_paged"),
         ("topk_transform_ragged", f"{kernel}::transform_ragged"),
         ("topk_plan", f"{kernel}::plan"),
+        ("topk_transform_with_histogram", f"{kernel}::transform_with_histogram"),
     ]
     if is_hip_runtime():
         # transform_packed only exists under USE_ROCM, see topk_v2.cuh
@@ -340,4 +341,35 @@ def topk_transform_sparse(
     published blocks as pool slots / 8, compressed positions for logical ids."""
     topk_transform_bf16_small(
         logits, valid_lens, blocks, out_indices, CANDIDATE_BLOCK_SIZE
+    )
+
+
+def topk_transform_paged_v2_with_histogram(
+    scores: torch.Tensor,
+    histograms: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_tables: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+    metadata: torch.Tensor,
+    out_raw_indices: Optional[torch.Tensor] = None,
+) -> None:
+    """Top-k v2 using the 1024-bin histogram emitted by paged-MQA.
+
+    ``histograms[row]`` must count ``extract_coarse_bin<10>(score)`` for every
+    valid score in that row.  The kernel retains the normal fp32 boundary and
+    exact radix tie passes; only the redundant first read of the wide score
+    tensor is removed. The input is scratch storage: every consumed histogram
+    row is reset to zero before the kernel completes.
+    """
+    module = _jit_topk_v2_module()
+    module.topk_transform_with_histogram(
+        scores,
+        histograms,
+        seq_lens,
+        page_tables,
+        out_page_indices,
+        page_size,
+        metadata,
+        out_raw_indices,
     )

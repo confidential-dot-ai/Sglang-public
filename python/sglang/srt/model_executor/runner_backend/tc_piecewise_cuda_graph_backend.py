@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import warnings
 from contextlib import contextmanager
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import torch
@@ -84,6 +85,32 @@ def _toggle_fused_ops(
                 sub.enter_torch_compile(num_tokens=num_tokens)
         if isinstance(sub, torch.nn.Module):
             _toggle_fused_ops(sub, reverse=reverse, num_tokens=num_tokens)
+
+
+
+def _cp_ring_dynamic_output_shape_ctx():
+    """Ring-attention CP's zigzag split (cp_utils.py's cp_split_and_rebuild_data_pcg,
+    communicator.py's _moe_cp_pad_and_allgather/_moe_cp_narrow_to_local) uses
+    a genuinely unbacked SymInt output row count -- a concrete or
+    tensor-shape-derived size gets baked into the traced graph as a constant
+    that goes stale once CUDAPiecewiseBackend starts replaying the same
+    compiled callable across differently-shaped piecewise captures. Dynamo
+    raises DynamicOutputShapeException for such ops unless this is enabled;
+    scoped to CP ring mode only so tracing behavior for every other model/
+    feature under tc_piecewise capture is unchanged.
+    """
+    import torch._dynamo.config
+
+    from sglang.srt.environ import envs
+
+    if envs.SGLANG_CP_ATTN_MODE.get() != "ring":
+        return nullcontext()
+
+    from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
+
+    if is_prefill_context_parallel_enabled():
+        return torch._dynamo.config.patch(capture_dynamic_output_shape_ops=True)
+    return nullcontext()
 
 
 class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
@@ -251,7 +278,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
 
     @contextmanager
     def replay_session(self):
-        with enable_tc_piecewise_cuda_graph():
+        with enable_tc_piecewise_cuda_graph(), _cp_ring_dynamic_output_shape_ctx():
             yield
 
     def replay(

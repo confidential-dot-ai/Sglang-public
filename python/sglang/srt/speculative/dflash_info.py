@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
+import time
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -19,6 +21,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
+logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 
 
@@ -46,6 +49,9 @@ class DFlashVerifyInput(SpecInput):
     num_tokens_per_req: int = -1
 
     ragged_verify_layout: Optional[RaggedVerifyLayout] = None
+    # Per-DP-rank packed graph-token buckets for compact SUM_LEN capture.
+    # None for static/MAX_LEN and for a rank-consistent graph miss.
+    dp_graph_num_tokens: Optional[list[int]] = None
     # Committed/live lengths before the verify caller temporarily expands
     # batch.seq_lens_cpu to the target-attention KV lengths.
     live_seq_lens_cpu: Optional[torch.Tensor] = None
@@ -62,13 +68,20 @@ class DFlashVerifyInput(SpecInput):
         self,
         batch: ScheduleBatch,
         target_worker: TpModelWorker,
+        *,
+        force_eager_decode: bool = False,
     ) -> tuple[ForwardBatch, bool]:
         """Prepare a DFLASH verify forward batch for overlap scheduling.
 
         The caller computes and stores `batch.out_cache_loc` before this
-        method is called. GPU keeps the original pre-planning path. NPU leaves
+        method is called. On GPU, this helper packages the verify forward and
+        pre-initializes CUDA-graph replay or eager attention metadata so the
+        actual forward can run with `skip_attn_backend_init=True`. NPU leaves
         attention/graph metadata initialization to ModelRunner because DP/EP
         padding can still change the compressor's runtime shapes.
+
+        force_eager_decode: run the verify forward eagerly; see
+        ForwardBatch.force_eager_decode.
         """
         from sglang.srt.speculative.spec_utils import prepare_mamba_track_for_verify
 
@@ -90,24 +103,52 @@ class DFlashVerifyInput(SpecInput):
             if batch.forward_mode.is_idle()
             else ForwardMode.TARGET_VERIFY
         )
+        if self.ragged_verify_layout is not None:
+            from sglang.srt.speculative.dspark_components.dspark_planner import (
+                compact_dp_sum_graph_token_buckets,
+            )
+
+            self.dp_graph_num_tokens = compact_dp_sum_graph_token_buckets(
+                model_runner=target_worker.model_runner,
+                global_tier_num_tokens=getattr(
+                    batch, "global_spec_verify_tier_num_tokens", None
+                ),
+                global_num_reqs=getattr(batch, "global_num_tokens", None),
+            )
+        else:
+            self.dp_graph_num_tokens = None
         if not batch.forward_mode.is_idle():
             # Rebuild mamba track indices (lazy: gather the positions planned
             # by mamba_lazy_spec_prepare) and clear the stale extend-time mask
             # before init_new snapshots them into the verify ForwardBatch.
             # Same hook eagle/ngram/dspark run before TARGET_VERIFY.
             prepare_mamba_track_for_verify(batch)
-        verify_forward_batch = ForwardBatch.init_new(
-            batch,
-            target_worker.model_runner,
-            capture_hidden_mode=self.capture_hidden_mode,
-            return_hidden_states_before_norm=False,
-        )
+        init_started_ns = time.perf_counter_ns()
+        if batch.spec_algorithm.is_dspark():
+            verify_forward_batch = ForwardBatch.init_dspark_target_verify(
+                batch,
+                target_worker.model_runner,
+                capture_hidden_mode=self.capture_hidden_mode,
+                return_hidden_states_before_norm=False,
+                force_eager_decode=force_eager_decode,
+            )
+        else:
+            verify_forward_batch = ForwardBatch.init_new(
+                batch,
+                target_worker.model_runner,
+                capture_hidden_mode=self.capture_hidden_mode,
+                return_hidden_states_before_norm=False,
+                force_eager_decode=force_eager_decode,
+            )
+        runner = target_worker.model_runner.decode_cuda_graph_runner
+        if runner is not None:
+            runner.record_metadata_timing(
+                "forward_batch_init_cpu_ms",
+                (time.perf_counter_ns() - init_started_ns) / 1e6,
+            )
 
         can_run_cuda_graph = bool(
-            target_worker.model_runner.decode_cuda_graph_runner
-            and target_worker.model_runner.decode_cuda_graph_runner.can_run_graph(
-                verify_forward_batch
-            )
+            runner and runner.can_run_graph(verify_forward_batch)
         )
         if _is_npu:
             # Do not pre-plan target verify on NPU. DP/EP padding can change
@@ -115,9 +156,13 @@ class DFlashVerifyInput(SpecInput):
             # stale-plan shape fields. Let ModelRunner select graph/eager and
             # initialize metadata after final batch preparation.
             return verify_forward_batch, can_run_cuda_graph
-        elif can_run_cuda_graph:
-            target_worker.model_runner.decode_cuda_graph_runner.load_batch(
-                verify_forward_batch
+
+        if can_run_cuda_graph:
+            load_started_ns = time.perf_counter_ns()
+            runner.stage_batch(verify_forward_batch)
+            runner.record_metadata_timing(
+                "preplan_dispatch_cpu_ms",
+                (time.perf_counter_ns() - load_started_ns) / 1e6,
             )
         elif not batch.forward_mode.is_idle():
             target_worker.model_runner.attn_backend.init_forward_metadata(
@@ -139,9 +184,14 @@ class DFlashVerifyInput(SpecInput):
         bs = len(req_pool_indices)
 
         layout = self.ragged_verify_layout
-        if layout is not None and layout.bs != bs:
-            # Graph replay pads the batch to the captured slots; match it.
-            layout = layout.padded_to_bucket(padded_bs=bs)
+        if layout is not None:
+            # Graph replay pads the batch to the captured request slots. Keep
+            # each synthetic row within the statically captured verify width;
+            # an unassignable remainder in the token tier is a ghost tail and
+            # must not enlarge a request's causal Q/K geometry.
+            layout = layout.padded_to_bucket(
+                padded_bs=bs, cap=self.draft_token_num
+            )
 
         if layout is None:
             qo_indptr = torch.arange(
@@ -156,7 +206,10 @@ class DFlashVerifyInput(SpecInput):
         else:
             qo_indptr = layout.qo_indptr_device
             verify_lens = layout.verify_lens
-            kv_indices_extra = layout.total_verify_tokens
+            # Capped/device-only layouts intentionally do not carry a host
+            # total. The graph token tier is a safe allocation bound; the
+            # device indptrs below delimit the exact initialized prefix.
+            kv_indices_extra = layout.graph_num_tokens
 
         cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
         paged_kernel_lens = paged_kernel_lens + verify_lens

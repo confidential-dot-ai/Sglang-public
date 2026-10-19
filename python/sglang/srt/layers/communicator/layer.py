@@ -593,13 +593,28 @@ class LayerCommunicator:
                     context=self._context,
                 )
             )
-            if (
-                gathered_last_layer_output is residual
-                # An accumulator that copies on append already holds a snapshot.
-                and not getattr(captured_last_layer_outputs, "copies_on_append", False)
-                and not self._post_attn_residual_is_read_only(residual, forward_batch)
+            copies_on_append = getattr(
+                captured_last_layer_outputs, "copies_on_append", False
+            )
+            is_tbo_child = (
+                getattr(forward_batch, "tbo_parent_token_range", None) is not None
+            )
+            if not copies_on_append and (
+                # A TBO child carries this value across decomposed operation
+                # stages. Even when the communication helper returns a tensor
+                # different from ``residual``, it may be a reusable DP/TP
+                # communication buffer that a later layer or ubatch overwrites
+                # before aux states are merged and handed to the draft model.
+                # Give every captured layer an owning snapshot.
+                is_tbo_child
+                or (
+                    gathered_last_layer_output is residual
+                    and not self._post_attn_residual_is_read_only(
+                        residual, forward_batch
+                    )
+                )
             ):
-                gathered_last_layer_output = residual.clone()
+                gathered_last_layer_output = gathered_last_layer_output.clone()
             captured_last_layer_outputs.append(gathered_last_layer_output)
         return hidden_states, residual
 

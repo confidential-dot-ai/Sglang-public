@@ -10,11 +10,11 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import msgspec
-
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import EPLB_BALANCEDNESS_WINDOW_SIZES
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.scheduler_components.tp_drift_detector import TpDriftDetector
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.observability.metrics_collector import (
     DPCooperationInfo,
@@ -267,6 +267,15 @@ class SchedulerMetricsReporter:
         self.spec_total_num_forward_ct = 0
         self.spec_num_block_accept_tokens = 0
         self.spec_num_cap_tokens = 0
+
+        # Lifetime counters for per-rank diagnostic logging (prefix cache hit
+        # rate, tokens processed overall) -- never reset.
+        self.prefill_total_tokens_alltime = 0
+        self.decode_total_tokens_alltime = 0
+        self.decode_radix_hit_tokens = 0
+        self.decode_radix_total_tokens = 0
+        # Built on first use: the TP group does not exist yet at this point.
+        self._tp_drift_detector: Optional[TpDriftDetector] = None
 
         # For PD disaggregation
         self.kv_transfer_speed_gb_s: float = 0.0
@@ -679,11 +688,10 @@ class SchedulerMetricsReporter:
         can_run_cuda_graph: bool,
         dp_cooperation_info: Optional[DPCooperationInfo] = None,
     ):
-        if (
-            not self.is_stats_logging_rank
-            and not self.current_scheduler_metrics_enabled
-        ):
-            return
+        # Was previously gated to `is_stats_logging_rank or
+        # current_scheduler_metrics_enabled` (skipping the whole function,
+        # including the per-rank log line, on non-logging ranks). Per-rank
+        # diagnostic logging now requires every rank to run this.
 
         now = time.perf_counter()
         gap_latency = now - self.last_prefill_stats_tic
@@ -706,11 +714,28 @@ class SchedulerMetricsReporter:
         )
         iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
 
+        # Lifetime diagnostics requested for per-rank monitoring: prefix
+        # cache hit rate this batch, and total tokens processed since
+        # server start (not reset per log interval like the throughput
+        # counters above).
+        prefill_batch_total = (
+            prefill_stats.log_input_tokens + prefill_stats.log_hit_tokens
+        )
+        prefill_hit_rate = (
+            prefill_stats.log_hit_tokens / prefill_batch_total
+            if prefill_batch_total > 0
+            else 0.0
+        )
+        self.prefill_total_tokens_alltime += prefill_stats.log_input_tokens
+
         msg = (
+            f"[rank tp{get_parallel().tp_rank}] "
             f"Prefill batch{iter_msg}, "
             f"#new-seq: {prefill_stats.num_new_seqs}, "
             f"#new-token: {prefill_stats.log_input_tokens}, "
             f"#cached-token: {prefill_stats.log_hit_tokens}, "
+            f"prefix cache hit rate: {prefill_hit_rate:.2%}, "
+            f"total tokens processed: {self.prefill_total_tokens_alltime}, "
             f"{token_usage_msg}"
             f"#running-req: {prefill_stats.num_running_reqs.total}, "
             f"#queue-req: {len(self.scheduler.waiting_queue)}, "
@@ -736,7 +761,10 @@ class SchedulerMetricsReporter:
             )
 
         msg += f"{self._graph_backend_label}: {can_run_cuda_graph}, "
-        msg += f"input throughput (token/s): {self.last_input_throughput:.2f}"
+        msg += (
+            f"input throughput (token/s): {self.last_input_throughput:.2f}, "
+            f"TPM this GPU (tokens/min): {self.last_input_throughput * 60:.0f}"
+        )
 
         if self.enable_mfu_metrics and gap_latency > 0:
             # Prefer the SoL suffix when it carries content: it scores FLOPs against
@@ -757,8 +785,10 @@ class SchedulerMetricsReporter:
             self.forward_pass_device_timer._report()
             msg += ", " + self.forward_occupancy_log_string()
 
-        if self.is_stats_logging_rank:
-            logger.info(msg)
+        # Log on every rank (not just is_stats_logging_rank) so per-GPU
+        # diagnostics are visible; the stats-collector block below stays
+        # single-rank-gated to avoid duplicate Prometheus series.
+        logger.info(msg)
         if self.current_scheduler_metrics_enabled:
             self.metrics_collector.increment_prefill_cuda_graph_pass(
                 value=can_run_cuda_graph
@@ -854,6 +884,16 @@ class SchedulerMetricsReporter:
             self.scheduler.kv_events_publisher.emit_kv_metrics()
         self.scheduler.kv_events_publisher.publish_kv_events()
 
+    def _drift_detector(self) -> TpDriftDetector:
+        if self._tp_drift_detector is None:
+            group = get_parallel().tp_group
+            self._tp_drift_detector = TpDriftDetector(
+                group_key=group.unique_name,
+                tp_rank=group.rank_in_group,
+                tp_size=group.world_size,
+            )
+        return self._tp_drift_detector
+
     def report_decode_stats(
         self,
         can_run_cuda_graph: bool,
@@ -889,15 +929,18 @@ class SchedulerMetricsReporter:
         # Periodic work: log + heavy metrics at decode_log_interval
         if self.forward_ct_decode % self.decode_log_interval != 0:
             return
-        if (
-            not self.is_stats_logging_rank
-            and not self.current_scheduler_metrics_enabled
-        ):
-            return
+        # Was previously also gated to `is_stats_logging_rank or
+        # current_scheduler_metrics_enabled` here, skipping the per-rank log
+        # line below on non-logging ranks. Per-rank diagnostic logging now
+        # requires every rank to run this.
 
         gap_latency = time.perf_counter() - self.last_decode_stats_tic
         self.last_decode_stats_tic = time.perf_counter()
         self.last_gen_throughput = self.num_generated_tokens / gap_latency
+        self.decode_total_tokens_alltime += self.num_generated_tokens
+        # Every rank reaches here on the same decode_log_interval boundary,
+        # which is what makes a cross-rank compare safe to do from here.
+        self._drift_detector().observe(self.decode_total_tokens_alltime)
 
         self.num_generated_tokens = 0
         num_running_reqs = len(batch.reqs)
@@ -916,7 +959,10 @@ class SchedulerMetricsReporter:
             else self.scheduler.forward_ct
         )
         iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
-        msg = f"Decode batch{iter_msg}, #running-req: {num_running_reqs}, {token_usage_msg}"
+        msg = (
+            f"[rank tp{get_parallel().tp_rank}] Decode batch{iter_msg}, "
+            f"#running-req: {num_running_reqs}, {token_usage_msg}"
+        )
 
         spec_num_steps = 0
         spec_num_draft_tokens = 0
@@ -977,12 +1023,26 @@ class SchedulerMetricsReporter:
 
         if self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
             self._update_decode_queue_stats(self.scheduler.enable_priority_scheduling)
+            # Lifetime decode-side radix-cache hit rate: hit tokens (L1
+            # device-resident match, DecodePrefixMatch.l1_prefix_len)
+            # accumulated in disaggregation/decode.py's prealloc path,
+            # against each admitted request's origin prompt length.
+            decode_hit_rate = (
+                self.decode_radix_hit_tokens / self.decode_radix_total_tokens
+                if self.decode_radix_total_tokens > 0
+                else 0.0
+            )
+            cache_hit_rate = decode_hit_rate
+            msg += f"prefix cache hit rate: {decode_hit_rate:.2%}, "
+            msg += f"total tokens processed: {self.decode_total_tokens_alltime}, "
             msg += f"pre-allocated usage: {self.scheduler.disagg_decode_prealloc_queue.num_tokens_pre_allocated / self.scheduler.max_total_num_tokens:.2f}, "
             msg += f"#prealloc-req: {len(self.scheduler.disagg_decode_prealloc_queue.queue)}, "
             msg += f"#transfer-req: {len(self.scheduler.disagg_decode_transfer_queue.queue)}, "
             if get_disagg().disaggregation_decode_host_receive_threshold > 0:
                 msg += f"#host-receive-req: {self.stats.num_decode_host_receive_queue_reqs.total}, "
             msg += f"#retracted-req: {len(self.scheduler.disagg_decode_prealloc_queue.retracted_queue)}, "
+        else:
+            msg += f"total tokens processed: {self.decode_total_tokens_alltime}, "
 
         if (
             get_disagg().language_only
@@ -995,6 +1055,7 @@ class SchedulerMetricsReporter:
         msg += (
             f"{self._graph_backend_label}: {can_run_cuda_graph}, "
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
+            f"TPM this GPU (tokens/min): {self.last_gen_throughput * 60:.0f}, "
             f"#queue-req: {len(self.scheduler.waiting_queue)}"
         )
 
@@ -1023,8 +1084,10 @@ class SchedulerMetricsReporter:
             self.forward_pass_device_timer._report()
             msg += ", " + self.forward_occupancy_log_string()
 
-        if self.is_stats_logging_rank:
-            logger.info(msg)
+        # Log on every rank (not just is_stats_logging_rank) so per-GPU
+        # diagnostics are visible; the stats-collector block below stays
+        # single-rank-gated to avoid duplicate Prometheus series.
+        logger.info(msg)
         if self.current_scheduler_metrics_enabled:
             priority_enabled = self.scheduler.enable_priority_scheduling
 

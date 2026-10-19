@@ -237,6 +237,42 @@ class Memory(msgspec.Struct):
     enable_lmcache: A[
         bool, "Using LMCache as an alternative hierarchical cache solution"
     ] = False
+    hicache_host_memory_backend: A[
+        str,
+        Arg(
+            help=(
+                "Allocator for the HiCache host pool. 'auto' preserves the "
+                "storage backend's allocator, 'default' uses mmap plus host "
+                "registration, and 'hardwire' uses TD-private cudaHostAlloc "
+                "pages from hardwire_torch."
+            ),
+            choices=["auto", "default", "hardwire"],
+        ),
+    ] = "auto"
+
+    lmcache_mode: A[
+        str,
+        Arg(
+            help=(
+                "LMCache connector mode. 'mp' uses the multiprocess service; "
+                "'ip' uses an in-process engine for plain MHA/MLA KV. 'auto' "
+                "uses MP unless Hardwire host memory is selected."
+            ),
+            choices=["auto", "ip", "mp"],
+        ),
+    ] = "auto"
+
+    lmcache_host_memory_backend: A[
+        str,
+        Arg(
+            help=(
+                "LMCache host allocator. 'hardwire' uses TD-private pinned "
+                "doorbell tensors and requires the in-process connector."
+            ),
+            choices=["default", "hardwire"],
+        ),
+    ] = "default"
+
     lmcache_config_file: A[
         Optional[str],
         "Path to the LMCache YAML configuration file",

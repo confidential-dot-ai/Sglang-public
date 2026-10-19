@@ -35,6 +35,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
     get_parallel,
+    get_platform,
     get_serving,
 )
 from sglang.srt.server_args import ServerArgs
@@ -316,6 +317,11 @@ def _init_parallel_groups(
     )
     initialize_model_parallel(
         duplicate_tp_group=get_disagg().enable_pdmux,
+        duplicate_attn_cp_group=(
+            get_platform().is_hip
+            and get_exec().overlap.enable_two_batch_overlap
+            and get_parallel().enable_prefill_cp
+        ),
         enable_symm_mem=get_exec().comm.enable_symm_mem,
         # Only WORLD is extended during scale-up. The joiner's model-parallel
         # groups are fixed groups local to its launch cohort.

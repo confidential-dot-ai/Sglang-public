@@ -412,6 +412,25 @@ def create_grammar_backend(
             n_vocab=vocab_size,
             eos_token_ids=eos_token_ids,
         )
+    elif name == "device_fsm":
+        # Device-resident token-DFA grammars (regex, JSON schema via
+        # schema->regex): the only backend whose grammars DFlash speculative
+        # decoding enforces in its verify step and CCD replays inside its
+        # captured WHILE loop. See constrained/device_token_fsm.py.
+        from sglang.srt.constrained.device_token_fsm import DeviceFSMGrammarBackend
+
+        eos_ids = set(eos_token_ids) if eos_token_ids else set()
+        tokenizer_eos = getattr(tokenizer, "eos_token_id", None)
+        if not eos_ids and tokenizer_eos is not None:
+            eos_ids = {int(tokenizer_eos)}
+        if not eos_ids:
+            raise ValueError(
+                "grammar_backend='device_fsm' requires a known EOS token id "
+                "(none provided and the tokenizer exposes none)"
+            )
+        grammar_backend = DeviceFSMGrammarBackend(
+            tokenizer, vocab_size=vocab_size, eos_token_ids=eos_ids
+        )
     elif name == "none":
         if get_serving().enable_strict_thinking:
             raise ValueError(

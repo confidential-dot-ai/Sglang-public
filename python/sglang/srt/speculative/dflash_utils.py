@@ -11,6 +11,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import (
     apply_custom_logit_processor,
@@ -205,9 +206,59 @@ def scale_kv_cell_size_per_token_for_dflash(
     ) // int(target_num_layers)
 
 
+def dflash_draft_kv_cell_bytes_per_token(
+    *,
+    total_num_kv_heads: int,
+    attn_tp_size: int,
+    head_dim: int,
+    v_head_dim: int,
+    draft_num_layers: int,
+    kv_elem_size: int,
+) -> int:
+    """Exact per-token draft-KV bytes for a dense DFLASH-family draft.
+
+    The draft's attention geometry (kv heads, head_dim) is independent of the
+    target's (the draft may have more kv heads than the target), so the draft
+    pool must be sized from the draft config, not by layer-ratio
+    scaling of the target cell. Head division mirrors
+    ModelConfig.get_num_kv_heads (replicate when heads < tp).
+    """
+    if total_num_kv_heads <= 0:
+        raise ValueError(
+            f"total_num_kv_heads must be positive, got {total_num_kv_heads}."
+        )
+    if attn_tp_size <= 0:
+        raise ValueError(f"attn_tp_size must be positive, got {attn_tp_size}.")
+    if head_dim <= 0 or v_head_dim <= 0:
+        raise ValueError(
+            f"head dims must be positive, got head_dim={head_dim}, "
+            f"v_head_dim={v_head_dim}."
+        )
+    if draft_num_layers <= 0:
+        raise ValueError(
+            f"draft_num_layers must be positive, got {draft_num_layers}."
+        )
+    if kv_elem_size <= 0:
+        raise ValueError(f"kv_elem_size must be positive, got {kv_elem_size}.")
+    local_kv_heads = max(1, int(total_num_kv_heads) // int(attn_tp_size))
+    return (
+        local_kv_heads
+        * (int(head_dim) + int(v_head_dim))
+        * int(draft_num_layers)
+        * int(kv_elem_size)
+    )
+
+
 def resolve_dflash_verify_mask_policy(attn_backend: Any) -> tuple[str, bool]:
     backend = attn_backend
     for _ in range(4):
+        # TboAttnBackend wraps the real backend as .primary and its
+        # __getattr__ delegates unknown attribute lookups downward, so the
+        # type-name check below would otherwise see the wrapper (never in
+        # the skip list) instead of the backend that actually runs verify.
+        if type(backend).__name__ == "TboAttnBackend":
+            backend = backend.primary
+            continue
         full_backend = getattr(backend, "full_attn_backend", None)
         if full_backend is None:
             break
@@ -427,9 +478,23 @@ def get_dflash_attention_sliding_window_size(config: Any) -> Optional[int]:
     if sliding_window is None and is_nemotron_35_draft_config(config):
         sliding_window = _get_dflash_config(config).get("swa_window_size")
     if sliding_window is None:
+        # HF Qwen3Config nulls top-level `sliding_window` unless
+        # `use_sliding_window` is set, which DFlash/DSpark exports do not set
+        # (a config.json sliding_window is gone after the Qwen3Config
+        # round-trip). The exports duplicate the window in
+        # dflash_config.swa_window_size — fall back to it.
+        dflash_cfg = _get_dflash_config(config)
+        if dflash_cfg.get("use_swa"):
+            sliding_window = dflash_cfg.get("swa_window_size")
+    if sliding_window is None:
         raise ValueError(
-            "DFLASH sliding_attention layers require config.sliding_window."
+            "DFLASH sliding_attention layers require config.sliding_window "
+            "(or dflash_config.swa_window_size with use_swa=true)."
         )
+
+    override = envs.SGLANG_FORCE_DFLASH_DRAFT_SWA_WINDOW.get()
+    if override is not None:
+        sliding_window = override
 
     # HF sliding windows include the current token; SGLang stores window_left.
     return int(sliding_window) - 1
@@ -1197,9 +1262,41 @@ def build_dflash_verify_target_probs(
     return target_probs.view(bs, draft_token_num, -1).contiguous()
 
 
-def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
+def validate_dflash_request(
+    req: Req, enable_overlap: bool, grammar_backend: Optional[str] = None
+) -> Optional[str]:
+    if req.return_logprob:
+        return "DFLASH speculative decoding does not support return_logprob yet."
+
     if enable_overlap and req.return_hidden_states:
         return "DFLASH speculative decoding does not support return_hidden_states yet."
+
+    has_grammar_params = (
+        req.sampling_params.json_schema is not None
+        or req.sampling_params.regex is not None
+        or req.sampling_params.ebnf is not None
+        or req.sampling_params.structural_tag is not None
+    )
+    if has_grammar_params:
+        # Only the device-FSM backend produces grammars DFlash can enforce
+        # inside its verify step (tensor-only masking + state advancement --
+        # see constrained/device_token_fsm.py). Host-CPU backends (xgrammar/
+        # outlines/llguidance) would be silently ignored by the verify path,
+        # so those requests must not reach DFlash at all. EBNF/structural_tag
+        # are CFG-class and stay unsupported even under device_fsm (its
+        # dispatcher returns InvalidGrammarObject, aborting the request
+        # visibly rather than generating unconstrained).
+        if grammar_backend != "device_fsm":
+            return (
+                "DFLASH speculative decoding supports grammar-constrained "
+                "decoding only with --grammar-backend device_fsm."
+            )
+        if getattr(req.sampling_params, "forced_token_ids", None) is not None:
+            return (
+                "DFLASH cannot combine oracle mode (forced_token_ids) with "
+                "grammar-constrained decoding: forced tokens come from a "
+                "recorded trace and have no reason to satisfy the grammar."
+            )
 
     return None
 

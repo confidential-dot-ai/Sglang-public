@@ -20,13 +20,20 @@ use tracing::{debug, trace};
 pub struct TokenBucket {
     inner: Arc<Mutex<TokenBucketInner>>,
     notify: Arc<Notify>,
-    capacity: f64,
     refill_rate: f64, // tokens per second
 }
 
 struct TokenBucketInner {
     tokens: f64,
     last_refill: Instant,
+    /// Live ceiling. Lives inside the mutex (rather than on TokenBucket) so the
+    /// admission limit can be retuned at runtime via `set_capacity` without a
+    /// restart -- see `POST /admission`.
+    capacity: f64,
+    /// Permits owed back to a capacity reduction, held by requests still in
+    /// flight. While positive, returned permits retire debt instead of becoming
+    /// available.
+    debt: f64,
 }
 
 impl TokenBucket {
@@ -45,11 +52,59 @@ impl TokenBucket {
             inner: Arc::new(Mutex::new(TokenBucketInner {
                 tokens: capacity,
                 last_refill: Instant::now(),
+                capacity,
+                debt: 0.0,
             })),
             notify: Arc::new(Notify::new()),
-            capacity,
             refill_rate,
         }
+    }
+
+    /// Current ceiling.
+    pub fn capacity(&self) -> f64 {
+        self.inner.lock().capacity
+    }
+
+    /// Retune the ceiling at runtime.
+    ///
+    /// Raising it credits the difference immediately and wakes waiters, so a
+    /// raise takes effect on queued requests without waiting for a refill tick.
+    ///
+    /// Lowering it never aborts in-flight requests: the reduction comes out of
+    /// available permits first, and the remainder becomes debt, so concurrency
+    /// drains to the new ceiling as those requests complete.
+    pub fn set_capacity(&self, new_capacity: f64) {
+        let new_capacity = new_capacity.max(0.0);
+        let raised = {
+            let mut inner = self.inner.lock();
+            let delta = new_capacity - inner.capacity;
+            inner.capacity = new_capacity;
+            if delta > 0.0 {
+                // Cancel outstanding debt before crediting anything back.
+                let paid = inner.debt.min(delta);
+                inner.debt -= paid;
+                inner.tokens += delta - paid;
+                true
+            } else {
+                let reduction = -delta;
+                let from_available = inner.tokens.min(reduction);
+                inner.tokens -= from_available;
+                inner.debt += reduction - from_available;
+                false
+            }
+        };
+        if raised {
+            self.notify.notify_waiters();
+        }
+        debug!("Token bucket: capacity set to {}", new_capacity);
+    }
+
+    /// Requests currently holding a permit, for metrics. Includes debt: those
+    /// permits are still held even though the ceiling no longer accounts for
+    /// them. Not refill-adjusted; meaningful for the `refill_rate=0` case.
+    pub fn in_flight(&self) -> f64 {
+        let inner = self.inner.lock();
+        (inner.capacity - inner.tokens).max(0.0) + inner.debt
     }
 
     /// Try to acquire tokens immediately.
@@ -67,7 +122,7 @@ impl TokenBucket {
         let elapsed = now.duration_since(inner.last_refill).as_secs_f64();
         let refill_amount = elapsed * self.refill_rate;
 
-        inner.tokens = (inner.tokens + refill_amount).min(self.capacity);
+        inner.tokens = (inner.tokens + refill_amount).min(inner.capacity);
         inner.last_refill = now;
 
         trace!(
@@ -88,59 +143,45 @@ impl TokenBucket {
         }
     }
 
-    /// Acquire tokens, waiting if necessary.
+    /// Acquire tokens, waiting until they are available.
     ///
-    /// When `refill_rate=0`, waits indefinitely for tokens to be returned via `return_tokens()`.
-    /// Use `acquire_timeout()` to set an appropriate timeout.
+    /// Waits indefinitely and imposes no deadline of its own: a request larger
+    /// than the ceiling, or one made against a bucket nothing is returning to,
+    /// never completes. Bound it with `acquire_timeout()`.
     pub async fn acquire(&self, tokens: f64) -> Result<(), tokio::time::error::Elapsed> {
-        if self.try_acquire(tokens).await.is_ok() {
-            return Ok(());
-        }
+        debug!("Token bucket: waiting for {} tokens", tokens);
 
-        // When refill_rate=0 (pure concurrency limiting), tokens only come back
-        // via return_tokens(), so we wait on notify signal only.
-        if self.refill_rate == 0.0 {
-            debug!(
-                "Token bucket: waiting indefinitely for {} tokens (refill_rate=0)",
-                tokens
-            );
+        loop {
+            // Register before re-checking: notify_waiters() only wakes waiters
+            // already queued, so a return in between is lost.
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
 
-            loop {
-                // Wait for notify signal from return_tokens()
-                self.notify.notified().await;
+            if self.try_acquire(tokens).await.is_ok() {
+                return Ok(());
+            }
 
-                if self.try_acquire(tokens).await.is_ok() {
-                    return Ok(());
-                }
+            if self.refill_rate == 0.0 {
+                // Pure concurrency limiting: nothing accrues on its own, so a
+                // return is the only thing that can help.
+                notified.await;
+                continue;
+            }
+
+            // Recomputed every pass. A single estimate taken on entry goes
+            // stale as soon as another waiter takes the tokens it counted on.
+            let until_refilled = {
+                let inner = self.inner.lock();
+                let deficit = tokens - inner.tokens;
+                Duration::from_secs_f64((deficit / self.refill_rate).max(0.0))
+            };
+
+            tokio::select! {
+                _ = notified => {},
+                _ = tokio::time::sleep(until_refilled) => {},
             }
         }
-
-        let wait_time = {
-            let inner = self.inner.lock();
-            let tokens_needed = tokens - inner.tokens;
-            let wait_secs = (tokens_needed / self.refill_rate).max(0.0);
-            Duration::from_secs_f64(wait_secs)
-        };
-
-        debug!(
-            "Token bucket: waiting {:?} for {} tokens",
-            wait_time, tokens
-        );
-
-        tokio::time::timeout(wait_time, async {
-            loop {
-                if self.try_acquire(tokens).await.is_ok() {
-                    return;
-                }
-                tokio::select! {
-                    _ = self.notify.notified() => {},
-                    _ = tokio::time::sleep(Duration::from_millis(10)) => {},
-                }
-            }
-        })
-        .await?;
-
-        Ok(())
     }
 
     /// Acquire tokens with custom timeout.
@@ -159,10 +200,14 @@ impl TokenBucket {
     pub fn return_tokens_sync(&self, tokens: f64) {
         {
             let mut inner = self.inner.lock();
-            inner.tokens = (inner.tokens + tokens).min(self.capacity);
+            // Retire debt from a lowered ceiling first: those permits are being
+            // reclaimed, not handed to the next request.
+            let paid = inner.debt.min(tokens);
+            inner.debt -= paid;
+            inner.tokens = (inner.tokens + (tokens - paid)).min(inner.capacity);
             debug!(
-                "Token bucket: returned {} tokens, {} available",
-                tokens, inner.tokens
+                "Token bucket: returned {} tokens ({} retired debt), {} available",
+                tokens, paid, inner.tokens
             );
         } // Release lock before notify
         self.notify.notify_waiters();
@@ -181,10 +226,119 @@ impl TokenBucket {
         let elapsed = now.duration_since(inner.last_refill).as_secs_f64();
         let refill_amount = elapsed * self.refill_rate;
 
-        inner.tokens = (inner.tokens + refill_amount).min(self.capacity);
+        inner.tokens = (inner.tokens + refill_amount).min(inner.capacity);
         inner.last_refill = now;
 
         inner.tokens
+    }
+}
+
+#[cfg(test)]
+mod concurrency_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// A burst of returns must wake every waiter, not just the one that wins
+    /// the first signal. The losers re-check and re-wait, and a return landing
+    /// in that gap used to be dropped.
+    #[tokio::test]
+    async fn a_burst_of_returns_is_not_lost_by_requeueing_waiters() {
+        let bucket = Arc::new(TokenBucket::new(4, 0));
+        for _ in 0..4 {
+            assert!(bucket.try_acquire(1.0).await.is_ok());
+        }
+
+        let waiters: Vec<_> = (0..4)
+            .map(|_| {
+                let bucket = bucket.clone();
+                tokio::spawn(async move {
+                    bucket.acquire_timeout(1.0, Duration::from_secs(2)).await
+                })
+            })
+            .collect();
+
+        // Let every waiter reach the wait before any token comes back.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        for _ in 0..4 {
+            bucket.return_tokens_sync(1.0);
+        }
+
+        for waiter in waiters {
+            assert!(
+                waiter.await.expect("waiter task ran").is_ok(),
+                "a waiter missed its wakeup and timed out with a token available"
+            );
+        }
+    }
+
+    /// A waiter must get the caller's whole budget. The deadline used to be
+    /// estimated once on entry, so a waiter that lost the race for a refill
+    /// gave up at its own estimate with time left on the clock.
+    #[tokio::test]
+    async fn a_contended_waiter_uses_the_callers_full_budget() {
+        // One token per second, so the second waiter cannot be served until
+        // roughly 2s, well inside the 3s each of them is given.
+        let bucket = Arc::new(TokenBucket::new(2, 1));
+        assert!(bucket.try_acquire(2.0).await.is_ok());
+
+        let waiters: Vec<_> = (0..2)
+            .map(|_| {
+                let bucket = bucket.clone();
+                tokio::spawn(async move {
+                    bucket.acquire_timeout(1.0, Duration::from_secs(3)).await
+                })
+            })
+            .collect();
+
+        for waiter in waiters {
+            assert!(
+                waiter.await.expect("waiter task ran").is_ok(),
+                "a waiter gave up on its own estimate instead of the 3s budget"
+            );
+        }
+    }
+
+    /// Lowering the ceiling below the in-flight count must not hand the
+    /// reduction back to new requests when a permit is returned.
+    #[tokio::test]
+    async fn returns_retire_debt_before_they_refill() {
+        let bucket = TokenBucket::new(4, 0);
+        for _ in 0..4 {
+            assert!(bucket.try_acquire(1.0).await.is_ok());
+        }
+
+        // Nothing is available to give up, so the whole cut becomes debt.
+        bucket.set_capacity(2.0);
+        assert_eq!(bucket.in_flight(), 4.0);
+
+        // The first two returns pay it down and admit nobody.
+        bucket.return_tokens_sync(1.0);
+        bucket.return_tokens_sync(1.0);
+        assert_eq!(bucket.available_tokens().await, 0.0);
+        assert_eq!(bucket.in_flight(), 2.0);
+
+        // Only now does a return free a slot, and the ceiling holds at 2.
+        bucket.return_tokens_sync(1.0);
+        assert_eq!(bucket.available_tokens().await, 1.0);
+        assert!(bucket.try_acquire(1.0).await.is_ok());
+        assert!(bucket.try_acquire(1.0).await.is_err());
+    }
+
+    /// Raising the ceiling again must not mint permits that are still held.
+    #[tokio::test]
+    async fn raising_the_ceiling_clears_debt_before_adding_tokens() {
+        let bucket = TokenBucket::new(4, 0);
+        for _ in 0..4 {
+            assert!(bucket.try_acquire(1.0).await.is_ok());
+        }
+        bucket.set_capacity(2.0);
+
+        // Undoing the cut restores the ceiling, not two free slots: all four
+        // permits are still out.
+        bucket.set_capacity(4.0);
+        assert_eq!(bucket.capacity(), 4.0);
+        assert_eq!(bucket.in_flight(), 4.0);
+        assert_eq!(bucket.available_tokens().await, 0.0);
     }
 }
 

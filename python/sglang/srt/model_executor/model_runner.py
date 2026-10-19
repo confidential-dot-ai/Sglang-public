@@ -18,6 +18,7 @@ from __future__ import annotations
 import contextlib
 import inspect
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Union
@@ -175,6 +176,7 @@ from sglang.srt.model_executor.runner import (
     EagerRunner,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.oracle_decode.forced_token_pool import apply_forced_tokens
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     assert_published,
@@ -263,6 +265,49 @@ class SamplingPrewarmResult:
 
     sampling_input_bytes: int = 0
     sampling_headroom_bytes: int = 0
+
+
+def wait_for_capture_turnstile() -> None:
+    """Block startup CUDA-graph capture until the peer worker's capture is done.
+
+    No-op unless SGLANG_CUDA_GRAPH_CAPTURE_WAIT_FILE is set. Ranks of one
+    worker all poll the same file, so they proceed together; the timeout
+    keeps a dead or wedged peer from hanging this worker forever.
+    """
+    path = envs.SGLANG_CUDA_GRAPH_CAPTURE_WAIT_FILE.get()
+    if not path or os.path.exists(path):
+        return
+    timeout_s = envs.SGLANG_CUDA_GRAPH_CAPTURE_WAIT_TIMEOUT_S.get()
+    deadline = time.monotonic() + timeout_s
+    logger.info(
+        "Capture turnstile: waiting for %s (timeout %.0fs)", path, timeout_s
+    )
+    while time.monotonic() < deadline:
+        if os.path.exists(path):
+            logger.info("Capture turnstile: %s released, starting capture", path)
+            return
+        time.sleep(5)
+    logger.warning(
+        "Capture turnstile: %s not released within %.0fs, capturing anyway",
+        path,
+        timeout_s,
+    )
+
+
+def signal_capture_turnstile() -> None:
+    """Mark this worker's startup capture as finished for a waiting peer.
+
+    No-op unless SGLANG_CUDA_GRAPH_CAPTURE_SIGNAL_FILE is set. Every rank
+    touches the file; the trailing capture work is collective across the
+    worker's ranks, so the first touch lands within moments of the last
+    rank leaving capture.
+    """
+    path = envs.SGLANG_CUDA_GRAPH_CAPTURE_SIGNAL_FILE.get()
+    if not path:
+        return
+    with open(path, "a"):
+        pass
+    logger.info("Capture turnstile: signaled %s", path)
 
 
 def _prefill_cuda_graph_allows_context_parallel(
@@ -1076,6 +1121,7 @@ class ModelRunner:
         return self.sampling_prewarm_result
 
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
+        wait_for_capture_turnstile()
         # from sglang.srt.layers.moe.utils import get_moe_runner_backend
 
         # if get_moe_runner_backend().is_flashinfer_megamoe():
@@ -1110,6 +1156,7 @@ class ModelRunner:
         self.decode_cuda_graph_runner = capture.decode.runner
         self.graph_memory_usage = capture.memory_usage
         self.graph_time_usage = capture.time_usage
+        signal_capture_turnstile()
 
         if is_scale_joiner:
             if self._elastic_cuda_graph_enabled():
@@ -1465,7 +1512,7 @@ class ModelRunner:
                 model=getattr(self, "model", None),
                 model_dtype=getattr(self, "dtype", torch.bfloat16),
                 is_draft_worker=getattr(self, "is_draft_worker", False),
-                is_dflash=(
+                is_dflash_family=(
                     spec_algorithm.is_dflash_family()
                     if spec_algorithm is not None
                     else False
@@ -1870,10 +1917,11 @@ class ModelRunner:
                 if self.device == "cpu"
                 else forward_batch.forward_mode.is_cuda_graph
             )
+            decode_cuda_graph_runner = self.decode_cuda_graph_runner
             can_run_graph = bool(
                 mode_check()
-                and self.decode_cuda_graph_runner
-                and self.decode_cuda_graph_runner.can_run_graph(forward_batch)
+                and decode_cuda_graph_runner
+                and decode_cuda_graph_runner.can_run_graph(forward_batch)
             )
 
             if (
@@ -1886,11 +1934,22 @@ class ModelRunner:
 
             # Replay cuda graph if applicable
             if can_run_graph:
-                ret = self.decode_cuda_graph_runner.execute(
+                ret = decode_cuda_graph_runner.execute(
                     forward_batch,
                     pp_proxy_tensors=pp_proxy_tensors,
                 )
                 return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
+
+            # DSPARK may have staged this batch after an earlier positive
+            # graph-admission check.  Eligibility is deliberately rechecked
+            # here; if it changed, release the private metadata slot before
+            # taking eager fallback or two misses would exhaust both stages.
+            if decode_cuda_graph_runner is not None:
+                discard_staged = getattr(
+                    decode_cuda_graph_runner, "discard_staged_batch", None
+                )
+                if discard_staged is not None:
+                    discard_staged(forward_batch)
 
             # DP / MLP-sync padding + attn-tp normalization. Only the decode
             # cuda-graph path above pre-pads its static buffers and returns
@@ -2013,6 +2072,13 @@ class ModelRunner:
                 logits_output, forward_batch.sampling_info
             )
 
+        # For prefill, we only use the position of the last token.
+        positions = (
+            forward_batch.positions
+            if forward_batch.forward_mode.is_decode()
+            else forward_batch.seq_lens - 1
+        )
+
         # Sample the next tokens
         next_token_ids = self.sampler(
             logits_output,
@@ -2020,18 +2086,19 @@ class ModelRunner:
             forward_batch.return_logprob,
             forward_batch.top_logprobs_nums,
             forward_batch.token_ids_logprobs,
-            # For prefill, we only use the position of the last token.
-            (
-                forward_batch.positions
-                if forward_batch.forward_mode.is_decode()
-                else forward_batch.seq_lens - 1
-            ),
+            positions,
+        )
+        # Oracle mode: no-op when forced_token_lookup is None (no request in
+        # this batch has forced_token_ids set).
+        next_token_ids = apply_forced_tokens(
+            next_token_ids, positions, forward_batch.forced_token_lookup
         )
         if observer_state is not None:
             logits_output.auxiliary_device_output = observer.after_sample(
                 observer_state,
                 next_token_ids,
             )
+
         self.ngram_embedding_manager.update_after_decode(
             next_token_ids=next_token_ids,
             forward_batch=forward_batch,

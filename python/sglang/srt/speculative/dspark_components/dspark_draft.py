@@ -13,6 +13,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
 from sglang.srt.environ import envs
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.overlap_utils import consume_deferred_seq_lens_cpu
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -249,6 +250,7 @@ class DraftBlockProposer:
         device: str,
         target_model,
         sampling_info,
+        force_eager_decode: bool = False,
     ) -> DraftProposal:
         embed_module = unwrap_lora_layer(
             self.draft_model.embed_tokens
@@ -266,6 +268,7 @@ class DraftBlockProposer:
             embed_module=embed_module,
             draft_sampler=draft_sampler,
             sampling_info=sampling_info,
+            force_eager_decode=force_eager_decode,
         )
         draft_block_ids = fwd.draft_block_ids
 
@@ -343,7 +346,9 @@ class DraftBlockProposer:
             folded=folded,
         )
 
-    def run_idle_participation(self, batch: ScheduleBatch) -> None:
+    def run_idle_participation(
+        self, batch: ScheduleBatch, *, force_eager_decode: bool = False
+    ) -> None:
         if not self._dp_moe_sync or batch.global_num_tokens is None:
             return
         device = self.draft_model_runner.device
@@ -361,6 +366,7 @@ class DraftBlockProposer:
             spec_algorithm=SpeculativeAlgorithm.DSPARK,
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
+            force_eager_decode=force_eager_decode,
         )
         self._fill_dp_moe_sync_metadata(idle_batch, batch)
         with torch.inference_mode():
@@ -377,6 +383,7 @@ class DraftBlockProposer:
         embed_module,
         draft_sampler=None,
         sampling_info=None,
+        force_eager_decode: bool = False,
     ) -> DraftForwardResult:
         gamma = self.gamma
         query_token_num = self.query_token_num
@@ -407,6 +414,10 @@ class DraftBlockProposer:
             noise_embedding = embed_module(draft_block_ids)
             draft_input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
+        # First exact consumer of the tick: the draft's attention plan
+        # derives its K coverage from the mirror, so the deferred blocking
+        # resolve (if armed) must land here, not earlier.
+        consume_deferred_seq_lens_cpu(batch)
         if batch.seq_lens_cpu is not None:
             draft_seq_lens_cpu = batch.seq_lens_cpu + query_token_num
             draft_seq_lens_sum = int(draft_seq_lens_cpu.sum())
@@ -435,6 +446,7 @@ class DraftBlockProposer:
                 draft_num_tokens, device
             ),
             global_num_token_non_padded_cpu=draft_num_tokens,
+            force_eager_decode=force_eager_decode,
         )
         self._fill_dp_moe_sync_metadata(draft_forward_batch, batch)
         graph_runner = self.draft_model_runner.decode_cuda_graph_runner

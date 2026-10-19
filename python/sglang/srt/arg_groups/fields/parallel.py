@@ -80,13 +80,16 @@ class Parallel(msgspec.Struct):
     load_balance_method: A[
         str,
         Arg(
-            help="The load balancing strategy for data parallelism.",
+            help="The load balancing strategy for data parallelism. "
+            "prefix_affinity assigns shared leading input tokens to the same "
+            "rank for radix cache reuse; one global prefix can concentrate load.",
             choices=[
                 "auto",
                 "round_robin",
                 "follow_bootstrap_room",
                 "total_requests",
                 "total_tokens",
+                "prefix_affinity",
             ],
         ),
     ] = "auto"

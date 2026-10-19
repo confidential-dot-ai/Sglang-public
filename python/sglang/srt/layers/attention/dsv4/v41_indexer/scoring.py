@@ -137,12 +137,25 @@ def get_deep_gemm_decode_data(
     return DeepGEMMDecodeData(q_fp4, q_sf, weights, k_cache)
 
 
+def get_prefill_queries(inputs: PrefillInputs) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Roped queries [rows, heads, 128] and bf16 head weights [rows, heads]."""
+    assert (inputs.q is None) == (inputs.weights is None), (
+        "a precomputed prefill query comes with its head weights"
+    )
+    if inputs.q is not None:
+        return inputs.q, inputs.weights
+    indexer = inputs.indexer
+    return (
+        indexer.queries(inputs.q_lora, inputs.freqs_cis[inputs.positions]),
+        indexer.head_weights(inputs.x),
+    )
+
+
 def get_deep_gemm_prefill_data(
     inputs: PrefillInputs, req_to_token: torch.Tensor
 ) -> Optional[DeepGEMMPrefillData]:
     """None when the chunk has no row or no visible compressed position."""
     ratio = inputs.compress_ratio
-    indexer = inputs.indexer
     pos = inputs.positions
     seq_lens_cpu = inputs.seq_lens_cpu
     assert (
@@ -168,9 +181,9 @@ def get_deep_gemm_prefill_data(
     if not slot_chunks or num_tokens == 0:
         return None
     k_slots = torch.cat(slot_chunks)
-    q = indexer.queries(inputs.q_lora, inputs.freqs_cis[pos])
+    q, weights = get_prefill_queries(inputs)
     q_fp4, q_sf = quantize_index_q(q)
-    weights = indexer.head_weights(inputs.x).float()
+    weights = weights.float()
     compress_lens = ((pos + 1) // ratio).to(torch.int32)
     request_starts = torch.repeat_interleave(
         torch.tensor(starts, dtype=torch.int32, device=device),
@@ -274,8 +287,7 @@ def prefill_requests(
     req, pos = inputs.req_rows, inputs.positions
     assert req is not None, "the torch indexer needs the batch's rows"
     out.reset()
-    q = indexer.queries(inputs.q_lora, inputs.freqs_cis[pos])
-    weights = indexer.head_weights(inputs.x)
+    q, weights = get_prefill_queries(inputs)
     # A compressed position is visible once the query has passed its last token.
     compress_lens = (pos + 1) // ratio
     topk = indexer.index_topk

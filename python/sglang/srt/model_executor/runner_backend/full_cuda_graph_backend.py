@@ -17,6 +17,7 @@ torch.cuda.CUDAGraph per shape.
 
 from __future__ import annotations
 
+import contextvars
 from contextlib import AbstractContextManager, contextmanager
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
@@ -45,6 +46,47 @@ if TYPE_CHECKING:
         BaseCudaGraphRunner,
     )
     from sglang.srt.model_executor.runner.shape_key import ShapeKey
+
+# CC conditional decode (cc_conditional_decode.py / dflash_cc_conditional_decode.py):
+# needs the pre-instantiation cudaGraph_t of each captured shape so it can be
+# embedded as a child graph node inside a WHILE-loop capture. torch.cuda.CUDAGraph
+# normally discards that structure after instantiate() to save memory; keep_graph=True
+# retains it. Strictly opt-in (retaining it for every shape has a real, if small,
+# memory/bookkeeping cost) and confirmed not to change capture/replay behavior for
+# the ordinary (non-CCD) path when unset. Read once at import.
+SGLANG_CC_CONDITIONAL_DECODE = get_bool_env_var("SGLANG_CC_CONDITIONAL_DECODE")
+
+# Runtime (not import-time) toggle: True only while a CC conditional decode
+# chunk's WHILE-loop body is actively being captured. When True, replay()
+# embeds the already-captured graph as a child node (cc_conditional_decode.py's
+# add_child_graph_node) instead of calling torch.cuda.CUDAGraph.replay() --
+# which the CUDA runtime itself rejects during an active outer capture
+# (confirmed: cudaErrorStreamCaptureUnsupported). A ContextVar rather than a
+# plain attribute so it's correct under whatever thread/task the capture runs
+# on; default False leaves every ordinary (non-CCD) replay() call untouched.
+_ccd_capturing: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "cc_conditional_decode_capturing", default=False
+)
+
+
+@contextmanager
+def ccd_capturing_context():
+    """Enter while capturing a CC conditional decode chunk body. Every
+    FullCudaGraphBackend.replay() call made inside this context embeds a
+    child graph node instead of replaying directly."""
+    token = _ccd_capturing.set(True)
+    try:
+        yield
+    finally:
+        _ccd_capturing.reset(token)
+
+
+def is_ccd_capturing() -> bool:
+    """True inside an active ccd_capturing_context(). Public getter so
+    other modules (e.g. attention backends deciding whether it's safe to
+    re-invoke a plan() call with its own host-memory traffic) don't reach
+    into the private ContextVar directly."""
+    return _ccd_capturing.get()
 
 
 def _allocate_output_buffer(output: Any) -> Optional[torch.Tensor]:
@@ -157,7 +199,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
             self._reuse_output_buffer = self._output_buffer is not None
         del warmup_output
 
-        graph = torch.cuda.CUDAGraph()
+        graph = torch.cuda.CUDAGraph(keep_graph=SGLANG_CC_CONDITIONAL_DECODE)
 
         graph_ctx: Callable[..., AbstractContextManager]
         if (
@@ -206,8 +248,24 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         static_forward_batch: ForwardBatch,
         **kwargs,
     ) -> Any:
-        with graph_pool_replay_scope():
-            self._graphs[shape_key].replay()
+        if _ccd_capturing.get():
+            from sglang.srt.model_executor.cc_conditional_decode import (
+                add_child_graph_node,
+            )
+
+            raw_graph = self.get_raw_graph(shape_key)
+            if raw_graph is None:
+                raise RuntimeError(
+                    f"CC conditional decode: no captured graph (or "
+                    f"keep_graph=False at capture time) for shape {shape_key}; "
+                    "the CCD eligibility gate should have excluded this batch."
+                )
+            add_child_graph_node(
+                torch.cuda.current_stream().cuda_stream, raw_graph
+            )
+        else:
+            with graph_pool_replay_scope():
+                self._graphs[shape_key].replay()
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:
@@ -217,3 +275,14 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         self._outputs.clear()
         self._output_buffer = None
         self._pool = None
+
+    def get_raw_graph(self, shape_key: ShapeKey) -> Optional[int]:
+        """Pre-instantiation cudaGraph_t handle for an already-captured shape,
+        for embedding as a child graph node elsewhere (CC conditional decode).
+        Only populated when SGLANG_CC_CONDITIONAL_DECODE was set at capture
+        time (keep_graph=True); returns None otherwise, and None if the shape
+        was never captured."""
+        graph = self._graphs.get(shape_key)
+        if graph is None or not SGLANG_CC_CONDITIONAL_DECODE:
+            return None
+        return graph.raw_cuda_graph()

@@ -3,6 +3,8 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/device_communicators/pynccl.py
 
 import logging
+import threading
+import weakref
 from contextlib import contextmanager
 from typing import Optional, Union
 
@@ -26,8 +28,41 @@ from sglang.srt.utils.common import get_current_device_stream_fast
 
 logger = logging.getLogger(__name__)
 
+# Live communicators, for aborting on a watchdog teardown.
+#
+# pynccl calls ncclAllReduce directly and so creates no ProcessGroupNCCL work
+# object; nothing in torch.distributed can see, time out, or abort these. The
+# registry is what gives a watchdog a handle on them.
+_LIVE_COMMUNICATORS: "weakref.WeakSet[PyNcclCommunicator]" = weakref.WeakSet()
+_LIVE_COMMUNICATORS_LOCK = threading.Lock()
+
+
+def abort_all_communicators() -> int:
+    """Raise the abort flag on every live pynccl communicator.
+
+    For teardown only. Aborting leaves the communicators unusable, but a
+    spinning collective kernel will not exit otherwise, and the process cannot
+    then be killed cleanly or release its GPU memory. Returns how many were
+    aborted.
+    """
+    with _LIVE_COMMUNICATORS_LOCK:
+        communicators = list(_LIVE_COMMUNICATORS)
+
+    aborted = 0
+    for communicator in communicators:
+        try:
+            communicator.abort()
+            aborted += 1
+        except Exception as e:
+            logger.error("Failed to abort a pynccl communicator: %s", e)
+    return aborted
+
 
 class PyNcclCommunicator:
+    # Class attribute so it exists even when __init__ bails out before the
+    # communicator is created.
+    aborted = False
+
     def __init__(
         self,
         group: Union[ProcessGroup, StatelessProcessGroup],
@@ -131,10 +166,40 @@ class PyNcclCommunicator:
             warmup_stream.synchronize()
             del data
 
+        with _LIVE_COMMUNICATORS_LOCK:
+            _LIVE_COMMUNICATORS.add(self)
+
         # by default it is disabled, e.g. in profiling models and prefill phase.
         # to use it, use under `with obj.change_state(enable=True)`, usually
         # when we are using CUDA graph.
         self.disabled = True
+
+    def abort(self) -> None:
+        """Raise the abort flag so in-flight collectives on this comm exit.
+
+        One-way: the communicator is unusable afterwards, and `disabled` is set
+        so a later call enqueues nothing onto a dead comm.
+        """
+        # `comm` is unset when init bailed out early, and those instances never
+        # reach the registry; guard anyway for direct callers.
+        if self.aborted or getattr(self, "comm", None) is None:
+            return
+
+        self.aborted = True
+        self.disabled = True
+        logger.error(
+            "Aborting pynccl communicator (rank %s of %s) on %s",
+            self.rank,
+            self.world_size,
+            self.device,
+        )
+        self.nccl.ncclCommAbort(self.comm)
+
+    def async_error(self) -> int:
+        """Async error code on this comm, 0 if none. A hang reports 0."""
+        if getattr(self, "comm", None) is None or self.aborted:
+            return 0
+        return self.nccl.ncclCommGetAsyncError(self.comm)
 
     def _resolve_stream(self) -> torch.cuda.Stream:
         """Return the current device stream used for NCCL calls."""
@@ -207,6 +272,15 @@ class PyNcclCommunicator:
         stream = self._resolve_stream()
 
         if sizes is not None:
+            if torch.cuda.is_current_stream_capturing():
+                import sys as _sys
+                import traceback as _tb
+
+                _sys.stderr.write(
+                    "CCD_DEBUG: pynccl.all_gather(sizes=%r) ncclBroadcast-loop "
+                    "path called DURING capture, stack:\n%s\n"
+                    % (sizes, "".join(_tb.format_stack(limit=15)))
+                )
             split_offset = 0
 
             self.nccl.ncclGroupStart()

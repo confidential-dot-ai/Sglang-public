@@ -18,6 +18,9 @@ Current coverage:
   field existing consumers depend on is silently dropped: every
   `ServerArgs` dataclass field, `internal_states`, `version`, and the
   pre-existing flat `kv_events_config` string all remain visible.
+
+* `TestServerInfoHardwireMemory` — requested-versus-active state and exact
+  allocated-byte aggregation across scheduler ranks.
 """
 
 import asyncio
@@ -481,6 +484,108 @@ class TestServerInfoControlPlaneUpdates(CustomTestCase):
             self.assertEqual(overlaid["weight_version"], "v2")
         finally:
             reset_context()
+
+
+class TestServerInfoHardwireMemory(CustomTestCase):
+    def test_requested_without_allocation_is_visible(self):
+        args = ServerArgs(
+            model_path="dummy",
+            cuda_graph_host_memory_backend="hardwire",
+        )
+
+        info = _call_server_info_with(args)
+
+        self.assertEqual(
+            info["hardwire_memory"],
+            {
+                "requested": True,
+                "enabled": False,
+                "active": False,
+                "verified": False,
+                "status": "requested_unallocated",
+                "requested_components": ["graph_staging"],
+                "active_components": [],
+                "total_allocated_bytes": 0,
+                "allocation_count": 0,
+                "rank_count": 0,
+                "by_component": {
+                    "graph_staging": {
+                        "requested": True,
+                        "enabled": False,
+                        "active": False,
+                        "verified": False,
+                        "allocated_bytes": 0,
+                        "allocation_count": 0,
+                        "kinds": [],
+                    }
+                },
+            },
+        )
+
+    def test_allocated_bytes_are_summed_across_ranks(self):
+        args = ServerArgs(model_path="dummy")
+        rank0 = {
+            "hardwire_memory": {
+                "requested_components": ["graph_staging"],
+                "active_components": ["graph_staging"],
+                "total_allocated_bytes": 1024,
+                "allocation_count": 2,
+                "by_component": {
+                    "graph_staging": {
+                        "requested": True,
+                        "active": True,
+                        "verified": True,
+                        "allocated_bytes": 1024,
+                        "allocation_count": 2,
+                        "kinds": ["pinned"],
+                    }
+                },
+            }
+        }
+        rank1 = {
+            "hardwire_memory": {
+                "requested_components": ["graph_staging", "hicache"],
+                "active_components": ["graph_staging", "hicache"],
+                "total_allocated_bytes": 6144,
+                "allocation_count": 3,
+                "by_component": {
+                    "graph_staging": {
+                        "requested": True,
+                        "active": True,
+                        "verified": True,
+                        "allocated_bytes": 2048,
+                        "allocation_count": 2,
+                        "kinds": ["pinned"],
+                    },
+                    "hicache": {
+                        "requested": True,
+                        "active": True,
+                        "verified": True,
+                        "allocated_bytes": 4096,
+                        "allocation_count": 1,
+                        "kinds": ["pinned"],
+                    },
+                },
+            }
+        }
+
+        info = _call_server_info_with(args, internal_states=[rank0, rank1])
+        hardwire = info["hardwire_memory"]
+
+        self.assertEqual(hardwire["status"], "active")
+        self.assertTrue(hardwire["enabled"])
+        self.assertTrue(hardwire["verified"])
+        self.assertEqual(hardwire["rank_count"], 2)
+        self.assertEqual(hardwire["total_allocated_bytes"], 7168)
+        self.assertEqual(hardwire["allocation_count"], 5)
+        self.assertEqual(
+            hardwire["by_component"]["graph_staging"]["allocated_bytes"],
+            3072,
+        )
+        self.assertEqual(
+            hardwire["by_component"]["hicache"]["allocated_bytes"],
+            4096,
+        )
 
 
 class TestServerInfoExistingFieldsPreserved(CustomTestCase):

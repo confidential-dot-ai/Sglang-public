@@ -32,6 +32,7 @@ use super::{
     utils::{mask_tools_as_mcp, patch_response_with_request_metadata, rewrite_streaming_block},
 };
 use crate::{
+    core::deadlines,
     protocols::{
         event_types::{
             is_function_call_type, is_response_event, FunctionCallEvent, ItemType, McpEvent,
@@ -44,7 +45,7 @@ use crate::{
         mcp_utils::{ensure_request_mcp_client, McpLoopConfig},
         openai::context::{RequestContext, StreamingEventContext, StreamingRequest},
         persistence_utils::persist_conversation_items,
-        streaming_utils::BreakerTrackedStream,
+        streaming_utils::{guarded_tracked_stream, StallGuard},
     },
 };
 
@@ -508,6 +509,7 @@ pub(super) async fn handle_simple_streaming_passthrough(
     }
 
     request_builder = request_builder.header("Accept", "text/event-stream");
+    request_builder = deadlines::apply_stream_deadline(request_builder);
 
     let response = match request_builder.send().await {
         Ok(resp) => resp,
@@ -543,7 +545,7 @@ pub(super) async fn handle_simple_streaming_passthrough(
     // Wrap upstream in `BreakerTrackedStream` so the breaker tick is decided
     // once on drop: success on clean `None`, failure on `Some(Err)`, neither
     // on early drop (client disconnected before upstream terminated).
-    let upstream_stream = BreakerTrackedStream::new(
+    let upstream_stream = guarded_tracked_stream(
         response.bytes_stream(),
         Arc::clone(&worker),
         req.url.clone(),
@@ -830,6 +832,7 @@ pub(super) async fn handle_streaming_with_tool_interception(
                 request_builder = apply_request_headers(h, request_builder, true);
             }
             request_builder = request_builder.header("Accept", "text/event-stream");
+            request_builder = deadlines::apply_stream_deadline(request_builder);
 
             // Race send() against tx.closed() so that a client disconnect
             // while we're still waiting for upstream response headers also
@@ -890,7 +893,14 @@ pub(super) async fn handle_streaming_with_tool_interception(
             // `biased;` drains a ready upstream chunk before observing client
             // disconnect, so a chunk already produced by reqwest reaches both
             // the client and the chunk_processor before we tear the loop down.
-            let upstream_stream = response.bytes_stream();
+            // Guarded, not breaker-tracked: this loop records the breaker
+            // outcome itself in the match arms below. A stall arrives here as
+            // Some(Err(..)) and takes the existing failure path.
+            let upstream_stream = StallGuard::new(
+                response.bytes_stream(),
+                deadlines::get().stream_idle(),
+                url_clone.clone(),
+            );
             futures_util::pin_mut!(upstream_stream);
             let mut handler = StreamingToolHandler::with_starting_index(next_output_index);
             if let Some(ref id) = preserved_response_id {

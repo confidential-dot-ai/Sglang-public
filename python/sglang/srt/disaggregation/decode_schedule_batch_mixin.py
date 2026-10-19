@@ -155,6 +155,8 @@ class ScheduleBatchDisaggregationDecodeMixin:
             # Non-spec: stash last token into the relay so the first DECODE's
             # resolve_forward_inputs gathers it like any other decode iter.
             future_map.stash(
-                self.req_pool_indices, RelayPayload(bonus_tokens=last_tokens_tensor)
+                self.req_pool_indices,
+                RelayPayload(bonus_tokens=last_tokens_tensor),
+                future_indices_cpu=self.req_pool_indices_cpu,
             )
             self.input_ids = None

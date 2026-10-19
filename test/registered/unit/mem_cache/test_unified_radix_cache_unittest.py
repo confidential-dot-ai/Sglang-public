@@ -6404,6 +6404,26 @@ class UnifiedRadixCacheSuite:
             )
         cache.sanity_check()
 
+    def test_hicache_write_back_internal_swa_evict_drops_when_disabled(self):
+        """SGLANG_ENABLE_HICACHE_SWA_TOMBSTONE_BACKUP=0 keeps the legacy drop
+        under write_back too."""
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA component")
+        if self.cfg.has_mamba:
+            self.skipTest("no hicache strategy covers FULL+SWA+MAMBA")
+        cache, _, seq_a, seq_b = self._build_internal_swa_fixture("write_back")
+
+        with envs.SGLANG_ENABLE_HICACHE_SWA_TOMBSTONE_BACKUP.override(False):
+            cache.evict(EvictParams(num_tokens=0, swa_num_tokens=len(seq_b)))
+
+        m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq_a))))
+        if m.best_match_node != cache.root_node_handle():
+            self.assertIsNone(
+                _host_value(cache, m.best_match_node, ComponentType.SWA),
+                "disabled: no host demote",
+            )
+        cache.sanity_check()
+
     def _build_chain_pages(self, cache, allocator, req_to_token_pool, num_pages):
         """Insert an incremental chain of single-page extensions.
 

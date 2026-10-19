@@ -89,6 +89,7 @@ pub fn create_test_app(
         context: app_context,
         concurrency_queue_tx: None,
         router_manager: None,
+        api_keys: None,
         mesh_handler: None,
         mesh_sync_manager: None,
     });
@@ -112,6 +113,11 @@ pub fn create_test_app(
     build_app(
         app_state,
         auth_config,
+        smg::middleware::AdminAuthConfig {
+            admin_api_key: router_config.admin_api_key.clone(),
+            ops_api_key: None,
+            key_store: None,
+        },
         None, // No control plane auth for tests
         router_config.max_payload_size,
         request_id_headers,
@@ -131,6 +137,7 @@ pub fn create_test_app_with_context(
         context: app_context.clone(),
         concurrency_queue_tx: None,
         router_manager: None,
+        api_keys: None,
         mesh_handler: None,
         mesh_sync_manager: None,
     });
@@ -157,6 +164,11 @@ pub fn create_test_app_with_context(
     build_app(
         app_state,
         auth_config,
+        smg::middleware::AdminAuthConfig {
+            admin_api_key: router_config.admin_api_key.clone(),
+            ops_api_key: None,
+            key_store: None,
+        },
         None, // No control plane auth for tests
         router_config.max_payload_size,
         request_id_headers,

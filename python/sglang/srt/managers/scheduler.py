@@ -77,6 +77,8 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
 from sglang.srt.disaggregation import role_switch
+from sglang.srt.disaggregation.ced_options import validate_ced_options
+from sglang.srt.disaggregation.ced_tail_timing import CedTailTimer
 from sglang.srt.disaggregation.checksum import KvChecksumComputer
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
@@ -295,6 +297,12 @@ from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
     release_kv_cache,
 )
+from sglang.srt.model_executor.ccspec_decode import (
+    SGLANG_CCSPEC_CHUNK_CAP,
+    SGLANG_CCSPEC_DECODE,
+    check_ccspec_eligible,
+    run_ccspec_chunk,
+)
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -324,6 +332,14 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs, compute_world_size
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+from sglang.srt.speculative.dflash_cc_conditional_decode import (
+    SGLANG_CC_CONDITIONAL_DECODE,
+    SGLANG_CC_CONDITIONAL_DECODE_CHUNK_CAP,
+    check_ccd_eligible,
+    merge_ccd_split_results,
+    run_ccd_chunk,
+    try_split_ccd_batch,
+)
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
 from sglang.srt.speculative.eagle_utils import (
     get_draft_recurrent_hidden_state_spec_from_config,
@@ -351,7 +367,7 @@ from sglang.srt.utils import (
     suppress_other_loggers,
     triton_load_watch,
 )
-from sglang.srt.utils.common import is_npu
+from sglang.srt.utils.common import is_confidential_compute, is_npu
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -641,6 +657,14 @@ class Scheduler(
         self.init_chunked_prefill()
         self.maybe_init_dynamic_chunk_sizer()
 
+        # Decode fairness (Track I): bound how many consecutive scheduling
+        # passes may pick prefill while decodable requests sit waiting.
+        # 0 = disabled (stock strict prefill-first arbitration). The counter
+        # is a pure pass-counter driven only by state every TP rank computes
+        # identically, so ranks stay in lockstep.
+        self.max_consecutive_prefill = envs.SGLANG_MAX_CONSECUTIVE_PREFILL.get()
+        self._consecutive_prefill_count = 0
+
         # Init diffusion LLM
         self.init_diffusion_llm()
 
@@ -667,6 +691,7 @@ class Scheduler(
 
         # Init prefill-decodedisaggregation
         self.init_disaggregation()
+        self.maybe_init_ced_tail_timer()
 
         # Init overlap schedule
         self.init_overlap()
@@ -1004,7 +1029,12 @@ class Scheduler(
             self.tp_worker = TpModelWorker(**worker_kwargs)
 
     def maybe_init_draft_worker(self):
-        if self.spec_algorithm.is_none():
+        # A DeepSeek-V4.1 prefill-side tail runs DSpark on the last PP stage only.
+        if self.spec_algorithm.is_none() or (
+            envs.SGLANG_OPT_DSV41_PREFILL_TAIL.get()
+            and self.server_args.disaggregation_mode == "prefill"
+            and get_parallel().pp_rank != get_parallel().pp_size - 1
+        ):
             self.draft_worker = None
             self.external_corpus_manager = None
             return
@@ -1083,6 +1113,10 @@ class Scheduler(
 
     def init_all_cuda_graphs(self):
         """Capture cuda graphs for all workers."""
+        if self.draft_worker is not None:
+            # Must run before self.tp_worker.init_cuda_graphs() -- see
+            # BaseSpecWorker.pre_target_capture_setup's docstring.
+            self.draft_worker.pre_target_capture_setup()
         self.tp_worker.init_cuda_graphs()
         if self.draft_worker is not None:
             self.draft_worker.init_cuda_graphs()
@@ -1201,6 +1235,15 @@ class Scheduler(
 
         self.tp_group = get_parallel().tp_group
         self.tp_cpu_group = self.tp_group.cpu_group
+        # Dedicated NCCL communicator for TP control-plane metadata broadcast
+        # (recv_reqs — checkpoint 098/gloo-vs-nccl-broadcast-bench.py), kept
+        # separate from tp_group.device_group so a control-plane ordering
+        # mismatch can never wedge the model's own forward-pass all_reduce.
+        self.tp_metadata_nccl_group = (
+            torch.distributed.new_group(ranks=self.tp_group.ranks, backend="nccl")
+            if self.tp_group.world_size > 1
+            else None
+        )
         self.attn_tp_group = get_parallel().attn_tp_group
         self.attn_tp_cpu_group = self.attn_tp_group.cpu_group
         self.attn_cp_group = get_parallel().attn_cp_group
@@ -1450,6 +1493,14 @@ class Scheduler(
         if envs.SGLANG_LOG_GC.get():
             configure_gc_logger()
 
+    def maybe_init_ced_tail_timer(self):
+        # Decode EXTEND batches are CED tail replays; see ced_tail_timing.py.
+        self.ced_tail_timer = (
+            CedTailTimer(tp_rank=get_parallel().tp_rank)
+            if self.disaggregation_mode == DisaggregationMode.DECODE
+            else None
+        )
+
     def init_disaggregation(self):
         self.mm_receiver = None
         self.disagg_prefill_bootstrap_queue = None
@@ -1614,6 +1665,11 @@ class Scheduler(
 
     def init_overlap(self):
         self.device_module = torch.get_device_module(self.device)
+        # Confidential-compute async D2H readback (set below once streams
+        # exist, only when overlap scheduling is actually enabled -- with no
+        # overlap there is no scheduler-thread stall to fix).
+        self.enable_cc_async_copy = False
+        self.d2h_worker = None
 
         # FutureMap is always-on: input_ids relay used in both modes.
         # Workers without the spec_v2_attn_backends override fall back to
@@ -1646,6 +1702,20 @@ class Scheduler(
                 self.draft_worker.get_confidence_budget_prepare()
             )
 
+        # Defer the blocking exact seq-lens mirror pull to the tick's first
+        # exact consumer (DSPARK draft plan / verify prep) so host prep
+        # overlaps the previous verify's GPU tail. DSPARK-only: those two
+        # consumers are the audited re-materialization points; the
+        # confidence-budget prepare reads the mirror right below the resolve
+        # call, so it keeps the eager pull.
+        self.future_map.defer_spec_cpu_seq_lens = (
+            needs_cpu_seq_lens
+            and self.enable_overlap
+            and self.spec_algorithm.is_dspark()
+            and self._confidence_budget_prepare is None
+            and not envs.SGLANG_OPT_DISABLE_SPEC_SEQ_LENS_DEFER.get()
+        )
+
         if use_mlx():
             # MLX uses its own overlap loop and does not create CUDA streams,
             # but the normal non-overlap scheduler path still relays decode
@@ -1668,6 +1738,63 @@ class Scheduler(
 
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
+
+        # CC conditional decode (checkpoint 067): extra per-tick results from
+        # a chunk's captured iterations, queued by run_batch's overlap branch
+        # for event_loop_overlap to drain right after each run_batch() call.
+        # None when the last run_batch() call didn't use a CCD chunk.
+        self._ccd_pending_extra_results: Optional[list] = None
+        # Set only for a split-batch CCD tick (checkpoint 119): ccd_extras'
+        # rows are the CCD-eligible sub-batch alone, not the post-merge,
+        # full-width batch -- event_loop_overlap must snapshot against this
+        # instead of its own `batch.copy()` when present. None otherwise,
+        # in which case event_loop_overlap's existing `batch.copy()`
+        # fallback is unchanged from before this feature existed.
+        self._ccd_pending_extra_snapshot: Optional[ScheduleBatch] = None
+
+        # Under confidential computing the per-step D2H result readback is
+        # forced synchronous and blocks the scheduler thread at issue,
+        # serializing the overlap pipeline. Offload it to a worker thread
+        # (TRT-LLM #8463 pattern). Unrelated to CCD (checkpoint 067) above,
+        # which is chunk-capture conditional decode, not confidential compute.
+        self.enable_cc_async_copy = is_confidential_compute()
+        if self.enable_cc_async_copy:
+            from sglang.srt.managers.overlap_copy_worker import AsyncD2HCopyWorker
+
+            self.d2h_worker = AsyncD2HCopyWorker(self.device_module, self.copy_stream)
+            logger.info(
+                "Confidential computing detected: offloading the per-step D2H "
+                "result readback to a worker thread to preserve overlap scheduling."
+            )
+
+    def _issue_result_copy_to_cpu(
+        self, result, copy_fn, non_cc_fallback=None, *, producer_stream=None
+    ):
+        """Issue the result's D2H readback.
+
+        Default path: run ``copy_fn`` (or ``non_cc_fallback`` if given, for
+        call sites with their own non-CC stream-overlap logic) inline. Under
+        confidential computing the copy blocks at issue, so instead record a
+        ``src_ready`` event on the producer (default: current) stream and hand the
+        still-blocking copy to the worker thread; the scheduler thread returns
+        immediately and keeps launching work. The deferred consume waits on
+        ``result.copy_ready_cpu`` instead of ``copy_done`` (see
+        ``SchedulerBatchResultProcessor._wait_result_copy``).
+        """
+        if self.enable_cc_async_copy:
+            src_ready = self.device_module.Event()
+            src_ready.record(stream=producer_stream)
+            result.copy_ready_cpu = self.d2h_worker.submit(src_ready, copy_fn)
+        elif non_cc_fallback is not None:
+            non_cc_fallback()
+        else:
+            copy_fn()
+
+    def _shutdown_d2h_worker(self):
+        """Stop the confidential-compute async D2H copy worker thread, if any."""
+        if getattr(self, "d2h_worker", None) is not None:
+            self.d2h_worker.shutdown()
+            self.d2h_worker = None
 
     def maybe_init_ngram_embedding(self):
         self.ngram_embedding_manager = (
@@ -1842,6 +1969,9 @@ class Scheduler(
     def release_host_resources(self) -> None:
         # Release pinned host buffers in userspace on graceful shutdown; see
         # HostKVCache.destroy. Called from run_scheduler_process's finally.
+        from sglang.srt.utils.host_staging import clear_host_staging_pools
+
+        clear_host_staging_pools()
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.destroy()
         self.tree_cache.release_host_resources()
@@ -1989,9 +2119,12 @@ class Scheduler(
                 # Fence result processing behind this forward's shared reads.
                 self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
+                ccd_extras, ccd_extras_snapshot = self._take_ccd_extras()
             else:
                 batch_result = None
                 self._sched_idled = True
+                ccd_extras = None
+                ccd_extras_snapshot = None
 
             # Process the last batch
             if self.last_batch:
@@ -2000,6 +2133,8 @@ class Scheduler(
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
+
+            self._drain_ccd_extras(batch, ccd_extras, ccd_extras_snapshot)
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
@@ -2011,6 +2146,80 @@ class Scheduler(
 
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
+
+    def _take_ccd_extras(self):
+        """Atomically claim (and clear) the CCD extra results run_batch may
+        have queued. Call immediately after run_batch, in EVERY event loop
+        that can run CCD -- checkpoint 123's PD livelock was exactly this
+        being claimed/drained only in event_loop_overlap while
+        event_loop_overlap_disagg_decode (the loop every PD decode engine
+        actually runs) silently dropped 4 of every chunk's 5 results."""
+        ccd_extras = self._ccd_pending_extra_results
+        ccd_extras_snapshot = self._ccd_pending_extra_snapshot
+        self._ccd_pending_extra_results = None
+        self._ccd_pending_extra_snapshot = None
+        return ccd_extras, ccd_extras_snapshot
+
+    def _drain_ccd_extras(self, batch, ccd_extras, ccd_extras_snapshot) -> None:
+        """CC conditional decode (checkpoint 067): a CCD run_batch() call did
+        chunk_cap+1 real ticks' worth of work in one host round-trip -- the
+        result the caller queued on result_queue is only the chunk's FINAL
+        tick. The earlier ticks' results are already fully computed
+        (read_history's synchronous D2H copy, checkpoint 066), so process
+        them now, synchronously, in order -- NOT via result_queue, which
+        would spread them across chunk_cap further loop iterations (each
+        paying a fresh recv_requests() call, defeating the entire point).
+        Must run AFTER the caller's pop_and_process() of last_batch: that
+        queued result is strictly older than this iteration's chunk, and any
+        request present in both needs its tokens appended in that order.
+        """
+        if not ccd_extras:
+            return
+        # A split-batch tick (checkpoint 119) sets ccd_extras_snapshot to
+        # the CCD-eligible sub-batch's own snapshot, taken before it was
+        # merged with the ineligible half -- ccd_extras' rows only ever
+        # cover that sub-batch, never the (possibly wider, post-merge)
+        # `batch`.
+        extras_snapshot = (
+            ccd_extras_snapshot if ccd_extras_snapshot is not None else batch.copy()
+        )
+        # ccd_extras[0] is the real priming tick's result -- genuinely
+        # GPU-resident (a real, eager forward_batch_generation call), unlike
+        # the normal per-tick path it never goes through the copy_to_cpu()
+        # step that ordinarily runs before result processing. The rest
+        # (synthetic ticks) already carry CPU tensors from read_history()'s
+        # own synchronous D2H, so this is a safe no-op for them (_async_d2h
+        # short-circuits for non-CUDA tensors). return_logprob/
+        # return_hidden_states are always False here: check_ccd_eligible
+        # already excludes both for any CCD-eligible batch. Found live:
+        # _resolve_spec_v2_tokens asserting result.next_token_ids.is_cpu on
+        # the priming result.
+        for extra_result in ccd_extras:
+            # copy_to_cpu() internally records completion onto copy_done
+            # (matching the normal per-tick path, which always sets this
+            # immediately before calling copy_to_cpu()); every ccd_extras
+            # entry constructs with copy_done=None, so this needs setting
+            # here too, not just for the priming result specifically.
+            extra_result.copy_done = self.device_module.Event()
+            extra_result.copy_to_cpu(return_logprob=False, return_hidden_states=False)
+        # These ticks are processed synchronously, right here, not via the
+        # normal result_queue's next-iteration lag -- must actually be on
+        # CPU before process_batch_result reads them, not just
+        # async-launched.
+        torch.cuda.synchronize()
+        _extras_debug = os.environ.get("SGLANG_CCD_SPLIT_DEBUG") == "1"
+        for extra_result in ccd_extras:
+            self.process_batch_result(extras_snapshot, extra_result)
+            if _extras_debug:
+                import sys as _sys_exdbg
+
+                _sys_exdbg.stderr.write(
+                    "CCD_EXTRAS_DEBUG: "
+                    f"fwd_mode={extras_snapshot.forward_mode} "
+                    f"accept_lens={extra_result.accept_lens.tolist() if extra_result.accept_lens is not None else None} "
+                    f"req_state={[(len(r.output_ids), bool(r.finished()), bool(r.is_retracted)) for r in extras_snapshot.reqs]}\n"
+                )
+                _sys_exdbg.stderr.flush()
 
     def is_disable_overlap_for_batch(
         self, batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
@@ -2308,6 +2517,7 @@ class Scheduler(
             mm_receiver=self.mm_receiver,
             tp_group=self.tp_group,
             tp_cpu_group=self.tp_cpu_group,
+            tp_metadata_nccl_group=self.tp_metadata_nccl_group,
             attn_tp_group=self.attn_tp_group,
             attn_tp_cpu_group=self.attn_tp_cpu_group,
             attn_cp_group=self.attn_cp_group,
@@ -2927,7 +3137,9 @@ class Scheduler(
             return
 
         if self.spec_algorithm.is_dflash_family():
-            error_msg = validate_dflash_request(req, self.enable_overlap)
+            error_msg = validate_dflash_request(
+                req, self.enable_overlap, self.server_args.grammar_backend
+            )
             if error_msg is not None:
                 req.set_finish_with_abort(error_msg)
                 self.init_req_max_new_tokens(req)
@@ -3338,9 +3550,13 @@ class Scheduler(
         ):
             return False
 
-        # Reject the incoming request by default.
+        # Reject the incoming request by default. Queue-full is load shedding,
+        # so it answers 429: the provider API contract requires failed requests
+        # under overload to tell the client it is being rate limited, and a 503
+        # reads as "this server is broken" instead of "retry later".
         req_to_abort = recv_req
         message = "The request queue is full."
+        status_code = HTTPStatus.TOO_MANY_REQUESTS
         if self.enable_priority_scheduling:
             # With priority scheduling, consider aboritng an existing request based on the priority.
             # direction = 1  => smaller number = higher priority; -1 => larger number = higher priority.
@@ -3361,13 +3577,16 @@ class Scheduler(
                 self.beam_coordinator.retire_group(candidate_req)
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
+                # Not rate limiting: this request lost a priority comparison,
+                # and retrying at a lower rate would not have saved it.
+                status_code = HTTPStatus.SERVICE_UNAVAILABLE
 
         self.ipc_channels.send_to_tokenizer.send_output(
             _make_abort_req(
                 req_to_abort,
                 finished_reason={
                     "type": "abort",
-                    "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                    "status_code": status_code,
                     "message": message,
                 },
             ),
@@ -3394,7 +3613,7 @@ class Scheduler(
                             abort_message="Request waiting timeout reached.",
                             finished_reason={
                                 "type": "abort",
-                                "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                                "status_code": HTTPStatus.TOO_MANY_REQUESTS,
                                 "message": "Request waiting timeout reached.",
                             },
                         )
@@ -3610,7 +3829,9 @@ class Scheduler(
             [r.output_ids[-1] for r in reqs], dtype=torch.int64, device=device
         )
         self.future_map.stash(
-            batch.req_pool_indices, RelayPayload(bonus_tokens=last_tokens)
+            batch.req_pool_indices,
+            RelayPayload(bonus_tokens=last_tokens),
+            future_indices_cpu=batch.req_pool_indices_cpu,
         )
         batch.input_ids = None
 
@@ -3720,9 +3941,29 @@ class Scheduler(
             if running_batch.is_empty():
                 running_batch.batch_is_full = False
 
+        # Decode fairness (Track I): the arbitration below is strictly
+        # prefill-first, so under a high turn rate decode ticks queue behind
+        # an unbroken stream of prefill batches (measured: 83-127ms/tick
+        # with no interleave vs 322-1475ms effective when crowded). When the
+        # streak limit is enabled and decodable work is waiting, skip
+        # prefill FORMATION for one pass — the gate must sit before
+        # get_new_batch_prefill because that call has side effects
+        # (KV allocation, waiting-queue pops) and a formed batch cannot be
+        # discarded. Skipped prefill work just stays queued for next pass;
+        # a mid-flight chunked request was already stashed above and its
+        # re-stash next pass is a guarded no-op.
+        decode_waiting = (
+            not running_batch.is_empty() and not running_batch.is_prefill_only
+        )
+        force_decode_pass = (
+            self.max_consecutive_prefill > 0
+            and decode_waiting
+            and self._consecutive_prefill_count >= self.max_consecutive_prefill
+        )
+
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
-        elif self._should_defer_prefill():
+        elif force_decode_pass or self._should_defer_prefill():
             new_batch = None
         else:
             prefill_plan = self.get_new_batch_prefill(running_batch)
@@ -3746,8 +3987,14 @@ class Scheduler(
         if new_batch is not None:
             # Run prefill first if possible
             ret = new_batch
+
+            # Count the streak only when decode work was actually waiting —
+            # prefill running on an otherwise-idle engine starves nothing.
+            if decode_waiting:
+                self._consecutive_prefill_count += 1
         else:
             # Run decode (skip for prefill-only batches)
+            self._consecutive_prefill_count = 0
             if not running_batch.is_empty() and not running_batch.is_prefill_only:
                 running_batch = self.update_running_batch(running_batch)
                 ret = running_batch if not running_batch.is_empty() else None
@@ -3950,6 +4197,7 @@ class Scheduler(
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         buffer_pipeline = self.tree_cache.buffer_pipeline
+        stop_reason = None
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
@@ -3984,6 +4232,11 @@ class Scheduler(
                 if not self.enable_priority_preemption or not adder.preempt_to_schedule(
                     req
                 ):
+                    stop_reason = (
+                        f"batch_full allocatable_reqs="
+                        f"{self.get_num_allocatable_reqs(running_bs, candidate_beam_width, running_batch=running_batch)} "
+                        f"req_pool_free={self.req_to_token_pool.available_size()}"
+                    )
                     break
 
             if self.enable_hicache_storage or self.enable_lmcache:
@@ -4053,7 +4306,24 @@ class Scheduler(
                             req.kv.mamba_pool_idx.unsqueeze(-1)
                         )
                         req.kv.mamba_pool_idx = None
+                stop_reason = (
+                    f"{res.name} next_uncached="
+                    f"{len(req.full_untruncated_fill_ids) - len(req.prefix_indices)} "
+                    f"added={added}"
+                )
                 break
+
+        if stop_reason is not None and envs.SGLANG_DEBUG_PREFILL_ADMISSION.get():
+            logger.info(
+                "Prefill admission stopped: %s admitted=%d waiting=%d "
+                "rem_chunk=%s rem_input=%s chunked_req=%s",
+                stop_reason,
+                len(adder.can_run_list),
+                len(self.waiting_queue),
+                adder.rem_chunk_tokens,
+                adder.rem_input_tokens,
+                self.chunked_req is not None,
+            )
 
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()
@@ -4341,6 +4611,15 @@ class Scheduler(
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
+        ced_tail_probe = (
+            self.ced_tail_timer.begin(
+                batch,
+                forward_ct=self.forward_ct + 1,
+                forward_stream=self.forward_stream if self.enable_overlap else None,
+            )
+            if self.ced_tail_timer is not None
+            else None
+        )
         self.metrics_reporter.record_scheduler_active()
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
@@ -4393,30 +4672,297 @@ class Scheduler(
 
                     with self._forward_isolation(batch, overlap=True):
                         future_indices = batch.req_pool_indices
+                        future_indices_cpu = batch.req_pool_indices_cpu
 
-                        # Spec_v2 fires on_publish mid-worker (between verify and
-                        # draft_extend) so schedule prep can overlap with draft_extend.
-                        # Non-spec has no later work — scheduler publishes after return.
-                        fwd_kwargs = {}
-                        if not batch.spec_algorithm.is_none():
-                            fwd_kwargs["on_publish"] = partial(
-                                self.future_map.publish, future_indices
+                        # CC conditional decode (checkpoints 059-067): runs
+                        # chunk_cap further ticks entirely on-GPU inside one
+                        # captured WHILE loop, after one real priming tick, so
+                        # this run_batch() call represents chunk_cap+1 real
+                        # ticks instead of 1 -- the outer event loop's
+                        # recv_requests()/get_next_batch_to_run() then run
+                        # proportionally less often per token generated.
+                        # Strictly opt-in; check_ccd_eligible is the single
+                        # source of truth for when it's safe to use, and every
+                        # excluded case (return_logprob, non-greedy sampling,
+                        # mamba, hidden_states/sampling_mask, ...) falls
+                        # through unchanged to the normal path below. Extra
+                        # per-tick results (all but the chunk's final one) are
+                        # queued via self._ccd_pending_extra_results for the
+                        # event loop to drain (_take_ccd_extras +
+                        # _drain_ccd_extras) right after this run_batch() call
+                        # returns.
+                        #
+                        # NOT a silent reset: a leftover value here means the
+                        # active event loop ran a CCD chunk last tick and
+                        # never drained it -- the exact checkpoint-123
+                        # failure (event_loop_overlap_disagg_decode dropped 4
+                        # of every chunk's 5 committed tokens with zero
+                        # errors, presenting as a silent production hang).
+                        # Silently overwriting would re-mask that entire bug
+                        # class; failing loudly here means any event loop
+                        # missing the drain dies on its SECOND CCD tick, in
+                        # the first minute of any test.
+                        if self._ccd_pending_extra_results is not None:
+                            raise RuntimeError(
+                                "CCD extra results from the previous tick were "
+                                "never drained: the active event loop ran a CCD "
+                                "chunk but did not call _take_ccd_extras/"
+                                "_drain_ccd_extras after run_batch. Every event "
+                                "loop that can reach run_batch under overlap "
+                                "scheduling must drain CCD extras every tick "
+                                "(see event_loop_overlap and "
+                                "event_loop_overlap_disagg_decode)."
                             )
-                            # Grammar-overlap-capable workers advance the grammar FSM
-                            # inside verify() before building the bitmask; hand them the
-                            # barrier that resolves the previous batch's committed
-                            # tokens (overlapping the target forward).
-                            if batch.spec_algorithm.supports_grammar_overlap():
-                                fwd_kwargs["grammar_barrier"] = (
-                                    self._advance_pending_grammar
-                                )
+                        self._ccd_pending_extra_results = None
+                        self._ccd_pending_extra_snapshot = None
 
-                        # FIXME: pp is not compatible with overlap
-                        batch_result = self.model_worker.forward_batch_generation(
-                            batch, **fwd_kwargs
-                        )
+                        # Split-batch CCD (checkpoint 119): check_ccd_eligible
+                        # above is all-or-nothing across the whole batch, so
+                        # under sustained multi-turn traffic (a steady mix of
+                        # long-running "veteran" requests that individually
+                        # qualify and freshly-admitted "newcomer" ones that
+                        # never do) it effectively never fires. try_split_ccd_batch
+                        # partitions the batch into a CCD-eligible subset and
+                        # an ineligible one and, if the split is worthwhile
+                        # (returns non-None -- see its own docstring for the
+                        # narrow V1 scope guards), this tick runs CCD on the
+                        # eligible subset and the normal eager path on the
+                        # ineligible subset, then scatters both halves'
+                        # results back into ONE result in the ORIGINAL
+                        # batch's row order (merge_ccd_split_results).
+                        # `batch` itself is never reordered: this whole
+                        # branch runs inside _forward_isolation, whose
+                        # restore reverts every dataclass field afterwards,
+                        # so any in-forward reorder (the earlier
+                        # vars().update morph) silently vanished and left
+                        # the result misaligned with the batch -- original-
+                        # order results against the untouched batch is the
+                        # only alignment that survives the restore.
+                        ccd_split = (
+                            SGLANG_CC_CONDITIONAL_DECODE
+                            and batch.spec_algorithm.is_dflash_family()
+                            and try_split_ccd_batch(batch, self.model_worker)
+                        ) or None
+
+                        if ccd_split is not None:
+                            (
+                                eligible_batch,
+                                ineligible_batch,
+                                eligible_indices,
+                                ineligible_indices,
+                            ) = ccd_split
+                            if os.environ.get("SGLANG_CCD_SPLIT_DEBUG") == "1":
+                                logger.info(
+                                    f"CCD_SPLIT_DEBUG: eligible={eligible_batch.batch_size()} "
+                                    f"ineligible={ineligible_batch.batch_size()}"
+                                )
+                            eligible_future_indices = eligible_batch.req_pool_indices
+                            eligible_future_indices_cpu = (
+                                eligible_batch.req_pool_indices_cpu
+                            )
+                            ineligible_future_indices = ineligible_batch.req_pool_indices
+                            ineligible_future_indices_cpu = (
+                                ineligible_batch.req_pool_indices_cpu
+                            )
+
+                            eos_ids_set = self.model_config.hf_eos_token_id or {-1}
+                            eos_ids = torch.tensor(
+                                sorted(eos_ids_set), dtype=torch.int64, device=self.device
+                            )
+                            eligible_max_new = torch.tensor(
+                                [
+                                    max(
+                                        1,
+                                        (req.sampling_params.max_new_tokens or 0)
+                                        - len(req.output_ids),
+                                    )
+                                    for req in eligible_batch.reqs
+                                ],
+                                dtype=torch.int32,
+                                device=self.device,
+                            )
+                            chunk_results = run_ccd_chunk(
+                                self.model_worker,
+                                eligible_batch,
+                                chunk_cap=SGLANG_CC_CONDITIONAL_DECODE_CHUNK_CAP,
+                                eos_ids=eos_ids,
+                                max_new=eligible_max_new,
+                                stream=self.forward_stream,
+                                on_publish=partial(
+                                    self.future_map.publish,
+                                    eligible_future_indices,
+                                    future_indices_cpu=eligible_future_indices_cpu,
+                                ),
+                            )
+                            eligible_result = chunk_results[-1]
+                            self._ccd_pending_extra_results = chunk_results[:-1]
+                            # ccd_extras' rows are eligible_batch's alone
+                            # (not the full-width original batch) -- the
+                            # event loop must snapshot against THIS, not its
+                            # own `batch.copy()` fallback, or the extras'
+                            # row count won't match the snapshot's req list.
+                            self._ccd_pending_extra_snapshot = eligible_batch.copy()
+
+                            ineligible_result = self.model_worker.forward_batch_generation(
+                                ineligible_batch,
+                                on_publish=partial(
+                                    self.future_map.publish,
+                                    ineligible_future_indices,
+                                    future_indices_cpu=ineligible_future_indices_cpu,
+                                ),
+                            )
+
+                            # Scatter both halves' results (and their
+                            # next_draft_inputs) back into original row
+                            # order. No ScheduleBatch merge, no batch morph:
+                            # the batch keeps its original order (see the
+                            # branch comment above -- _forward_isolation
+                            # would revert any reorder anyway), so the
+                            # shared post-branch code below relays with the
+                            # original `future_indices` local, which is
+                            # exactly the order the merged result is in.
+                            # next_draft_input is rebuilt fresh inside
+                            # merge_ccd_split_results (make_draft_input_v2),
+                            # so the transient KV-reservation bookkeeping
+                            # fields (task #141) start None on it -- no
+                            # manual reset needed.
+                            batch_result = merge_ccd_split_results(
+                                eligible_result,
+                                ineligible_result,
+                                eligible_indices,
+                                ineligible_indices,
+                                device=self.device,
+                            )
+                            use_ccd = False
+                        else:
+                            use_ccd = (
+                                SGLANG_CC_CONDITIONAL_DECODE
+                                and batch.spec_algorithm.is_dflash_family()
+                                and check_ccd_eligible(batch, self.model_worker) is None
+                            )
+
+                        if ccd_split is None and use_ccd:
+                            if os.environ.get("SGLANG_CCD_SPLIT_DEBUG") == "1":
+                                logger.info(
+                                    f"CCD_WHOLE_BATCH_DEBUG: bs={batch.batch_size()}"
+                                )
+                            eos_ids_set = self.model_config.hf_eos_token_id or {-1}
+                            eos_ids = torch.tensor(
+                                sorted(eos_ids_set), dtype=torch.int64, device=self.device
+                            )
+                            max_new = torch.tensor(
+                                [
+                                    max(
+                                        1,
+                                        (req.sampling_params.max_new_tokens or 0)
+                                        - len(req.output_ids),
+                                    )
+                                    for req in batch.reqs
+                                ],
+                                dtype=torch.int32,
+                                device=self.device,
+                            )
+                            chunk_results = run_ccd_chunk(
+                                self.model_worker,
+                                batch,
+                                chunk_cap=SGLANG_CC_CONDITIONAL_DECODE_CHUNK_CAP,
+                                eos_ids=eos_ids,
+                                max_new=max_new,
+                                stream=self.forward_stream,
+                                on_publish=partial(
+                                    self.future_map.publish,
+                                    future_indices,
+                                    future_indices_cpu=future_indices_cpu,
+                                ),
+                            )
+                            batch_result = chunk_results[-1]
+                            self._ccd_pending_extra_results = chunk_results[:-1]
+                        elif (
+                            ccd_split is None
+                            and SGLANG_CCSPEC_DECODE
+                            and batch.spec_algorithm.is_none()
+                            and check_ccspec_eligible(
+                                batch, self.model_worker.model_runner
+                            )
+                            is None
+                        ):
+                            # CCSpec (model_executor/ccspec_decode.py): CCD's
+                            # WHILE-loop chunk amortization for PLAIN decode --
+                            # no draft model. Structured exactly like the CCD
+                            # whole-batch branch above: the chunk's terminal
+                            # result becomes this tick's batch_result; the
+                            # priming tick + earlier captured ticks queue on
+                            # the SAME extras machinery (_take_ccd_extras /
+                            # _drain_ccd_extras + tripwire, all unchanged).
+                            # _ccd_pending_extra_snapshot stays None: whole-
+                            # batch, so the event loop's batch.copy() fallback
+                            # is exactly right (same convention as CCD's
+                            # whole-batch path).
+                            #
+                            # Shared post-branch reconciliation (derivations in
+                            # run_ccspec_chunk's docstring): the body carries
+                            # batch.seq_lens in place to S0 + emitted, so the
+                            # non-spec publish below (`batch.seq_lens + 1`)
+                            # publishes the next tick's post-prepare value, and
+                            # the terminal result's next_token_ids is the LAST
+                            # emitted tick's DEVICE tokens, so
+                            # _relay_forward_payload seeds the next tick's
+                            # input gather correctly. Neither shared line needs
+                            # modification.
+                            eos_ids_set = self.model_config.hf_eos_token_id or {-1}
+                            eos_ids = torch.tensor(
+                                sorted(eos_ids_set),
+                                dtype=torch.int64,
+                                device=self.device,
+                            )
+                            chunk_results = run_ccspec_chunk(
+                                self.model_worker,
+                                batch,
+                                chunk_cap=SGLANG_CCSPEC_CHUNK_CAP,
+                                eos_ids=eos_ids,
+                                stream=self.forward_stream,
+                            )
+                            batch_result = chunk_results[-1]
+                            # `or None`: a priming-tick EOS emits zero captured
+                            # ticks; an empty extras list must not linger.
+                            self._ccd_pending_extra_results = (
+                                chunk_results[:-1] or None
+                            )
+                            self._ccd_pending_extra_snapshot = None
+                        elif ccd_split is None:
+                            # Spec_v2 fires on_publish mid-worker (between verify and
+                            # draft_extend) so schedule prep can overlap with draft_extend.
+                            # Non-spec has no later work — scheduler publishes after return.
+                            fwd_kwargs = (
+                                {
+                                    "on_publish": partial(
+                                        self.future_map.publish,
+                                        future_indices,
+                                            future_indices_cpu=future_indices_cpu,
+                                    )
+                                }
+                                if not batch.spec_algorithm.is_none()
+                                else {}
+                            )
+                            if not batch.spec_algorithm.is_none():
+                                # Grammar-overlap-capable workers advance the grammar FSM
+                                # inside verify() before building the bitmask; hand them the
+                                # barrier that resolves the previous batch's committed
+                                # tokens (overlapping the target forward).
+                                if batch.spec_algorithm.supports_grammar_overlap():
+                                    fwd_kwargs["grammar_barrier"] = (
+                                        self._advance_pending_grammar
+                                    )
+                            # FIXME: pp is not compatible with overlap
+                            batch_result = self.model_worker.forward_batch_generation(
+                                batch, **fwd_kwargs
+                            )
                         if batch.spec_algorithm.is_none():
-                            self.future_map.publish(future_indices, batch.seq_lens + 1)
+                            self.future_map.publish(
+                                future_indices,
+                                batch.seq_lens + 1,
+                                future_indices_cpu=future_indices_cpu,
+                            )
                         # Park any refs the worker wants kept alive 2 iters
                         # (cross-stream tensor lifetime; pinned in the same
                         # ring slot as the SB attr snapshot).
@@ -4442,25 +4988,43 @@ class Scheduler(
                         batch_result.copy_done = self.device_module.Event()
                         if batch_result.delay_sample_func is None:
                             self._relay_forward_payload(
-                                batch, future_indices, batch_result
+                                batch,
+                                future_indices,
+                                batch_result,
+                                future_indices_cpu=future_indices_cpu,
+                            )
+                            copy_fn = partial(
+                                batch_result.copy_to_cpu,
+                                return_logprob=batch.return_logprob,
+                                return_hidden_states=batch.return_hidden_states,
                             )
                             if _is_hip:
                                 # Cross-stream sync costs more than the tiny D2H it
-                                # overlaps.
-                                batch_result.copy_to_cpu(
-                                    return_logprob=batch.return_logprob,
-                                    return_hidden_states=batch.return_hidden_states,
-                                )
+                                # overlaps. (Confidential compute is an NVIDIA-only
+                                # feature, so enable_cc_async_copy is always False
+                                # here -- this call is always the inline copy_fn.)
+                                self._issue_result_copy_to_cpu(batch_result, copy_fn)
                             else:
-                                # Result D2H on copy_stream overlaps the next forward
-                                # instead of serializing on forward_stream; it's a leaf
-                                # gated by copy_done, so nothing on forward_stream waits.
-                                self.copy_stream.wait_stream(self.forward_stream)
-                                with self.copy_stream_ctx:
-                                    batch_result.copy_to_cpu(
-                                        return_logprob=batch.return_logprob,
-                                        return_hidden_states=batch.return_hidden_states,
-                                    )
+
+                                def _copy_on_stream():
+                                    # Result D2H on copy_stream overlaps the next
+                                    # forward instead of serializing on
+                                    # forward_stream; it's a leaf gated by
+                                    # copy_done, so nothing on forward_stream waits.
+                                    # Not used under confidential computing: the
+                                    # copy blocks the issuing thread at issue there
+                                    # regardless of which stream it's issued on, so
+                                    # the worker thread (below) issues copy_fn
+                                    # directly instead.
+                                    self.copy_stream.wait_stream(self.forward_stream)
+                                    with self.copy_stream_ctx:
+                                        copy_fn()
+
+                                self._issue_result_copy_to_cpu(
+                                    batch_result,
+                                    copy_fn,
+                                    non_cc_fallback=_copy_on_stream,
+                                )
                         else:
                             batch_result.future_indices = future_indices
 
@@ -4476,7 +5040,12 @@ class Scheduler(
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 resolve_forward_inputs(batch, self.future_map)
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
-                self._relay_forward_payload(batch, batch.req_pool_indices, batch_result)
+                self._relay_forward_payload(
+                    batch,
+                    batch.req_pool_indices,
+                    batch_result,
+                    future_indices_cpu=batch.req_pool_indices_cpu,
+                )
                 batch.input_ids = None
                 self._copy_auxiliary_output_to_cpu(batch, batch_result)
             elif not batch.spec_algorithm.is_none():
@@ -4592,7 +5161,10 @@ class Scheduler(
                 if batch_result.has_sampled_token_ids:
                     # Non-spec: relay via future_map, gathered next iter.
                     self._relay_forward_payload(
-                        batch, batch.req_pool_indices, batch_result
+                        batch,
+                        batch.req_pool_indices,
+                        batch_result,
+                        future_indices_cpu=batch.req_pool_indices_cpu,
                     )
                     batch.input_ids = None
                 self.update_cache_from_scheduler(batch, batch_result)
@@ -4631,7 +5203,7 @@ class Scheduler(
                         pooled_hidden_states=pooler_output.pooled_hidden_states,
                         can_run_cuda_graph=can_run_cuda_graph,
                     )
-                    ret.copy_to_cpu()
+                    self._issue_result_copy_to_cpu(ret, ret.copy_to_cpu)
             else:
                 resolve_forward_inputs(batch, self.future_map)
                 pooler_output, can_run_cuda_graph = (
@@ -4645,6 +5217,8 @@ class Scheduler(
 
         self._maybe_report_active_ranks()
 
+        if ced_tail_probe is not None:
+            self.ced_tail_timer.end(ced_tail_probe, batch, forward_ct=self.forward_ct)
         return ret
 
     def _maybe_report_active_ranks(self) -> None:
@@ -4676,12 +5250,18 @@ class Scheduler(
         batch: ScheduleBatch,
         future_indices: torch.Tensor,
         batch_result: GenerationBatchResult,
+        *,
+        future_indices_cpu: Optional[torch.Tensor] = None,
     ) -> None:
         """Stash this iter's relay payload for next iter's resolve_forward_inputs."""
         if self.spec_algorithm.is_ngram():
             if batch_result.next_draft_input is not None:
                 payload = RelayPayload.from_ngram(batch_result.next_draft_input)
-                self.future_map.stash(future_indices, payload)
+                self.future_map.stash(
+                    future_indices,
+                    payload,
+                    future_indices_cpu=future_indices_cpu,
+                )
             return
         if batch_result.next_draft_input is not None:
             payload = RelayPayload.from_draft_input(batch_result.next_draft_input)
@@ -4693,7 +5273,11 @@ class Scheduler(
             # The worker sliced the tail off before sampling, so sampled tokens
             # cover only the reqs-aligned rows; the coordinator relays the rest.
             future_indices = future_indices[: batch.beam_tail.num_base_rows]
-        self.future_map.stash(future_indices, payload)
+        self.future_map.stash(
+            future_indices,
+            payload,
+            future_indices_cpu=future_indices_cpu,
+        )
         self.beam_coordinator.maybe_select_and_relay(
             batch, batch_result, chunked_req=self.chunked_req
         )
@@ -4725,7 +5309,9 @@ class Scheduler(
         )
 
     def launch_batch_sample_if_needed(
-        self, batch_result: GenerationBatchResult, cur_batch: ScheduleBatch
+        self,
+        batch_result: GenerationBatchResult,
+        cur_batch: ScheduleBatch,
     ) -> Union[GenerationBatchResult]:
         # TODO(lsyin): make the delayed sample a default behavior after
         # unifying the forward_batch_generation interface (related to spec V2).
@@ -4738,18 +5324,34 @@ class Scheduler(
             assert _batch_result is batch_result
             # Delay-sample is non-spec only; relays the sampled bonus tokens.
             self._relay_forward_payload(
-                cur_batch, batch_result.future_indices, batch_result
+                cur_batch,
+                batch_result.future_indices,
+                batch_result,
+                future_indices_cpu=cur_batch.req_pool_indices_cpu,
             )
+        copy_fn = partial(
+            batch_result.copy_to_cpu,
+            return_logprob=cur_batch.return_logprob,
+            return_hidden_states=cur_batch.return_hidden_states,
+        )
 
-        # Run device-to-host copy on a separate stream to avoid blocking the
-        # forward stream. The copy waits for the sampled result and can overlap
-        # with subsequent forward computation.
-        self.copy_stream.wait_stream(self.forward_stream)
-        with self.copy_stream_ctx:
-            batch_result.copy_to_cpu(
-                return_logprob=cur_batch.return_logprob,
-                return_hidden_states=cur_batch.return_hidden_states,
-            )
+        def _copy_on_stream():
+            # Result D2H on copy_stream overlaps the next forward instead of
+            # serializing on forward_stream; it's a leaf gated by copy_done,
+            # so nothing on forward_stream waits. Not used under confidential
+            # computing: the copy blocks the issuing thread at issue there
+            # regardless of which stream it's issued on, so the worker thread
+            # (elsewhere) issues copy_fn directly instead.
+            self.copy_stream.wait_stream(self.forward_stream)
+            with self.copy_stream_ctx:
+                copy_fn()
+
+        self._issue_result_copy_to_cpu(
+            batch_result,
+            copy_fn,
+            non_cc_fallback=_copy_on_stream,
+            producer_stream=self.forward_stream,
+        )
 
         # Release the closure and large GPU tensors that are no longer needed.
         # The delay_sample_func closure captures forward_batch (which holds
@@ -5239,6 +5841,20 @@ class Scheduler(
             draft_graph_memory_usage=draft_graph_memory_usage,
         )
         ret["memory_usage"] = memory_usage
+        from sglang.srt.utils.hardwire_memory_registry import (
+            get_hardwire_memory_snapshot,
+        )
+
+        requested_hardwire_components = []
+        if get_exec().graph.cuda_graph_host_memory_backend == "hardwire":
+            requested_hardwire_components.append("graph_staging")
+        if get_memory().hicache_host_memory_backend == "hardwire":
+            requested_hardwire_components.append("hicache")
+        if get_memory().lmcache_host_memory_backend == "hardwire":
+            requested_hardwire_components.append("lmcache")
+        ret["hardwire_memory"] = get_hardwire_memory_snapshot(
+            requested_components=requested_hardwire_components
+        )
         ret["startup_time"] = self.startup_time
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
         # PD role switch: report this instance's role and the decode CUDA graph
@@ -5309,6 +5925,7 @@ class Scheduler(
                 "speculative_accept_threshold_acc",
                 "dspark_force_budget_frac",
                 "dspark_clear_info_records",
+                "ced_tail_options",
             ]
         )
 
@@ -5326,6 +5943,22 @@ class Scheduler(
                 )
                 if_success = False
                 break
+            elif k == "ced_tail_options":
+                if (
+                    self.disaggregation_mode != DisaggregationMode.DECODE
+                    or not envs.SGLANG_OPT_DSV41_CED_SPLIT.get()
+                ):
+                    logging.warning(
+                        "ced_tail_options requires a CED-split decode worker."
+                    )
+                    if_success = False
+                    break
+                try:
+                    validate_ced_options(v)
+                except (ValueError, TypeError):
+                    logger.exception("Invalid CED tail options")
+                    if_success = False
+                    break
             elif k == "dspark_force_budget_frac":
                 if not self.spec_algorithm.is_dspark() or not hasattr(
                     self.draft_worker, "set_dspark_forced_budget_frac"
@@ -5367,6 +6000,12 @@ class Scheduler(
             # DSpark control keys are worker commands, not server args; route
             # them to the draft worker and keep them out of the override.
             remaining = dict(server_args_dict)
+            if "ced_tail_options" in remaining:
+                # CED tail knobs are read through envs on every rank.
+                options = remaining.pop("ced_tail_options")
+                for name, value in validate_ced_options(options).items():
+                    getattr(envs, name).set(value)
+                logger.info("CED tail options updated: %s", options)
             frac = remaining.pop("dspark_force_budget_frac", None)
             if "dspark_force_budget_frac" in server_args_dict:
                 self.draft_worker.set_dspark_forced_budget_frac(
@@ -6103,6 +6742,8 @@ def run_scheduler_process(
             # FPM has a background ZMQ publisher thread that needs explicit
             # teardown to flush queued metrics and close the socket cleanly.
             scheduler.metrics_reporter._shutdown_fpm()
+            # Stop the confidential-compute async D2H copy worker thread.
+            scheduler._shutdown_d2h_worker()
             # Graceful path only: on the exception path the GPU may be wedged
             # and the synchronize() in destroy() could itself hang.
             if scheduler.gracefully_exit:

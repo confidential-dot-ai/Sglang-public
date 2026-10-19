@@ -690,6 +690,22 @@ impl WorkerRegistry {
 
         HealthChecker::new(handle, shutdown)
     }
+
+    /// Start the background KV-occupancy poller (see kv_occupancy_poller.rs
+    /// for why this exists -- load()'s request count alone can't see a
+    /// worker pinned near-full on KV while running very few requests).
+    /// registry_arc must be the SAME Arc<WorkerRegistry> the router holds
+    /// (not a fresh Self::default()), or the poller reads/updates a
+    /// disconnected registry.
+    pub(crate) fn start_kv_occupancy_poller(
+        registry_arc: Arc<WorkerRegistry>,
+        interval_secs: u64,
+    ) -> crate::core::kv_occupancy_poller::KvOccupancyPoller {
+        crate::core::kv_occupancy_poller::KvOccupancyPoller::start(
+            registry_arc,
+            std::time::Duration::from_secs(interval_secs),
+        )
+    }
 }
 
 impl Default for WorkerRegistry {

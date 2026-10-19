@@ -781,6 +781,7 @@ class SWAComponent(TreeComponent):
         if (
             cache.cache_controller is None
             or not cache.is_write_back
+            or not envs.SGLANG_ENABLE_HICACHE_SWA_TOMBSTONE_BACKUP.get()
             or not self.tree_core.has_swa_host_pool
             or cd.host_value is not None
             or node.backuped

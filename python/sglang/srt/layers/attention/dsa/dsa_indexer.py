@@ -71,6 +71,7 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_npu,
+    is_sm100_supported,
     is_xpu,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -221,6 +222,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     _MQA_LOGITS_STATIC_SKIP_ELEMS = MQA_LOGITS_STATIC_SKIP_ELEMS
     _MQA_LOGITS_TOTAL_MEM_FRACTION = MQA_LOGITS_TOTAL_MEM_FRACTION
     _MQA_LOGITS_MAX_BYTES_ROCM = MQA_LOGITS_MAX_BYTES_ROCM
+    _PAGED_MQA_TOPK_HISTOGRAM_BINS = 1024
     # One measured budget per device for the process lifetime.
     _mqa_logits_budget_bytes: Dict[int, int] = {}
 
@@ -380,6 +382,35 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         self.paged_mqa_logits_backend = DSAPagedMQALogitsBackend.resolve(
             get_exec().kernel.dsa_paged_mqa_logits_backend
         )
+        # Keep one stable allocation per power-of-two row bucket. Stable
+        # addresses matter because CUDA graphs captured for an earlier batch
+        # size may continue to reference that bucket after larger shapes warm
+        # up. The buffers are scratch state, not model state, so they should
+        # not be registered in the state dict.
+        self._paged_mqa_topk_histogram_workspaces: Dict[
+            Tuple[torch.device, int], torch.Tensor
+        ] = {}
+
+    def _get_paged_mqa_topk_histogram_workspace(
+        self, rows: int, device: torch.device
+    ) -> torch.Tensor:
+        if rows <= 0:
+            raise ValueError("paged-MQA top-k histogram requires at least one row")
+
+        capacity = 1 << (rows - 1).bit_length()
+        key = (device, capacity)
+        workspace = self._paged_mqa_topk_histogram_workspaces.get(key)
+        if workspace is None:
+            # The top-k consumer returns every used row to zero. Only a newly
+            # created bucket needs initialization before paged-MQA starts
+            # accumulating into it.
+            workspace = torch.zeros(
+                (capacity, self._PAGED_MQA_TOPK_HISTOGRAM_BINS),
+                dtype=torch.int32,
+                device=device,
+            )
+            self._paged_mqa_topk_histogram_workspaces[key] = workspace
+        return workspace[:rows]
 
     @contextlib.contextmanager
     def _with_real_sm_count(self):
@@ -951,8 +982,30 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         B = metadata.get_seqlens_int32().shape[0]
         next_n = q_offset // B if B > 0 else 0
+        use_fused_topk_histogram = (
+            envs.SGLANG_OPT_DSA_PAGED_MQA_TOPK_HISTOGRAM.get()
+            and envs.SGLANG_DSA_FUSE_TOPK.get()
+            and _is_cuda
+            and is_sm100_supported()
+            and not forward_batch.forward_mode.is_draft_extend_v2()
+            and max_seq_len > 16384
+            and seqlens_32.dim() == 1
+            and seqlens_32.numel() == q_offset
+            and 0 < self.index_topk <= 2048
+            and hasattr(metadata, "topk_transform_with_histogram")
+            and getattr(metadata, "force_unfused_topk", True) is False
+            and getattr(metadata, "topk_backend", None) is not None
+            and metadata.topk_backend.should_use_topk_v2()
+            and getattr(metadata, "topk_transform_method", None) is not None
+            and metadata.topk_transform_method.name == "PAGED"
+            and metadata.attn_metadata.real_page_table.shape[0] == q_offset
+            and metadata.attn_metadata.topk_v2_plan is not None
+        )
         use_cute_dsl = (
-            self.paged_mqa_logits_backend.is_cutedsl()
+            (
+                self.paged_mqa_logits_backend.is_cutedsl()
+                or use_fused_topk_histogram
+            )
             and not forward_batch.forward_mode.is_draft_extend_v2()
         )
         dsl_expand_factor, dsl_atom = 1, 1
@@ -1079,7 +1132,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 clean_logits=False,
             )
         elif use_cute_dsl:
-            logits = cutedsl_paged_mqa_logits(
+            topk_histogram_workspace = (
+                self._get_paged_mqa_topk_histogram_workspace(q_offset, q_fp8.device)
+                if use_fused_topk_histogram
+                else None
+            )
+            logits_or_pair = cutedsl_paged_mqa_logits(
                 q_fp8,
                 kv_cache_fp8,
                 weights,
@@ -1096,7 +1154,15 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 blocksize=blocksize,
                 sm_count=self.sm_count,
                 get_paged_mqa_logits_metadata_fn=deep_gemm.get_paged_mqa_logits_metadata,
+                topk_lengths=seqlens_32 if use_fused_topk_histogram else None,
+                topk_histogram_workspace=topk_histogram_workspace,
+                num_init_tokens=self.num_init_tokens,
+                num_local_tokens=self.num_local_tokens,
             )
+            if use_fused_topk_histogram:
+                logits, topk_histogram = logits_or_pair
+            else:
+                logits = logits_or_pair
         elif use_dg_native:
             logits = deepgemm_paged_mqa_logits_native(
                 _chunked_fp8_paged_mqa_logits,
@@ -1124,9 +1190,16 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 q_offset=q_offset,
             )
 
-        # NOTE(dark): logits should be cleaned in topk_transform
-        self._mask_init_and_local_tokens(logits, seqlens_32)
-        topk_result = metadata.topk_transform(logits, self.index_topk)
+        # The histogram path folds forced-token masking into the MQA epilogue;
+        # applying the scatter again would leave the histogram stale.
+        if use_fused_topk_histogram:
+            topk_result = metadata.topk_transform_with_histogram(
+                logits, topk_histogram, self.index_topk
+            )
+        else:
+            # NOTE(dark): logits should be cleaned in topk_transform
+            self._mask_init_and_local_tokens(logits, seqlens_32)
+            topk_result = metadata.topk_transform(logits, self.index_topk)
         # Restore possible padding exist in the hidden states.
         if not _is_hip and q_offset < q_fp8.shape[0]:
             pad_len = q_fp8.shape[0] - q_offset

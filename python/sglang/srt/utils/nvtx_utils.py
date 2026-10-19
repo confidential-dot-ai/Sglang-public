@@ -26,6 +26,8 @@ ops, and the speculative-decoding / forward spans -- share one primitive.
 """
 
 import logging
+import os
+import time
 from contextlib import ExitStack, contextmanager, nullcontext
 from functools import partial, wraps
 from typing import Optional
@@ -35,6 +37,19 @@ import torch
 from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
+
+# TEMPORARY debug instrumentation for the profiler-pathology investigation
+# (tdx-checkpoints/074-077): isolated microbenchmarks showed record_function
+# itself (and record_function + CUDA-graph-replay) are both fast on this host
+# with an active profiler, which rules out the primitive itself -- something
+# specific to the real scheduler process is slow. Times each of the 5
+# per-tick spans end-to-end (span entry + wrapped function body + span exit)
+# and logs a warning above a threshold, so a real reproduction pinpoints
+# which stage balloons. Off by default; remove once root-caused.
+_PROFILE_RANGE_DEBUG = os.environ.get("SGLANG_PROFILE_RANGE_DEBUG", "0") == "1"
+_PROFILE_RANGE_DEBUG_THRESHOLD_S = float(
+    os.environ.get("SGLANG_PROFILE_RANGE_DEBUG_THRESHOLD_S", "0.1")
+)
 
 _SCHEDULER_NVTX = envs.SGLANG_ENABLE_NVTX_SCHEDULER.get()
 _OPERATIONS_NVTX = envs.SGLANG_ENABLE_NVTX_OPERATIONS.get()
@@ -73,12 +88,43 @@ def _profile_range_impl(
 ):
     with ExitStack() as stack:
         if record:
-            stack.enter_context(torch.profiler.record_function(debug_name))
+            if _PROFILE_RANGE_DEBUG:
+                t_enter0 = time.monotonic()
+                stack.enter_context(torch.profiler.record_function(debug_name))
+                t_enter1 = time.monotonic()
+                if t_enter1 - t_enter0 > _PROFILE_RANGE_DEBUG_THRESHOLD_S:
+                    logger.warning(
+                        "[PROFILE_RANGE_DEBUG] record_function ENTER for %s took %.3fs",
+                        debug_name,
+                        t_enter1 - t_enter0,
+                    )
+            else:
+                stack.enter_context(torch.profiler.record_function(debug_name))
         if nvtx_enabled:
             if color is None:
                 color = _NVTX_COLOR_MAP.get(debug_name)
             stack.enter_context(_nvtx_module.annotate(debug_name, color=color))
-        yield
+        if _PROFILE_RANGE_DEBUG:
+            t_body0 = time.monotonic()
+            yield
+            t_body1 = time.monotonic()
+            if t_body1 - t_body0 > _PROFILE_RANGE_DEBUG_THRESHOLD_S:
+                logger.warning(
+                    "[PROFILE_RANGE_DEBUG] body for %s took %.3fs",
+                    debug_name,
+                    t_body1 - t_body0,
+                )
+            t_exit0 = time.monotonic()
+        else:
+            yield
+    if _PROFILE_RANGE_DEBUG and record:
+        t_exit1 = time.monotonic()
+        if t_exit1 - t_exit0 > _PROFILE_RANGE_DEBUG_THRESHOLD_S:
+            logger.warning(
+                "[PROFILE_RANGE_DEBUG] EXIT (record_function/nvtx teardown) for %s took %.3fs",
+                debug_name,
+                t_exit1 - t_exit0,
+            )
 
 
 def profile_range(

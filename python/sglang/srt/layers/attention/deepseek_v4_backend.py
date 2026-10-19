@@ -300,6 +300,43 @@ def _bcg_low_ratio_source_projections(*args):
 _bcg_low_ratio_source_projections_fn = None
 
 
+def _low_ratio_index_topk_live(backend, layer, x, q_lora, req, pos, q, w):
+    from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+        get_tc_piecewise_forward_context,
+    )
+
+    forward_batch = get_tc_piecewise_forward_context().forward_batch
+    real = forward_batch.global_num_token_non_padded_cpu
+    if real is None:
+        real = x.shape[0]
+    if real == 0:
+        return
+    backend._low_ratio_index_topk(
+        layer,
+        x[:real],
+        q_lora[:real],
+        req[:real],
+        pos[:real],
+        forward_batch,
+        q=q[:real],
+        weights=w[:real],
+    )
+
+
+def _bcg_low_ratio_index_topk(*args):
+    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+        eager_on_graph,
+    )
+
+    global _bcg_low_ratio_index_topk_fn
+    if _bcg_low_ratio_index_topk_fn is None:
+        _bcg_low_ratio_index_topk_fn = eager_on_graph(True)(_low_ratio_index_topk_live)
+    return _bcg_low_ratio_index_topk_fn(*args)
+
+
+_bcg_low_ratio_index_topk_fn = None
+
+
 def _as_int_list(values) -> Optional[List[int]]:
     if values is None:
         return None
@@ -905,7 +942,7 @@ def _tail_rows(
     t: torch.Tensor, *, token_indices: torch.Tensor, contiguous_start: Optional[int]
 ) -> torch.Tensor:
     if contiguous_start is not None:
-        return t[contiguous_start:]
+        return t[contiguous_start : contiguous_start + token_indices.numel()]
     return t[token_indices]
 
 
@@ -997,6 +1034,8 @@ class DSV4Metadata:
                 self.c128_compress_metadata,
                 src=static_metadata.c128_compress_metadata,
             )
+        # The eager index layers republish it every replay.
+        self.candidate_metadata = None
         self.sparse_prefill_cache = None
         self.prefill_shared_reads_snapshotted = False
 
@@ -1067,6 +1106,7 @@ class DeepseekV4AttnBackend(
     supports_ragged_verify_graph: bool = True
     needs_cpu_seq_lens: bool = False
     trtllm_attn: bool = False
+    tbo_supports_cuda_graph: bool = False
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         # Breakable-graph verify rereads shared state across segments.
@@ -1094,6 +1134,12 @@ class DeepseekV4AttnBackend(
         speculative_num_steps=0,
     ):
         super().__init__()
+        # Must match DeepseekV4Model._can_run_tbo's capture-time gate. When
+        # disabled, TboAttnBackend leaves child metadata out of decode/verify
+        # graph capture and replay, and the captured model body stays non-TBO.
+        self.tbo_supports_cuda_graph = (
+            envs.SGLANG_ENABLE_DEEPSEEK_V4_TBO_CUDA_GRAPH.get()
+        )
         self.model_runner = model_runner
         self.encoder_replay = False
         self.device = torch.device(model_runner.device)
@@ -1123,6 +1169,11 @@ class DeepseekV4AttnBackend(
         )
         self.has_c4: bool = 4 in self.present_ratios
         self.has_c128: bool = 128 in self.present_ratios
+        # The prefill graph's ratio-1/2 index layers run as eager breaks on the live
+        # rows instead of scoring a static context width.
+        self.prefill_graph_eager_indexer: bool = (
+            envs.SGLANG_OPT_DSV41_PREFILL_GRAPH_EAGER_INDEXER.get()
+        )
         cfg = model_runner.model_config.hf_text_config
         self.is_dsv41: bool = getattr(cfg, "model_type", None) == "deepseek_v41"
         self.prefill_candidates, self.decode_candidates = make_candidate_indexer(
@@ -1149,6 +1200,8 @@ class DeepseekV4AttnBackend(
         )
         # The model switches onto this metadata in enter_late_layer_tail.
         self.tail_forward_metadata: Optional[DSV4Metadata] = None
+        # Bounded prompt-tail replay inside the breakable prefill graph.
+        self.bcg_tail_state = None
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
         self.dsv4_prefill_backend = getattr(kernel, "dsv4_prefill_backend", "auto")
         if use_dsv4_q8kv8_sparse_prefill(self.dsv4_prefill_backend):
@@ -1200,7 +1253,11 @@ class DeepseekV4AttnBackend(
         self.cuda_graph_swa_out_cache_loc: Optional[torch.Tensor] = None
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
-        pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
+        pin_tensor = torch.tensor(
+            x,
+            dtype=torch.int32,
+            pin_memory=not envs.SGLANG_OPT_DSV41_ASYNC_TAIL_METADATA.get(),
+        )
         return pin_tensor.to(self.device, non_blocking=True)
 
     def _resolve_verify_layout(
@@ -1452,7 +1509,12 @@ class DeepseekV4AttnBackend(
             ),
         )
         if use_prefill_cuda_graph and self.low_ratio_prefill_graph:
-            low = core_attn_metadata.low_ratios
+            # The eager break scores the live rows without paged indexer metadata.
+            low = (
+                ()
+                if self.prefill_graph_eager_indexer
+                else core_attn_metadata.low_ratios
+            )
             metadata.c1_indexer_metadata = (
                 self._low_ratio_prefill_indexer_metadata(core_attn_metadata, 1)
                 if 1 in low
@@ -1499,7 +1561,12 @@ class DeepseekV4AttnBackend(
 
     @property
     def low_ratio_prefill_graph(self) -> bool:
-        return bool(self.low_ratios) and has_dense_fp4_indexer() and is_sm100_or_newer()
+        return (
+            not getattr(self, "ced_encoder_graph", False)
+            and bool(self.low_ratios)
+            and has_dense_fp4_indexer()
+            and is_sm100_or_newer()
+        )
 
     def can_run_prefill_cuda_graph(self, forward_batch: ForwardBatch) -> bool:
         max_seq_len = _prefill_graph_max_seq_len()
@@ -1509,7 +1576,7 @@ class DeepseekV4AttnBackend(
         return int(seq_lens_cpu.max().item()) <= max_seq_len
 
     def _build_late_layer_tail_metadata(
-        self, forward_batch: ForwardBatch
+        self, forward_batch: ForwardBatch, *, graph_bucket: Optional[int] = None
     ) -> DSV4Metadata:
         # Each request contributes only its last SWA_WINDOW extend tokens, with the
         # window floored at the tail start: window KV before it is never written here.
@@ -1531,6 +1598,13 @@ class DeepseekV4AttnBackend(
             token_indices=token_indices,
             contiguous_start=contiguous_start,
         )
+        if graph_bucket is not None:
+            from sglang.srt.model_executor.runner_utils.dsv41_bounded_replay import (
+                pad_rows,
+            )
+
+            out_cache_loc = pad_rows(out_cache_loc, graph_bucket)
+            swa_replay_start = pad_rows(swa_replay_start, graph_bucket)
         tail_lens = torch.tensor(tail_lens_cpu, dtype=torch.int32, device=device)
         cp_tail = (
             self._late_layer_tail_cp_layout(forward_batch, token_indices, tail_lens)
@@ -1539,7 +1613,11 @@ class DeepseekV4AttnBackend(
         )
 
         metadata = self.init_forward_metadata_prefill(
-            max_seq_len=int(seq_lens_cpu.max().item()),
+            max_seq_len=(
+                int(seq_lens_cpu.max().item())
+                if graph_bucket is None
+                else self.MAX_SEQ_LEN_FOR_CAPTURE
+            ),
             req_pool_indices=forward_batch.req_pool_indices,
             seq_lens=forward_batch.seq_lens.to(torch.int32),
             seq_lens_cpu=seq_lens_cpu.tolist(),
@@ -1549,6 +1627,7 @@ class DeepseekV4AttnBackend(
             extend_seq_lens_cpu=tail_lens_cpu,
             extend_start_loc=torch.cumsum(tail_lens, dim=0) - tail_lens,
             swa_replay_start=swa_replay_start,
+            use_prefill_cuda_graph=graph_bucket is not None,
             forward_batch=forward_batch if cp_tail is not None else None,
             cp_metadata=cp_tail["cp_metadata"] if cp_tail is not None else None,
         )
@@ -1561,13 +1640,26 @@ class DeepseekV4AttnBackend(
         )
         metadata.core_attn_metadata.swa_out_cache_loc = swa_out_cache_loc
         metadata.low_ratio_req_indices = torch.repeat_interleave(
-            forward_batch.req_pool_indices.to(torch.int64), tail_lens.to(torch.int64)
+            forward_batch.req_pool_indices.to(torch.int64),
+            tail_lens.to(torch.int64),
+            # The scheduler already knows the total; otherwise PyTorch reads the
+            # GPU repeat counts back to determine the output allocation size.
+            output_size=(
+                sum(tail_lens_cpu)
+                if envs.SGLANG_OPT_DSV41_ASYNC_TAIL_METADATA.get()
+                else None
+            ),
         )
         positions = _tail_rows(
             forward_batch.positions,
             token_indices=token_indices,
             contiguous_start=contiguous_start,
         )
+        if graph_bucket is not None:
+            positions = pad_rows(positions, graph_bucket)
+            metadata.low_ratio_req_indices = pad_rows(
+                metadata.low_ratio_req_indices, graph_bucket
+            )
         metadata.low_ratio_pos_i64 = positions.to(torch.int64)
         if cp_tail is None:
             # Without CP, tail rows index the full extend on this rank.
@@ -1578,6 +1670,9 @@ class DeepseekV4AttnBackend(
                 extend_seq_lens_cpu=tail_lens_cpu,
                 swa_out_cache_loc=swa_out_cache_loc,
                 contiguous_start=contiguous_start,
+                pad_rows=0
+                if graph_bucket is None
+                else graph_bucket - sum(tail_lens_cpu),
             )
         else:
             # With CP, select from this rank's extend and pad for collectives.
@@ -2732,6 +2827,9 @@ class DeepseekV4AttnBackend(
             pos = positions
         if (
             forward_batch.forward_mode.is_extend()
+            # TARGET_VERIFY also satisfies is_extend(), but runs in the decode
+            # graph runner without the prefill context the projection break needs.
+            and not forward_batch.forward_mode.is_target_verify()
             and self._low_ratio_in_prefill_graph()
         ):
             bufs = self._source_projection_buffers(x.shape[0], layer.compress_ratio)
@@ -2741,7 +2839,12 @@ class DeepseekV4AttnBackend(
                     layer, x, req, pos, projected=(bufs["kv"], bufs.get("score"))
                 )
             if run_indexer and layer.indexer is not None:
-                self._low_ratio_index_topk_captured(layer, bufs["q"], bufs["w"])
+                if self.prefill_graph_eager_indexer:
+                    _bcg_low_ratio_index_topk(
+                        self, layer, x, q_lora, req, pos, bufs["q"], bufs["w"]
+                    )
+                else:
+                    self._low_ratio_index_topk_captured(layer, bufs["q"], bufs["w"])
             return
         if run_compressor and layer.compressor is not None:
             self._low_ratio_compress(layer, x, req, pos, forward_batch)
@@ -3080,6 +3183,8 @@ class DeepseekV4AttnBackend(
         forward_batch,
         *,
         rows_per_request=None,  # NOTE: only used in CP
+        q=None,  # NOTE: prefill only, with weights
+        weights=None,
     ) -> None:
         is_source = layer.indexer.is_candidate_source
         is_consumer = layer.indexer.uses_candidates
@@ -3110,7 +3215,15 @@ class DeepseekV4AttnBackend(
                 self.full_topk_indexer.topk_decode(inputs, out)
         else:
             inputs = self._make_low_ratio_prefill_indexer_inputs(
-                layer, x, q_lora, req, pos, forward_batch, rows_per_request
+                layer,
+                x,
+                q_lora,
+                req,
+                pos,
+                forward_batch,
+                rows_per_request,
+                q=q,
+                weights=weights,
             )
             if is_source:
                 published = self.prefill_candidates.publish_prefill(inputs, out)
@@ -3182,6 +3295,9 @@ class DeepseekV4AttnBackend(
         pos,
         forward_batch,
         rows_per_request,
+        *,
+        q=None,
+        weights=None,
     ) -> PrefillInputs:
         tail = self.forward_metadata.late_layer_tail
         if rows_per_request is not None:
@@ -3208,6 +3324,8 @@ class DeepseekV4AttnBackend(
             seq_lens_cpu=_as_int_list(forward_batch.seq_lens_cpu),
             rows_per_request=rows_per_request,
             rows_per_request_device=rows_per_request_device,
+            q=q,
+            weights=weights,
         )
 
     def _publish_candidate_metadata(self, published: Optional[CandidateMetadata]):

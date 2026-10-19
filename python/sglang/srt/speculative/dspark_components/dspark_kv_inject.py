@@ -2,6 +2,8 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
     is_unified_kv_triton,
 )
@@ -89,12 +91,36 @@ class TargetHiddenKvInjector:
             )
             return
 
+        # Non-MLA draft pools land here. A ring-pooled draft still needs its
+        # (req, pos) -> ring slot published and the loc translated: SWAKVPool's
+        # set_kv_buffer asserts swa_loc is not None for a sliding layer and
+        # never translates internally ("computed once per forward by the
+        # attention backend") -- but the draft's KV is written by this injector,
+        # not by an attention backend, so the translation has to happen here.
+        # Bundled as KVWriteLoc so the pool gets both the full loc and the
+        # pre-resolved SWA loc in one argument.
+        write_loc = cache_loc
+        if getattr(pool, "draft_swa_ring_stride", None) is not None:
+            self._maybe_publish_ring_mapping(
+                pool=pool,
+                cache_loc=cache_loc,
+                positions=positions,
+                state_slot=state_slot,
+                final_pos=final_pos,
+            )
+            write_loc = KVWriteLoc(
+                loc=cache_loc,
+                swa_loc=pool.translate_loc_from_full_to_swa(cache_loc).to(
+                    torch.int32
+                ),
+            )
+
         with torch.inference_mode():
             self.draft_model.write_target_hidden_kv(
                 target_hidden=target_hidden,
                 pool=pool,
                 positions=positions,
-                cache_loc=cache_loc,
+                cache_loc=write_loc,
                 cache_loc_2d=cache_loc_2d,
                 commit_lens=commit_lens,
                 target_hidden_is_projected=target_hidden_is_projected,
@@ -140,6 +166,18 @@ class TargetHiddenKvInjector:
                 cache_loc_2d.shape[1],
             )
         else:
+            # A ring-pooled draft owns its mapping instead of borrowing the
+            # target's, so publish this forward's (req, pos) -> ring slot before
+            # translating. Reads (the draft page table) go through the same
+            # mapping, which is why the ring loc cannot simply be computed here
+            # and discarded.
+            self._maybe_publish_ring_mapping(
+                pool=pool,
+                cache_loc=cache_loc,
+                positions=positions,
+                state_slot=state_slot,
+                final_pos=final_pos,
+            )
             swa_loc = pool.translate_loc_from_full_to_swa(cache_loc).to(torch.int32)
             if commit_lens is not None and cache_loc_2d is not None:
                 bs, verify_len = cache_loc_2d.shape
@@ -158,6 +196,39 @@ class TargetHiddenKvInjector:
                 positions=positions,
                 pool=pool,
             )
+
+    def _maybe_publish_ring_mapping(
+        self,
+        *,
+        pool,
+        cache_loc: torch.Tensor,
+        positions: torch.Tensor,
+        state_slot: Optional[torch.Tensor],
+        final_pos: Optional[torch.Tensor],
+    ) -> None:
+        """Scatter this forward's target locs onto their draft ring slots.
+
+        Same ring arithmetic as _unified_inject_loc, but published into the
+        pool's full->swa mapping so the draft's page table reads it back.
+        Tokens older than the window are left at the -1 sentinel: they share a
+        ring slot with a live token and must not be attended.
+        """
+        ring_size = getattr(pool, "draft_swa_ring_stride", None)
+        mapping = getattr(pool, "full_to_swa_index_mapping", None)
+        if ring_size is None or mapping is None:
+            return
+        if state_slot is None:
+            raise RuntimeError(
+                "draft SWA ring requires state_slot (per-token draft "
+                "req_pool_indices); got None"
+            )
+        pos = positions.to(torch.int64)
+        loc = state_slot.to(torch.int64) * ring_size + pos % ring_size
+        if final_pos is not None:
+            window = pool.draft_swa_window
+            keep = pos > (final_pos.to(torch.int64) - window)
+            loc = torch.where(keep, loc, torch.full_like(loc, -1))
+        mapping[cache_loc.to(torch.int64)] = loc
 
     def _unified_inject_loc(
         self,
@@ -252,10 +323,26 @@ class TargetHiddenKvInjector:
             device=self.device,
         )
         verify_cache_loc_2d = verify_cache_loc.view(bs, stride)
+        # A ring-pooled draft publishes (req, pos) -> ring slot before
+        # translating, and the publisher requires the per-token req slot --
+        # without it, _maybe_publish_ring_mapping raises. Committed verify
+        # tokens are the newest of their request, so no final_pos gating.
+        state_slot = None
+        if getattr(
+            self.draft_model_runner.token_to_kv_pool, "draft_swa_ring_stride", None
+        ) is not None:
+            state_slot = (
+                batch.req_pool_indices[:bs]
+                .to(torch.int64)
+                .view(-1, 1)
+                .expand(bs, stride)
+                .reshape(-1)
+            )
         self.inject_target_hidden(
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
             cache_loc=verify_cache_loc,
             cache_loc_2d=verify_cache_loc_2d,
             positions=positions_2d.reshape(-1),
             commit_lens=commit_lens,
+            state_slot=state_slot,
         )

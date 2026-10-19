@@ -68,6 +68,15 @@ class RouterArgs:
     dp_aware: bool = False
     enable_igw: bool = False  # Enable IGW (Inter-Gateway) mode for multi-model support
     api_key: Optional[str] = None
+    admin_api_key: Optional[str] = None
+    ops_api_key: Optional[str] = None
+    api_key_store: Optional[str] = None
+    reject_video: bool = False
+    # Ceiling on images in flight on this gateway; 429 above it. 0 disables.
+    max_inflight_images: int = 0
+    max_inflight_megapixels: int = int(os.environ.get("M3_MAX_INFLIGHT_MEGAPIXELS") or 0)
+    max_images_per_request: int = int(os.environ.get("M3_MAX_IMAGES_PER_REQUEST") or 0)
+    unmeasured_image_megapixels: int = 0
     log_dir: Optional[str] = None
     log_level: Optional[str] = None
     json_log: bool = False
@@ -86,8 +95,14 @@ class RouterArgs:
     prometheus_duration_buckets: Optional[List[float]] = None
     # Request ID headers configuration
     request_id_headers: Optional[List[str]] = None
-    # Request timeout in seconds
+    # Total deadline for a non-streaming request. Does not apply to streams.
     request_timeout_secs: int = 1800
+    # Total deadline for a streaming request; 0 means unbounded.
+    stream_total_timeout_secs: int = 0
+    # Socket silence tolerated, including the wait for response headers.
+    request_read_timeout_secs: int = 600
+    # Silence tolerated between SSE frames once a stream has started.
+    stream_idle_timeout_secs: int = 120
     # Grace period in seconds to wait for in-flight requests during shutdown
     shutdown_grace_period_secs: int = 180
     # Max concurrent requests for rate limiting (-1 to disable)
@@ -506,7 +521,43 @@ class RouterArgs:
             f"--{prefix}request-timeout-secs",
             type=int,
             default=RouterArgs.request_timeout_secs,
-            help="Request timeout in seconds",
+            help=(
+                "Total deadline for a NON-STREAMING request, in seconds. Does not "
+                "apply to streaming responses; see --stream-total-timeout-secs."
+            ),
+        )
+        request_group.add_argument(
+            f"--{prefix}stream-total-timeout-secs",
+            type=int,
+            default=RouterArgs.stream_total_timeout_secs,
+            help=(
+                "Total deadline for a STREAMING request, in seconds. 0 (default) "
+                "means unbounded: a healthy stream is bounded by the two silence "
+                "timeouts rather than by elapsed generation time. Set a value only "
+                "to cap generation length outright."
+            ),
+        )
+        request_group.add_argument(
+            f"--{prefix}request-read-timeout-secs",
+            type=int,
+            default=RouterArgs.request_read_timeout_secs,
+            help=(
+                "Silence tolerated on the worker socket, in seconds, including the "
+                "wait for response headers. Must exceed the worst legitimate "
+                "time-to-first-token or slow cold prefills are cancelled. "
+                "0 disables."
+            ),
+        )
+        request_group.add_argument(
+            f"--{prefix}stream-idle-timeout-secs",
+            type=int,
+            default=RouterArgs.stream_idle_timeout_secs,
+            help=(
+                "Silence tolerated between SSE frames once a stream has started, "
+                "in seconds. Arms only after the first frame, so it can be far "
+                "tighter than --request-read-timeout-secs; must be strictly less "
+                "than it. 0 disables."
+            ),
         )
         request_group.add_argument(
             f"--{prefix}shutdown-grace-period-secs",
@@ -572,6 +623,27 @@ class RouterArgs:
             type=int,
             default=RouterArgs.rate_limit_tokens_per_second,
             help="Token bucket refill rate (tokens per second). If not set, defaults to max_concurrent_requests",
+        )
+        rate_limit_group.add_argument(
+            f"--{prefix}max-inflight-images",
+            type=int,
+            metavar="N",
+            default=RouterArgs.max_inflight_images,
+            help="Reject with 429 any chat/responses request whose image parts would push the number of images in flight on this gateway above N. 0 disables.",
+        )
+        parser.add_argument(
+            "--max-inflight-megapixels",
+            type=int,
+            default=RouterArgs.max_inflight_megapixels,
+            help="Image area admitted concurrently, in megapixels (0 = disabled). "
+            "Protects base-GPU memory: preprocessing cost scales with area, not file count.",
+        )
+        parser.add_argument(
+            "--unmeasured-image-megapixels",
+            type=int,
+            default=RouterArgs.unmeasured_image_megapixels,
+            help="Area charged to an image whose dimensions cannot be read, in megapixels "
+            "(0 = the spec max_total_pixels). Remote URLs are the main case.",
         )
 
         # Retry configuration
@@ -907,6 +979,29 @@ class RouterArgs:
             type=str,
             default=None,
             help="The api key used for the authorization with the worker. Useful when the dp aware scheduling strategy is enabled.",
+        )
+        auth_group.add_argument(
+            f"--{prefix}admin-api-key",
+            type=str,
+            default=None,
+            help="Admin API key for management endpoints (/admission, /admin/metrics, /admin/keys, /flush_cache, /wasm, /v1/tokenizers). Does NOT accept --api-key; unset refuses those endpoints with 403.",
+        )
+        auth_group.add_argument(
+            f"--{prefix}ops-api-key",
+            type=str,
+            default=None,
+            help="Narrower key reaching /admission only, not /admin/metrics or /admin/keys. For partners who need to move the concurrency ceiling.",
+        )
+        auth_group.add_argument(
+            f"--{prefix}api-key-store",
+            type=str,
+            default=None,
+            help="JSON file backing keys minted via /admin/keys. Unset disables minting; keys are stored hashed and survive a restart.",
+        )
+        auth_group.add_argument(
+            f"--{prefix}reject-video",
+            action="store_true",
+            help="Refuse chat requests carrying video parts with HTTP 400. For deployments that have declared they do not accept video traffic.",
         )
         auth_group.add_argument(
             f"--{prefix}control-plane-api-keys",

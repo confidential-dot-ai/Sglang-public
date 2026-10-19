@@ -191,6 +191,9 @@ class CuteDSLPagedMQALogitsRunner:
         epi_dtype,
         acc_dtype,
         output_dtype,
+        emit_topk_histogram,
+        num_init_tokens,
+        num_local_tokens,
         pipeline_flags=None,
     ):
         """Compile kernel using fake tensors + TVM FFI."""
@@ -206,6 +209,9 @@ class CuteDSLPagedMQALogitsRunner:
             epi_dtype,
             acc_dtype,
             output_dtype,
+            emit_topk_histogram,
+            num_init_tokens,
+            num_local_tokens,
             tuple(sorted(pipeline_flags.items())),
         )
         if key in cls.kernel_cache:
@@ -244,6 +250,17 @@ class CuteDSLPagedMQALogitsRunner:
             stride=(cute.sym_int64(), 1),
         )
 
+        hist_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32,
+            (cute.sym_int(), 1024) if emit_topk_histogram else (1, 1),
+            stride_order=(1, 0),
+        )
+        topk_lengths_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32,
+            (cute.sym_int(),) if emit_topk_histogram else (1,),
+            stride_order=(0,),
+        )
+
         bt_fake = cute.runtime.make_fake_compact_tensor(
             cutlass.Int32, (sym_B, max_blocks_per_seq), stride_order=(1, 0)
         )
@@ -269,6 +286,9 @@ class CuteDSLPagedMQALogitsRunner:
             epi_dtype=to_cutlass[epi_dtype],
             acc_dtype=to_cutlass[acc_dtype],
             output_dtype=to_cutlass[output_dtype],
+            emit_topk_histogram=emit_topk_histogram,
+            num_init_tokens=num_init_tokens,
+            num_local_tokens=num_local_tokens,
             **pipeline_flags,
         )
 
@@ -278,6 +298,8 @@ class CuteDSLPagedMQALogitsRunner:
             q_fake,
             w_fake,
             logits_fake,
+            hist_fake,
+            topk_lengths_fake,
             bt_fake,
             cl_fake,
             sm_fake,
@@ -307,7 +329,11 @@ class CuteDSLPagedMQALogitsRunner:
         epi_dtype: torch.dtype = torch.float32,
         acc_dtype: torch.dtype = torch.float32,
         output_dtype: torch.dtype = torch.float32,
-    ) -> torch.Tensor:
+        topk_lengths: torch.Tensor | None = None,
+        topk_histogram_workspace: torch.Tensor | None = None,
+        num_init_tokens: int = 0,
+        num_local_tokens: int = 0,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Execute FP8 paged MQA logits kernel.
 
         Args:
@@ -322,6 +348,9 @@ class CuteDSLPagedMQALogitsRunner:
             epi_dtype: epilogue compute dtype
             acc_dtype: MMA accumulator dtype
             output_dtype: output logits dtype
+            topk_histogram_workspace: optional reusable [B*next_n, 1024]
+                contiguous int32 workspace. Reusable storage must be zero on
+                entry; the fused top-k consumer restores it to zero.
         Returns:
             logits: [B*next_n, max_context_len] output_dtype
         """
@@ -331,6 +360,15 @@ class CuteDSLPagedMQALogitsRunner:
         compute_block_kv = 128
         num_phys_blocks = kv_fused.shape[0]
         num_sms = HardwareInfo().get_device_multiprocessor_count()
+        emit_topk_histogram = topk_lengths is not None
+        if emit_topk_histogram:
+            if output_dtype != torch.float32:
+                raise ValueError("fused paged-MQA/top-k histogram requires fp32 logits")
+            if topk_lengths.dtype != torch.int32 or topk_lengths.numel() != B * next_n:
+                raise ValueError(
+                    "topk_lengths must be contiguous int32 with B*next_n elements"
+                )
+            topk_lengths = topk_lengths.reshape(B * next_n).contiguous()
 
         # Auto-tune (num_epi_subtiles, pipeline flags) for the epilogue when the
         # caller leaves num_epi_subtiles unset; an explicit value disables the
@@ -365,6 +403,28 @@ class CuteDSLPagedMQALogitsRunner:
             dtype=output_dtype,
         )
         logits = logits[:, :max_context_len]
+        if emit_topk_histogram:
+            histogram_shape = (B * next_n, 1024)
+            if topk_histogram_workspace is None:
+                topk_histogram = torch.zeros(
+                    histogram_shape, device=q.device, dtype=torch.int32
+                )
+            else:
+                if (
+                    topk_histogram_workspace.shape != histogram_shape
+                    or topk_histogram_workspace.dtype != torch.int32
+                    or topk_histogram_workspace.device != q.device
+                    or not topk_histogram_workspace.is_contiguous()
+                ):
+                    raise ValueError(
+                        "topk_histogram_workspace must be contiguous int32 "
+                        f"with shape {histogram_shape} on {q.device}"
+                    )
+                topk_histogram = topk_histogram_workspace
+        else:
+            # Compile-time dead aliases keep the default kernel allocation-free.
+            topk_lengths = context_lens[:1]
+            topk_histogram = topk_lengths.view(1, 1)
 
         key = (
             compute_block_kv,
@@ -377,6 +437,9 @@ class CuteDSLPagedMQALogitsRunner:
             epi_dtype,
             acc_dtype,
             output_dtype,
+            emit_topk_histogram,
+            num_init_tokens,
+            num_local_tokens,
             tuple(sorted(pipeline_flags.items())),
         )
         if key not in cls.kernel_cache:
@@ -391,6 +454,9 @@ class CuteDSLPagedMQALogitsRunner:
                 epi_dtype,
                 acc_dtype,
                 output_dtype,
+                emit_topk_histogram,
+                num_init_tokens,
+                num_local_tokens,
                 pipeline_flags,
             )
         compiled = cls.kernel_cache[key]
@@ -407,12 +473,16 @@ class CuteDSLPagedMQALogitsRunner:
             q_for_ffi,
             w_2d,
             logits,
+            topk_histogram,
+            topk_lengths,
             block_table,
             context_lens,
             schedule_meta,
             num_phys_blocks,
             B,
         )
+        if emit_topk_histogram:
+            return logits, topk_histogram
         return logits
 
 

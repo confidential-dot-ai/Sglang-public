@@ -46,6 +46,7 @@ from torch.distributed import Backend, ProcessGroup
 
 from sglang.srt import platforms
 from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.distributed.collective_trace import trace_collective
 from sglang.srt.distributed.utils import (
     all_gather_single,
     reduce_scatter_single,
@@ -441,6 +442,9 @@ class GroupCoordinator:
         from sglang.srt.distributed.device_communicators.custom_all_reduce import (
             dispatch_custom_allreduce,
         )
+        from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+            CustomAllReduceV2,
+        )
         from sglang.srt.distributed.device_communicators.pymscclpp import (
             PyMscclppCommunicator,
         )
@@ -492,9 +496,14 @@ class GroupCoordinator:
                     group=self.cpu_group,
                     device=self.device,
                 )
+                ca_extra_kwargs: Dict[str, Any] = {}
+                max_pull_bytes = envs.SGLANG_CUSTOM_AR_MAX_PULL_BYTES.get()
+                if max_pull_bytes is not None and CAClass is CustomAllReduceV2:
+                    ca_extra_kwargs["max_pull_size"] = max_pull_bytes
                 self.ca_comm = CAClass(
                     group=self.cpu_group,
                     device=self.device,
+                    **ca_extra_kwargs,
                 )
             except Exception as e:
                 logger.warning(
@@ -663,6 +672,7 @@ class GroupCoordinator:
             with maybe_pynccl_context, maybe_pymscclpp_context:
                 yield graph_capture_context
 
+    @trace_collective("all_reduce")
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         """
         User-facing all-reduce function before we actually call the
@@ -765,6 +775,18 @@ class GroupCoordinator:
             input_=input_,
             should_use_pymscclpp_allreduce=should_use_pymscclpp_allreduce,
         )
+        import os as _os_ardbg
+        if _os_ardbg.environ.get("SGLANG_CCD_LMHEAD_DEBUG") == "1" and (
+            outplace_all_reduce_method == "pymscclpp"
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            import sys as _sys_ardbg
+            _sys_ardbg.stderr.write(
+                f"CCD_AR_DEBUG: outplace_all_reduce_method={outplace_all_reduce_method} "
+                f"input_shape={tuple(input_.shape)} input_bytes={input_.numel() * input_.element_size()} "
+                f"capturing={torch.cuda.is_current_stream_capturing()}\n"
+            )
+            _sys_ardbg.stderr.flush()
         if outplace_all_reduce_method is not None:
             return outplace_all_reduce(
                 input_,
@@ -789,6 +811,7 @@ class GroupCoordinator:
             inplace_all_reduce(input_, group_name=self.unique_name)
             return input_
 
+    @trace_collective("fused_allreduce_rmsnorm")
     def fused_allreduce_rmsnorm(
         self,
         input_: torch.Tensor,
@@ -932,6 +955,11 @@ class GroupCoordinator:
         input_: torch.Tensor,
         should_use_pymscclpp_allreduce: Optional[bool] = None,
     ) -> Optional[str]:
+        # Checked before the size-threshold backends below: inside a captured
+        # graph every rank must pick the same implementation, and the choice
+        # cannot be renegotiated at replay.
+        if is_in_tc_piecewise_cuda_graph() and self.pynccl_comm is not None:
+            return "pynccl"
         if should_use_pymscclpp_allreduce is None:
             should_use_pymscclpp_allreduce = (
                 self.pymscclpp_comm is not None
@@ -958,9 +986,6 @@ class GroupCoordinator:
             and self.torch_symm_mem_comm.should_torch_symm_mem_allreduce(input_)
         ):
             return "torch_symm_mem"
-        if is_in_tc_piecewise_cuda_graph() and self.pynccl_comm is not None:
-            # For piecewise cuda graph, we use pynccl outplace allreduce
-            return "pynccl"
         return None
 
     def _can_use_flashinfer_allreduce(self, input_: torch.Tensor) -> bool:
@@ -2513,6 +2538,7 @@ def init_distributed_environment(
 def initialize_model_parallel(
     backend: Optional[str] = None,
     duplicate_tp_group: bool = False,
+    duplicate_attn_cp_group: bool = False,
     enable_symm_mem: bool = False,
     recovered_rank: bool = False,
     rank_offset: int = 0,
@@ -3218,6 +3244,19 @@ def destroy_model_parallel():
 
     global _SHARED_EXPERTS_TP
     global _ATTN_TP
+
+    # FlashInfer CUDA graphs retain raw workspace pointers. Destroy every
+    # communicator-scoped fusion workspace while its process groups are still
+    # alive.
+    try:
+        from sglang.srt.layers.flashinfer_comm_fusion import (
+            cleanup_flashinfer_workspace,
+        )
+
+        cleanup_flashinfer_workspace()
+    except Exception as e:
+        logger.warning("Failed to clean up FlashInfer fusion workspaces: %s", e)
+
     global _TP
     if (
         _SHARED_EXPERTS_TP is not None

@@ -12,9 +12,12 @@
 // Re-export UNKNOWN_MODEL_ID from protocols for use throughout core
 pub use crate::protocols::UNKNOWN_MODEL_ID;
 
+pub mod api_keys;
 pub mod circuit_breaker;
+pub mod deadlines;
 pub mod error;
 pub mod job_queue;
+pub(crate) mod kv_occupancy_poller;
 pub mod metrics_aggregator;
 pub mod model_card;
 pub mod model_type;
@@ -29,6 +32,7 @@ pub mod worker_service;
 
 // Re-export commonly used types for convenience
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState};
+pub use deadlines::DeadlinePolicy;
 pub use error::{WorkerError, WorkerResult};
 pub use job_queue::{Job, JobQueue, JobQueueConfig};
 pub use model_card::{ModelCard, ProviderType};

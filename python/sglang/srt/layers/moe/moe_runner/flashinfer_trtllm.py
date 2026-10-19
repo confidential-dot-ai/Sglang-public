@@ -668,8 +668,12 @@ def get_activation_type(activation: str, is_gated: bool = True) -> int:
         _ACTIVATION_STR_TO_TYPE = {
             "silu": ActivationType.Swiglu,
             "gelu": ActivationType.Geglu,
-            "situ": ActivationType.Situ,
         }
+        # SiTU was added after the minimum supported FlashInfer 0.6.14.
+        # Do not eagerly dereference the optional enum while resolving the
+        # overwhelmingly common SwiGLU path.
+        if situ_type := getattr(ActivationType, "Situ", None):
+            _ACTIVATION_STR_TO_TYPE["situ"] = situ_type
     else:
         _ACTIVATION_STR_TO_TYPE = {
             "silu": ActivationType.Silu,

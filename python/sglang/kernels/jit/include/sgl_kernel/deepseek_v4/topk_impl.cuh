@@ -636,12 +636,22 @@ struct TopKRegister : TopKRadixBase<12> {
 // Streaming path: seq_len > 8192 -- two vectorized passes over global memory
 // ---------------------------------------------------------------------------
 
-struct TopKStreaming : TopKRadixBase<12> {
+template <uint32_t HistBits>
+struct TopKStreamingImpl : TopKRadixBase<HistBits> {
+  using Base = TopKRadixBase<HistBits>;
+  using typename Base::Smem;
+  using Base::kHistBits;
+  using Base::kMaxNumTie;
+  using Base::init_histogram;
+  using Base::for_each_input;
+  using Base::find_threshold;
+  using Base::handle_tie;
  public:
   static constexpr uint32_t kMaxSeqLen = std::numeric_limits<uint32_t>::max();
 
-  template <bool kUsePDL>
-  SGL_DEVICE static void forward(TopKProblem problem, void* _smem) {
+  template <bool kUsePDL, bool kPrecomputedHistogram = false>
+  SGL_DEVICE static void forward(TopKProblem problem, void* _smem,
+      const uint32_t* __restrict__ precomputed_histogram = nullptr) {
     const auto tx = threadIdx.x;
     const auto smem = static_cast<Smem*>(_smem);
 
@@ -653,17 +663,23 @@ struct TopKStreaming : TopKRadixBase<12> {
     __syncthreads();
     PDLWaitPrimary<kUsePDL>();
 
-    // Phase 1: Load and build histogram
-    for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t) {
-      const auto bin = extract_coarse_bin<kHistBits>(val);
-      atomicAdd(&smem->histogram[bin], 1);
-    });
-    const auto num_padding = problem.input_start;
-    if (tx == 0 && num_padding != 0) {
-      atomicSub(&smem->histogram[extract_coarse_bin<kHistBits>(padding_value())], num_padding);
-      atomicAdd(&smem->histogram[0], num_padding);
+    if constexpr (kPrecomputedHistogram) {
+      static_assert(kHistBits == 10);
+      smem->histogram[tx] = precomputed_histogram[tx];
+      __syncthreads();
+    } else {
+      // Phase 1: Load and build histogram
+      for_each_input(problem.in, problem.seq_len, [&](float val, uint32_t) {
+        const auto bin = extract_coarse_bin<kHistBits>(val);
+        atomicAdd(&smem->histogram[bin], 1);
+      });
+      const auto num_padding = problem.input_start;
+      if (tx == 0 && num_padding != 0) {
+        atomicSub(&smem->histogram[extract_coarse_bin<kHistBits>(padding_value())], num_padding);
+        atomicAdd(&smem->histogram[0], num_padding);
+      }
+      __syncthreads();
     }
-    __syncthreads();
 
     // Phase 2: Find the threshold bin
     find_threshold(problem.topk, problem.seq_len, smem, [&](uint32_t threshold_bin) {
@@ -709,6 +725,9 @@ struct TopKStreaming : TopKRadixBase<12> {
   }
 };
 
+using TopKStreaming = TopKStreamingImpl<12>;
+using TopKStreamingHistogram = TopKStreamingImpl<10>;
+
 // ---------------------------------------------------------------------------
 // Cluster path: very long seq_len, small batch. `kClusterSize` blocks cooperate
 // on one batch element via distributed shared memory (one cluster per element).
@@ -752,8 +771,9 @@ struct TopKCluster : TopKRadixBase<10> {
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
   }
 
-  template <bool kUsePDL>
-  SGL_DEVICE static void forward(TopKProblem problem, void* _smem) {
+  template <bool kUsePDL, bool kPrecomputedHistogram = false>
+  SGL_DEVICE static void forward(TopKProblem problem, void* _smem,
+      const uint32_t* __restrict__ precomputed_histogram = nullptr) {
     const auto tx = threadIdx.x;
     const auto smem = static_cast<Smem*>(_smem);
     const auto cluster = cooperative_groups::this_cluster();
@@ -777,11 +797,16 @@ struct TopKCluster : TopKRadixBase<10> {
     }
     PDLWaitPrimary<kUsePDL>();
 
-    // Phase 1: Load and build histogram over this rank's contiguous chunk.
-    for_each_input<N>(problem.in, problem.seq_len, [&](float val, uint32_t) {
-      const auto bin = extract_coarse_bin<kHistBits>(val);
-      atomicAdd(&smem->histogram[bin], 1);
-    });
+    // The producer histogram covers the full row; only rank 0 consumes it.
+    if constexpr (kPrecomputedHistogram) {
+      if (this_rank == 0) smem->histogram[tx] = precomputed_histogram[tx];
+    } else {
+      // Phase 1: Load and build histogram over this rank's contiguous chunk.
+      for_each_input<N>(problem.in, problem.seq_len, [&](float val, uint32_t) {
+        const auto bin = extract_coarse_bin<kHistBits>(val);
+        atomicAdd(&smem->histogram[bin], 1);
+      });
+    }
 
     barrier_cluster_wait();  // bar-0 wait
     __syncthreads();
@@ -790,8 +815,10 @@ struct TopKCluster : TopKRadixBase<10> {
       // Phase 2. atomic flush all histogram into rank 0
       static_assert(kHistSize == kBlockSize);  // one bin per thread
 
-      if (const auto count = smem->histogram[tx]; count != 0) {
-        atomicAdd(&smem_0->histogram[tx], count);
+      if constexpr (!kPrecomputedHistogram) {
+        if (const auto count = smem->histogram[tx]; count != 0) {
+          atomicAdd(&smem_0->histogram[tx], count);
+        }
       }
 
       barrier_cluster_arrive_release();  // bar-1 arrive

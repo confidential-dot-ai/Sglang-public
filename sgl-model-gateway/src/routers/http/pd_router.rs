@@ -22,8 +22,8 @@ use super::pd_types::api_path;
 use crate::{
     config::types::RetryConfig,
     core::{
-        is_retryable_status, HashRing, RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry,
-        WorkerType, UNKNOWN_MODEL_ID,
+        deadlines, is_retryable_status, HashRing, RetryExecutor, Worker, WorkerLoadGuard,
+        WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID,
     },
     observability::{
         events::{self, Event},
@@ -45,12 +45,13 @@ use crate::{
         error,
         grpc::utils::{error_type_from_status, route_to_endpoint},
         header_utils,
-        streaming_utils::BreakerTrackedStream,
+        streaming_utils::guarded_tracked_stream,
+        tokenize::tokenize_bounded_prefix,
         RouterTrait,
     },
+    tokenizer::TokenizerRegistry,
 };
 
-#[derive(Debug)]
 pub struct PDRouter {
     pub worker_registry: Arc<WorkerRegistry>,
     pub policy_registry: Arc<PolicyRegistry>,
@@ -58,6 +59,20 @@ pub struct PDRouter {
     pub retry_config: RetryConfig,
     pub api_key: Option<String>,
     pub enable_igw: bool,
+    pub tokenizer_registry: Arc<TokenizerRegistry>,
+}
+
+impl std::fmt::Debug for PDRouter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PDRouter")
+            .field("worker_registry", &self.worker_registry)
+            .field("policy_registry", &self.policy_registry)
+            .field("client", &self.client)
+            .field("retry_config", &self.retry_config)
+            .field("api_key", &self.api_key)
+            .field("enable_igw", &self.enable_igw)
+            .finish()
+    }
 }
 
 struct PreparedWorkerRequest<'a> {
@@ -72,6 +87,13 @@ struct PDRequestContext<'a> {
     is_stream: bool,
     return_logprob: bool,
     request_text: Option<String>,
+    /// Text for policies that set `wants_system_prompt_excluded` (today:
+    /// `PrefixHashPolicy`) -- like `request_text` but with leading
+    /// system/developer content excluded. `None` for every route except
+    /// `/v1/chat/completions` (the only request type with message-role
+    /// structure to separate out) or when no active policy wants it, in
+    /// which case tokenization falls back to `request_text`.
+    prefix_hash_request_text: Option<String>,
     model_id: Option<&'a str>,
     headers: Option<HeaderMap>,
 }
@@ -189,6 +211,7 @@ impl PDRouter {
             retry_config: ctx.router_config.effective_retry_config(),
             api_key: ctx.router_config.api_key.clone(),
             enable_igw: ctx.router_config.enable_igw,
+            tokenizer_registry: Arc::clone(&ctx.tokenizer_registry),
         })
     }
 
@@ -401,6 +424,7 @@ impl PDRouter {
                         let (prefill, decode) = match self
                             .select_pd_pair(
                                 context.request_text.as_deref(),
+                                context.prefix_hash_request_text.as_deref(),
                                 context.model_id,
                                 context.headers.as_ref(),
                             )
@@ -691,6 +715,7 @@ impl PDRouter {
             &prepared_prefill.body,
             headers,
             false,
+            context.is_stream,
         );
         let decode_request = self.build_post_with_headers(
             &self.client,
@@ -698,6 +723,7 @@ impl PDRouter {
             &prepared_decode.body,
             headers,
             false,
+            context.is_stream,
         );
 
         // Run both in this handler task (not a detached tokio::spawn) so a client
@@ -953,6 +979,13 @@ impl PDRouter {
         prefill_policy.needs_request_text() || decode_policy.needs_request_text()
     }
 
+    fn policies_want_system_excluded(&self) -> bool {
+        let prefill_policy = self.policy_registry.get_prefill_policy();
+        let decode_policy = self.policy_registry.get_decode_policy();
+        prefill_policy.wants_system_prompt_excluded()
+            || decode_policy.wants_system_prompt_excluded()
+    }
+
     /// Builds the text used for cache-aware routing of a chat request.
     ///
     /// This must reflect the *full* conversation (system prompt, prior turns,
@@ -975,9 +1008,24 @@ impl PDRouter {
         }
     }
 
+    /// Like `build_chat_request_text`, but for policies with
+    /// `wants_system_prompt_excluded() == true` (today: `PrefixHashPolicy`) --
+    /// see `GenerationRequest::extract_text_for_prefix_hash_routing`'s doc
+    /// comment for why a bounded-window hash policy needs this separately
+    /// from `cache_aware`'s full-text routing.
+    fn build_chat_request_text_for_prefix_hash(body: &ChatCompletionRequest) -> Option<String> {
+        let text = body.extract_text_for_prefix_hash_routing();
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
+    }
+
     async fn select_pd_pair(
         &self,
         request_text: Option<&str>,
+        prefix_hash_request_text: Option<&str>,
         model_id: Option<&str>,
         headers: Option<&HeaderMap>,
     ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>), String> {
@@ -1013,15 +1061,71 @@ impl PDRouter {
         let prefill_policy = self.policy_registry.get_prefill_policy();
         let decode_policy = self.policy_registry.get_decode_policy();
 
-        // Get cached hash ring for consistent hashing
+        // Get cached hash ring for consistent hashing. Look up by the
+        // REQUEST's model first, not effective_model_id: rings are keyed by
+        // worker.model_id() at registration ("mm27"), while effective_model_id
+        // is deliberately None when igw is off (it scopes WORKER LISTS, which
+        // are global in that mode). Using it here meant every non-igw deploy
+        // looked up ring "unknown", got None, and prefix_hash silently
+        // degraded to its least-loaded fallback -- with tied/stale loads
+        // that's a CONSTANT worker, i.e. total decode-side collapse
+        // (observed live 2026-07-24: 99%+ of requests on one of three
+        // decode engines despite --decode-policy prefix_hash).
         let hash_ring = self
             .worker_registry
-            .get_hash_ring(effective_model_id.unwrap_or(UNKNOWN_MODEL_ID));
+            .get_hash_ring(model_id.unwrap_or(UNKNOWN_MODEL_ID))
+            .or_else(|| self.worker_registry.get_hash_ring(UNKNOWN_MODEL_ID));
+
+        // Tokenize once (not per prefill/decode sub-call -- both share the
+        // same request tokens) for policies that route on token ids over
+        // HTTP (e.g. PrefixHashPolicy). Bounded to the largest prefix either
+        // policy asks for; gracefully None (not an error) if neither policy
+        // needs tokens, there's no request text, or no tokenizer is
+        // registered yet for this model.
+        let max_tokens_needed = [
+            prefill_policy.prefix_tokens_needed(),
+            decode_policy.prefix_tokens_needed(),
+        ]
+        .into_iter()
+        .flatten()
+        .max();
+        // If either policy wants leading system/developer content excluded
+        // (PrefixHashPolicy), tokenize `prefix_hash_request_text` instead of
+        // `request_text` -- falling back to `request_text` when the caller
+        // didn't build one (every route except /v1/chat/completions, which
+        // is the only request type with message-role structure to separate
+        // out; see PDRequestContext::prefix_hash_request_text).
+        //
+        // Sharing ONE tokenization between prefill and decode (like
+        // max_tokens_needed above) means a MIXED config -- one side
+        // cache_aware, the other prefix_hash -- would have the cache_aware
+        // side route on system-excluded tokens too if the prefix_hash side
+        // sets this. Not a concern for same-policy-both-sides configs
+        // (this deployment's actual config); a mixed setup wanting exact
+        // per-policy text would need two separate tokenization passes.
+        let wants_system_excluded = prefill_policy.wants_system_prompt_excluded()
+            || decode_policy.wants_system_prompt_excluded();
+        let text_to_tokenize = if wants_system_excluded {
+            prefix_hash_request_text.or(request_text)
+        } else {
+            request_text
+        };
+        let tokens_owned: Option<Vec<u32>> = match (max_tokens_needed, text_to_tokenize) {
+            (Some(n), Some(text)) if n > 0 => tokenize_bounded_prefix(
+                &self.tokenizer_registry,
+                model_id.unwrap_or(UNKNOWN_MODEL_ID),
+                text,
+                n,
+            ),
+            _ => None,
+        };
+        let tokens: Option<&[u32]> = tokens_owned.as_deref();
 
         let prefill = Self::pick_worker_by_policy_arc(
             &prefill_workers,
             &*prefill_policy,
             request_text,
+            tokens,
             headers,
             hash_ring.clone(),
             "prefill",
@@ -1032,6 +1136,7 @@ impl PDRouter {
             &decode_workers,
             &*decode_policy,
             request_text,
+            tokens,
             headers,
             hash_ring,
             "decode",
@@ -1060,6 +1165,7 @@ impl PDRouter {
         workers: &[Arc<dyn Worker>],
         policy: &dyn LoadBalancingPolicy,
         request_text: Option<&str>,
+        tokens: Option<&[u32]>,
         headers: Option<&HeaderMap>,
         hash_ring: Option<Arc<HashRing>>,
         worker_type: &str,
@@ -1089,7 +1195,7 @@ impl PDRouter {
                 &available_workers,
                 &SelectWorkerInfo {
                     request_text,
-                    tokens: None, // HTTP doesn't have tokens, use gRPC for PrefixHash
+                    tokens,
                     headers,
                     hash_ring,
                 },
@@ -1137,7 +1243,7 @@ impl PDRouter {
         // synthesizes a single-chunk SSE error envelope that would otherwise
         // stream cleanly to None and record a spurious success.
         let mut tracked =
-            BreakerTrackedStream::new(stream, Arc::clone(&decode), decode.url().to_string());
+            guarded_tracked_stream(stream, Arc::clone(&decode), decode.url().to_string());
         if !(status.is_success() || status.is_client_error()) {
             tracked.mark_errored();
         }
@@ -1368,10 +1474,16 @@ impl PDRouter {
         json_request: &Value,
         headers: Option<&HeaderMap>,
         connection_close: bool,
+        is_stream: bool,
     ) -> reqwest::RequestBuilder {
         let mut request = client.post(endpoint_url).json(json_request);
         if connection_close {
             request = request.header("Connection", "close");
+        }
+        // Both legs: prefill holds the connection for the whole generation
+        // too, so the non-streaming total would cancel it as well.
+        if is_stream {
+            request = deadlines::apply_stream_deadline(request);
         }
         if let Some(headers) = headers {
             for (name, value) in headers.iter() {
@@ -1467,7 +1579,7 @@ impl RouterTrait for PDRouter {
         // Note: This endpoint actually causes the model to generate tokens, so we only test one pair
 
         // Select a random worker pair using the policy
-        let (prefill, decode) = match self.select_pd_pair(None, None, None).await {
+        let (prefill, decode) = match self.select_pd_pair(None, None, None, None).await {
             Ok(pair) => pair,
             Err(e) => {
                 return error::service_unavailable(
@@ -1588,6 +1700,10 @@ impl RouterTrait for PDRouter {
             is_stream,
             return_logprob,
             request_text,
+            // GenerateRequest has no message-role structure to separate a
+            // leading system prompt out of; policies wanting system-excluded
+            // text fall back to `request_text` (see select_pd_pair).
+            prefix_hash_request_text: None,
             model_id,
             headers: headers.cloned(),
         };
@@ -1609,6 +1725,11 @@ impl RouterTrait for PDRouter {
         } else {
             None
         };
+        let prefix_hash_request_text = if self.policies_want_system_excluded() {
+            Self::build_chat_request_text_for_prefix_hash(body)
+        } else {
+            None
+        };
 
         // Calculate batch size
         let batch_size = Self::get_chat_batch_size(body);
@@ -1619,6 +1740,7 @@ impl RouterTrait for PDRouter {
             is_stream,
             return_logprob,
             request_text,
+            prefix_hash_request_text,
             model_id,
             headers: headers.cloned(),
         };
@@ -1653,6 +1775,8 @@ impl RouterTrait for PDRouter {
             is_stream,
             return_logprob,
             request_text,
+            // Same reasoning as route_generate: no message-role structure here.
+            prefix_hash_request_text: None,
             model_id,
             headers: headers.cloned(),
         };
@@ -1697,6 +1821,9 @@ impl RouterTrait for PDRouter {
             // which the Responses API schema does not carry.
             return_logprob: false,
             request_text,
+            // System-prefix exclusion is a chat-template operation; Responses
+            // uses its ordinary routing text for both policy families.
+            prefix_hash_request_text: None,
             model_id,
             headers: headers.cloned(),
         };
@@ -1723,6 +1850,8 @@ impl RouterTrait for PDRouter {
             is_stream: false,
             return_logprob: false,
             request_text: req_text,
+            // Same reasoning as route_generate: no message-role structure here.
+            prefix_hash_request_text: None,
             model_id,
             headers: headers.cloned(),
         };
@@ -1766,7 +1895,11 @@ impl RouterTrait for PDRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{BasicWorkerBuilder, DPAwareWorkerBuilder, WorkerType};
+    use crate::{
+        core::{BasicWorkerBuilder, DPAwareWorkerBuilder, WorkerType},
+        policies::PrefixHashPolicy,
+        tokenizer::{mock::MockTokenizer, traits::Tokenizer},
+    };
 
     fn create_test_pd_router() -> PDRouter {
         let worker_registry = Arc::new(WorkerRegistry::new());
@@ -1780,6 +1913,7 @@ mod tests {
             retry_config: RetryConfig::default(),
             api_key: Some("test_api_key".to_string()),
             enable_igw: false,
+            tokenizer_registry: Arc::new(TokenizerRegistry::new()),
         }
     }
 
@@ -1865,7 +1999,7 @@ mod tests {
         router.worker_registry.register(Arc::from(healthy_worker));
         router.worker_registry.register(Arc::from(decode_worker));
 
-        let result = router.select_pd_pair(None, None, None).await;
+        let result = router.select_pd_pair(None, None, None, None).await;
 
         assert!(result.is_ok());
         let (prefill, _decode) = result.unwrap();
@@ -1878,10 +2012,62 @@ mod tests {
     async fn test_empty_worker_lists() {
         let router = create_test_pd_router();
 
-        let result = router.select_pd_pair(None, None, None).await;
+        let result = router.select_pd_pair(None, None, None, None).await;
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("No prefill workers available"));
+    }
+
+    #[tokio::test]
+    async fn test_prefix_hash_policy_selects_worker_with_real_tokens() {
+        // Regression test for the "HTTP doesn't have tokens" bug: PrefixHashPolicy
+        // used to always fail on this path because SelectWorkerInfo.tokens was
+        // hardcoded to None, so select_worker_impl always hit its NoTokens branch.
+        let router = create_test_pd_router();
+        router
+            .policy_registry
+            .set_prefill_policy(Arc::new(PrefixHashPolicy::with_defaults()));
+        router
+            .policy_registry
+            .set_decode_policy(Arc::new(PrefixHashPolicy::with_defaults()));
+
+        let prefill_worker = create_test_worker(
+            "http://prefill".to_string(),
+            WorkerType::Prefill {
+                bootstrap_port: None,
+            },
+            true,
+        );
+        let decode_worker =
+            create_test_worker("http://decode".to_string(), WorkerType::Decode, true);
+        router.worker_registry.register(Arc::from(prefill_worker));
+        router.worker_registry.register(Arc::from(decode_worker));
+
+        let id = crate::tokenizer::TokenizerRegistry::generate_id();
+        router
+            .tokenizer_registry
+            .load(&id, "test-model", "mock-source", || async {
+                Ok(Arc::new(MockTokenizer::default()) as Arc<dyn Tokenizer>)
+            })
+            .await
+            .unwrap();
+
+        // Only words in MockTokenizer's small fixed vocab produce non-empty
+        // token ids (it silently drops unrecognized words) -- see mock.rs.
+        let result = router
+            .select_pd_pair(
+                Some("Hello world test token"),
+                None,
+                Some("test-model"),
+                None,
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "expected prefix_hash routing to succeed with real tokens, got: {:?}",
+            result.err()
+        );
     }
 
     #[test]

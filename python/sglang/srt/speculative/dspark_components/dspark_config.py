@@ -11,6 +11,7 @@ from sglang.srt.runtime_context import (
     get_model,
     get_spec,
 )
+from sglang.srt.environ import envs
 from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 
 if TYPE_CHECKING:
@@ -31,21 +32,48 @@ def get_dspark_sample_from_anchor(draft_hf_config: Any) -> bool:
     return bool(_cfg_get(draft_hf_config, "sample_from_anchor", True))
 
 
-def draft_is_deepseek_v4() -> bool:
+def _is_deepseek_v4_draft(
+    *,
+    draft_model_path: Optional[str],
+    trust_remote_code: bool,
+    revision: Optional[str],
+    json_model_override_args: str,
+    model_config_parser: Optional[str],
+) -> bool:
     from sglang.srt.configs.model_config import is_deepseek_v4
     from sglang.srt.utils.hf_transformers_utils import get_config
 
-    draft_model_path = get_spec().speculative_draft_model_path
     if not draft_model_path:
         return False
     draft_hf_config = get_config(
         draft_model_path,
-        trust_remote_code=get_model().trust_remote_code,
-        revision=get_spec().speculative_draft_model_revision,
-        model_override_args=json.loads(get_model().json_model_override_args),
-        model_config_parser=get_model().model_config_parser,
+        trust_remote_code=trust_remote_code,
+        revision=revision,
+        model_override_args=json.loads(json_model_override_args),
+        model_config_parser=model_config_parser,
     )
     return draft_hf_config is not None and is_deepseek_v4(draft_hf_config)
+
+
+def draft_is_deepseek_v4() -> bool:
+    return _is_deepseek_v4_draft(
+        draft_model_path=get_spec().speculative_draft_model_path,
+        trust_remote_code=get_model().trust_remote_code,
+        revision=get_spec().speculative_draft_model_revision,
+        json_model_override_args=get_model().json_model_override_args,
+        model_config_parser=get_model().model_config_parser,
+    )
+
+
+def draft_is_deepseek_v4_from_args(server_args: ServerArgs) -> bool:
+    """draft_is_deepseek_v4 for resolution time, before the config bags publish."""
+    return _is_deepseek_v4_draft(
+        draft_model_path=server_args.speculative_draft_model_path,
+        trust_remote_code=server_args.trust_remote_code,
+        revision=server_args.speculative_draft_model_revision,
+        json_model_override_args=server_args.json_model_override_args,
+        model_config_parser=server_args.model_config_parser,
+    )
 
 
 def dspark_gamma_from_num_draft_tokens(num_draft_tokens: int) -> int:
@@ -205,8 +233,57 @@ def _get_dspark_config(config: Any) -> dict:
         return {}
 
 
+def _validate_dspark_swa_config(draft_hf_config: Any) -> None:
+    """Cross-check dflash_config's SWA claims against the top-level fields the
+    draft attention actually consumes (layer_types + sliding_window).
+
+    A draft trained with SWA-1024 that silently runs global attention (or a
+    different window) mismatches training, so a checkpoint that *declares*
+    SWA must also carry the fields that turn it on.
+    """
+    from sglang.srt.speculative.dflash_utils import (
+        get_dflash_attention_sliding_window_size,
+        _get_dflash_config,
+    )
+
+    dflash_cfg = _get_dflash_config(draft_hf_config)
+    use_swa = dflash_cfg.get("use_swa")
+    declared_window = dflash_cfg.get("swa_window_size")
+    if not use_swa and declared_window is None:
+        return
+
+    effective_window_left = get_dflash_attention_sliding_window_size(
+        draft_hf_config
+    )
+    if use_swa and effective_window_left is None:
+        raise ValueError(
+            "DSpark draft config declares dflash_config.use_swa=true but the "
+            "top-level layer_types/sliding_window fields (which drive the "
+            "draft attention) do not enable sliding-window attention; the "
+            "draft would attend globally and mismatch training."
+        )
+    if (
+        declared_window is not None
+        and effective_window_left is not None
+        and envs.SGLANG_FORCE_DFLASH_DRAFT_SWA_WINDOW.get() is None
+    ):
+        # get_dflash_attention_sliding_window_size returns window_left
+        # (HF sliding_window - 1). Skipped under an active window override:
+        # that deliberately runs the draft off its checkpoint-declared
+        # window, so a mismatch here is expected, not a config error.
+        if int(declared_window) - 1 != int(effective_window_left):
+            raise ValueError(
+                "DSpark draft config SWA window mismatch: "
+                f"dflash_config.swa_window_size={declared_window} but the "
+                f"top-level sliding_window resolves to window_left="
+                f"{effective_window_left} (expected "
+                f"{int(declared_window) - 1})."
+            )
+
+
 def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
     base = parse_dflash_draft_config(draft_hf_config=draft_hf_config)
+    _validate_dspark_swa_config(draft_hf_config)
 
     dspark_cfg = _get_dspark_config(draft_hf_config)
     text_config = _get_text_config(draft_hf_config)

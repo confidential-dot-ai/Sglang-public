@@ -70,6 +70,7 @@ fn bench_wasm_middleware_buffering(c: &mut Criterion) {
         context: Arc::new(context),
         concurrency_queue_tx: None,
         router_manager: None,
+        api_keys: None,
         mesh_handler: None,
         mesh_sync_manager: None,
     });

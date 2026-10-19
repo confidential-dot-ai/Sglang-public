@@ -10,7 +10,7 @@ from collections import OrderedDict
 from collections.abc import AsyncGenerator
 from enum import Enum
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from sglang.srt.runtime_context import get_model, get_serving
 
@@ -121,6 +121,25 @@ logger = logging.getLogger(__name__)
 
 _MEDIA_CONTENT_PART_TYPES = frozenset({"image_url", "video_url", "audio_url"})
 _CHAT_TEMPLATE_CACHE_MAX_SIZE = 128
+
+
+class _ChatStreamingResponse(StreamingResponse):
+    """Own the prefetched generator even if sending headers/body fails."""
+
+    def __init__(self, content, *, generator: AsyncGenerator[str, None], **kwargs):
+        super().__init__(content, **kwargs)
+        self._generator = generator
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            try:
+                await self.body_iterator.aclose()
+            finally:
+                # The body iterator may never have started (header send failure),
+                # but _handle_streaming_request already advanced this generator.
+                await self._generator.aclose()
 
 
 def normalize_tool_content(role: str, content):
@@ -275,7 +294,6 @@ class OpenAIServingChat(OpenAIServingBase):
     ):
         super().__init__(tokenizer_manager)
         self.template_manager = template_manager
-        self.tool_call_parser = self.tokenizer_manager.config_value("tool_call_parser")
         self.reasoning_parser = self.tokenizer_manager.config_value("reasoning_parser")
         self.default_chat_template_kwargs = (
             get_serving().default_chat_template_kwargs or {}
@@ -403,6 +421,14 @@ class OpenAIServingChat(OpenAIServingBase):
             # A template that needs kwargs this probe does not supply tells us
             # nothing; keep the long-standing text path.
             return False
+
+    @property
+    def tool_call_parser(self) -> Optional[str]:
+        # Read fresh so a post-startup /set_tool_call_parser update (recorded
+        # via TokenizerManager.record_config_updates) takes effect on the
+        # next request without a restart. Unlike reasoning_parser, this has
+        # no per-request-independent object to rebuild on change.
+        return self.tokenizer_manager.config_value("tool_call_parser")
 
     def _handle_last_assistant_message(
         self,
@@ -1002,12 +1028,80 @@ class OpenAIServingChat(OpenAIServingBase):
 
         The reasoning parser is told the same thing, so channel-framed formats
         keep their framing intact exactly when a tool-call parser consumes it.
+
+        Gating this on the request's tools -- declared, or implied by tool
+        calls in the history -- passed the model's tool-call markup through
+        verbatim as visible content with finish_reason "stop", delivering raw
+        special tokens to the user instead of a tool_calls array. The provider
+        API contract requires the opposite: "calls should be allowed even
+        when no tools are defined; when tools are defined, calls to undefined
+        tools should still be allowed". Tool schemas are only needed to
+        type-convert arguments, not to recognise a call, so the parser does
+        the right thing with an empty tool list.
+
+        `tool_choice == "none"` only counts as an opt-out alongside declared
+        tools. With no tools the field is not the caller's choice at all --
+        `set_tool_choice_default` injects "none" (protocol.py) -- and reading
+        it as one would disable the parser on exactly the no-tools request the
+        contract requires it for.
         """
-        return bool(
-            request.tool_choice != "none"
-            and self._effective_tools(request)
-            and self.tool_call_parser
+        opted_out = request.tool_choice == "none" and bool(
+            self._effective_tools(request)
         )
+        return not opted_out and bool(self.tool_call_parser)
+
+    @staticmethod
+    def _validate_tool_call_ids(request: ChatCompletionRequest) -> str | None:
+        """Check that tool replies line up with the tool calls that were made.
+
+        Two ways an agent history can be internally inconsistent, both of which
+        were previously served as if valid:
+
+          * a `tool` message whose tool_call_id matches no call the assistant
+            ever issued -- the reply is attributed to nothing;
+          * an assistant turn whose calls are only partly answered -- the model
+            is asked to continue from a state that never existed.
+
+        The second is deliberately scoped to turns that HAVE been answered. An
+        assistant message whose calls are still outstanding is the normal
+        mid-flight shape (the caller is about to run the tools), and must stay
+        valid.
+        """
+        issued: dict = {}  # call id -> index of the assistant message issuing it
+        for idx, message in enumerate(request.messages):
+            for call in getattr(message, "tool_calls", None) or []:
+                call_id = getattr(call, "id", None)
+                if call_id is not None:
+                    issued[call_id] = idx
+
+        answered = set()
+        for message in request.messages:
+            if getattr(message, "role", None) != "tool":
+                continue
+            call_id = getattr(message, "tool_call_id", None)
+            if call_id is None:
+                return "A `tool` message must carry a tool_call_id."
+            if call_id not in issued:
+                return (
+                    f"tool_call_id `{call_id}` does not match any tool call in "
+                    "this conversation."
+                )
+            answered.add(call_id)
+
+        if answered:
+            by_turn: dict = {}
+            for call_id, turn in issued.items():
+                by_turn.setdefault(turn, set()).add(call_id)
+            for turn, call_ids in sorted(by_turn.items()):
+                if call_ids & answered:
+                    missing = sorted(call_ids - answered)
+                    if missing:
+                        return (
+                            "Every tool call must be answered before the "
+                            "conversation continues; missing a `tool` message "
+                            f"for: {', '.join(missing)}."
+                        )
+        return None
 
     def _validate_request(self, request: ChatCompletionRequest) -> str | None:
         """Validate that the input is valid."""
@@ -1023,6 +1117,14 @@ class OpenAIServingChat(OpenAIServingBase):
                 "Request-supplied chat_template is not allowed. Start the server "
                 "with --trust-request-chat-template to permit it."
             )
+
+        model_error = self._validate_model_name(request.model)
+        if model_error:
+            return model_error
+
+        tool_call_id_error = self._validate_tool_call_ids(request)
+        if tool_call_id_error:
+            return tool_call_id_error
 
         if request.return_sampling_mask and not request.return_meta_info:
             return "return_sampling_mask requires return_meta_info=true."
@@ -1891,12 +1993,18 @@ class OpenAIServingChat(OpenAIServingBase):
             return self.create_error_response(str(e))
 
         async def prepend_first_chunk():
-            yield first_chunk
-            async for chunk in generator:
-                yield chunk
+            try:
+                yield first_chunk
+                async for chunk in generator:
+                    yield chunk
+            finally:
+                # Closing/cancelling an outer async generator does not close
+                # the generator it is iterating over.
+                await generator.aclose()
 
-        return StreamingResponse(
+        return _ChatStreamingResponse(
             prepend_first_chunk(),
+            generator=generator,
             media_type="text/event-stream",
             background=self.tokenizer_manager.create_abort_task(adapted_request),
         )
@@ -1936,6 +2044,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
         stream_started = False
         error_aborted = False
+        generation = None
         try:
             include_usage, continuous_usage_stats = should_include_usage(
                 request.stream_options,
@@ -1950,9 +2059,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 and raw_request.headers.get("x-sglext-ids-framed") == "1"
             )
 
-            async for content in self.tokenizer_manager.generate_request(
+            generation = self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
-            ):
+            )
+            async for content in generation:
                 index = content.get("index", 0)
 
                 prompt_tokens[index] = self._reported_prompt_tokens(
@@ -2229,6 +2339,24 @@ class OpenAIServingChat(OpenAIServingBase):
                 raise
             error = self.create_streaming_error_response(str(e))
             yield f"data: {error}\n\n"
+        except Exception as e:
+            # Before headers, handle_request can still return an HTTP error.
+            # After headers, make failures explicit rather than truncating SSE.
+            # Do not catch BaseException: cancellation/GeneratorExit must unwind.
+            if not stream_started:
+                raise
+            logger.exception("Error while streaming chat completion")
+            error = self.create_streaming_error_response(
+                message=f"Internal server error: {e}",
+                err_type="InternalServerError",
+                status_code=500,
+            )
+            yield f"data: {error}\n\n"
+        finally:
+            if generation is not None:
+                # Release the model-update lock and abort pending generation on
+                # parser failures, explicit aborts, or a closed response stream.
+                await generation.aclose()
 
         yield "data: [DONE]\n\n"
 

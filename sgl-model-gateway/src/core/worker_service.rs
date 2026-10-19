@@ -128,6 +128,28 @@ impl IntoResponse for DeleteWorkerResult {
     }
 }
 
+/// Result of starting or clearing a drain
+#[derive(Debug)]
+pub struct DrainWorkerResult {
+    pub worker_id: WorkerId,
+    pub url: String,
+    pub draining: bool,
+    /// Requests still in flight. Zero means the worker is safe to stop.
+    pub in_flight: usize,
+}
+
+impl IntoResponse for DrainWorkerResult {
+    fn into_response(self) -> Response {
+        let response = json!({
+            "worker_id": self.worker_id.as_str(),
+            "url": self.url,
+            "draining": self.draining,
+            "in_flight": self.in_flight,
+        });
+        (StatusCode::OK, Json(response)).into_response()
+    }
+}
+
 /// Result of updating a worker (async job submission)
 #[derive(Debug)]
 pub struct UpdateWorkerResult {
@@ -333,6 +355,35 @@ impl WorkerService {
             .map_err(|e| WorkerServiceError::QueueSubmitFailed { message: e })?;
 
         Ok(DeleteWorkerResult { worker_id, url })
+    }
+
+    /// Start or clear a drain on a worker.
+    ///
+    /// Applied directly rather than through the job queue: the point of a
+    /// drain is that routing stops before the call returns, so a queued job
+    /// would let requests land on the worker the operator just withheld.
+    pub fn set_worker_drain(
+        &self,
+        worker_id_raw: &str,
+        draining: bool,
+    ) -> Result<DrainWorkerResult, WorkerServiceError> {
+        let worker_id = self.parse_worker_id(worker_id_raw)?;
+
+        let worker =
+            self.worker_registry
+                .get(&worker_id)
+                .ok_or_else(|| WorkerServiceError::NotFound {
+                    worker_id: worker_id_raw.to_string(),
+                })?;
+
+        worker.set_draining(draining);
+
+        Ok(DrainWorkerResult {
+            worker_id,
+            url: worker.url().to_string(),
+            draining,
+            in_flight: worker.load(),
+        })
     }
 
     /// Update a worker by ID (submits async job)

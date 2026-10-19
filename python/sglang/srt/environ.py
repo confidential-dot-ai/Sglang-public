@@ -361,6 +361,20 @@ class Envs:
     SGLANG_LOG_SCHEDULER_STATUS_INTERVAL = EnvFloat(60.0)
     SGLANG_ENABLE_RANK_CONSENSUS_CHECKER = EnvBool(False)
 
+    # Scheduler decode fairness: after this many CONSECUTIVE prefill batches
+    # scheduled while decodable requests sat waiting, skip prefill formation
+    # for one pass so the running batch gets a decode tick. 0 (default)
+    # disables it, preserving the stock strict prefill-first arbitration.
+    # Deterministic across TP ranks (pure pass-counter, no wall clock).
+    SGLANG_MAX_CONSECUTIVE_PREFILL = EnvInt(0)
+    # DSPARK target-verify CUDA-graph metadata pipeline. Prepare FB-shared
+    # inputs into two private registries on a metadata stream, then promote the
+    # ready slot into the stable captured buffers immediately before replay.
+    SGLANG_DSPARK_DOUBLE_BUFFER_METADATA = EnvBool(False)
+    # Aggregate ForwardBatch construction, graph loading, registry fill,
+    # attention-metadata, and promotion timings every N verify forwards.
+    SGLANG_DSPARK_METADATA_TIMING_INTERVAL = EnvInt(0)
+
     # ===================================================================
     # IPC, broadcasters, and ports
     # ===================================================================
@@ -445,6 +459,20 @@ class Envs:
     SGLANG_TEST_SCRIPTED_RUNTIME_OUT_OF_BAND_ERROR_PATH = EnvStr(None)
     SGLANG_TEST_SCRIPTED_RUNTIME_SYS_PATH_ENTRY = EnvStr(None)
 
+    # CPU placement used when SGLANG_SET_CPU_AFFINITY is enabled. The default
+    # preserves the historical contiguous-per-TP-rank behavior. "strided"
+    # assigns every Nth physical core to each rank so all ranks span sockets.
+    SGLANG_CPU_AFFINITY_MODE = EnvStr("contiguous")
+    # Pin every thread already present in the scheduler process. Linux thread
+    # affinity is per-TID; setting only the PID leaves pre-existing worker-pool
+    # threads unpinned. New threads inherit their creator's corrected mask.
+    SGLANG_CPU_AFFINITY_ALL_THREADS = EnvBool(False)
+    # Optional global placement across multiple server processes on one node.
+    # Zero uses the local TP width. rank_offset lets a second TP replica claim
+    # a disjoint set of strided cores (for example world=8, offsets 0 and 4).
+    SGLANG_CPU_AFFINITY_WORLD_SIZE = EnvInt(0)
+    SGLANG_CPU_AFFINITY_RANK_OFFSET = EnvInt(0)
+
     # ===================================================================
     # Profiling, tracing, and metrics
     # ===================================================================
@@ -455,14 +483,35 @@ class Envs:
     # reaches this many requests (0 = first decode batch). Lets a batch-size bench
     # capture steady-state full-admission decode steps instead of the ramp-up.
     SGLANG_PROFILE_BY_STAGE_DECODE_MIN_BS = EnvInt(0)
-    SGLANG_ENABLE_NVTX_SCHEDULER = EnvBool(False)
-    SGLANG_ENABLE_NVTX_OPERATIONS = EnvBool(False)
+    SGLANG_PROFILER_WARMUP_ON_INIT = EnvBool(False)
+    SGLANG_ENABLE_NVTX_SCHEDULER = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_ENABLE_NVTX"
+    )
+    SGLANG_ENABLE_NVTX_OPERATIONS = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_OPERATIONS_ENABLE_PROFILE"
+    )
+    # Diagnostic-only NVTX ranges for cross-rank collective arrival analysis.
+    # Labels include the decoder layer, communicator, rank, sequence,
+    # tensor shape, and bytes. Resolved at import time so the default-off path
+    # leaves collective methods completely undecorated.
+    SGLANG_COLLECTIVE_TRACE = EnvBool(False)
     SGLANG_RECORD_STEP_TIME = EnvBool(False)
     SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE = EnvBool(False)
     # Opt-in: emit one CUDA-graph capture trace per captured batch size (per-bs).
     # SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE (single combined trace) takes
     # precedence when both are set.
     SGLANG_GRAPH_BATCH_CAPTURE = EnvBool(False)
+    # Cross-worker CUDA-graph capture turnstile. On the CC/B300 rig, the
+    # recorded GSP wedges (Xid 120 -> Xid 154, NV_ERR_INVALID_DATA from
+    # MEMORY_TRANSFER_WITH_GSP) all struck while co-located workers ran
+    # startup graph capture concurrently; weight loading overlaps safely.
+    # A worker with WAIT_FILE set blocks before its startup capture until
+    # the file exists (or the timeout passes, so a dead peer cannot hang
+    # it); a worker with SIGNAL_FILE set touches that file once its own
+    # startup capture completes.
+    SGLANG_CUDA_GRAPH_CAPTURE_WAIT_FILE = EnvStr("")
+    SGLANG_CUDA_GRAPH_CAPTURE_SIGNAL_FILE = EnvStr("")
+    SGLANG_CUDA_GRAPH_CAPTURE_WAIT_TIMEOUT_S = EnvFloat(3600.0)
     SGLANG_TORCH_PROFILER_DIR = EnvStr("/tmp")
     # Allocator-history buffer for /start_profile activities=["MEM"]; the
     # default truncates long windows (each entry is one alloc/free event).
@@ -485,6 +534,8 @@ class Envs:
     # ===================================================================
     SGLANG_DETECT_SLOW_RANK = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
+    # Log why each prefill batch stopped admitting while requests were still waiting.
+    SGLANG_DEBUG_PREFILL_ADMISSION = EnvBool(False)
     SGLANG_VALIDATE_MAMBA_REPLAY_STATE_INDICES = EnvBool(False)
     SGLANG_GDN_DECODE_FUSION_LOG_LAYER_HITS = EnvBool(False)
     SGLANG_GDN_DECODE_FUSION_VERIFY_REAL_TENSORS = EnvBool(False)
@@ -501,6 +552,9 @@ class Envs:
     # Physical KV-page checks: committed<=allocated + no page alias.
     SGLANG_CHECK_KV_PAGE_INVARIANTS = EnvBool(False)
     SGLANG_TBO_DEBUG = EnvBool(False)
+    # Run initial TBO-eligible forwards through the ordinary layer loop so
+    # their kernels JIT before side-stream collectives can overlap them.
+    SGLANG_TBO_SKIP_INITIAL_FORWARDS = EnvInt(4)
     # Timing probe: run the swap-in fully but skip the host->device KV bytes,
     # measuring the "IO is free" floor. GARBAGE OUTPUT -- benchmarking only.
     SGLANG_DEBUG_HISPARSE_SKIP_IO = EnvBool(False)
@@ -530,6 +584,27 @@ class Envs:
     SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER = EnvBool(False)
     SGLANG_DSPARK_DEBUG_CONFIDENCE_METRICS = EnvBool(False)
     SGLANG_DSPARK_DEBUG_DUMP = EnvTuple(tuple())
+    # Diagnostic-only: retain DSpark per-step records on every TP rank instead
+    # of only the attention-TP leader, and export each rank's payload when the
+    # internal-state endpoint drains the recorder. Both are disabled by
+    # default; the all-rank mode inserts CUDA timing events on every rank.
+    SGLANG_DSPARK_DEBUG_DUMP_ALL_RANKS = EnvBool(False)
+    SGLANG_DSPARK_DEBUG_DUMP_DIR = EnvStr("")
+    # Diagnostic-only: append one JSONL record per write_target_hidden_kv call
+    # (raw captured target_hidden and its post-fc/hidden_norm projection --
+    # dtype, NaN/Inf, and summary stats) to this path. Empty (default) disables
+    # the hook entirely; eager mode only (no CUDA-graph-safe host sync guard).
+    SGLANG_DSPARK_DEBUG_HIDDEN_DUMP_PATH = EnvStr("")
+    # Diagnostic-only: append one JSONL record per *suspicious* accepted token
+    # -- one whose target probability is below
+    # SGLANG_DSPARK_DEBUG_ACCEPT_P_THRESHOLD. Correct rejection sampling accepts
+    # a draft token with probability min(1, p/q) and resamples the bonus from
+    # the residual (p-q)+, so neither can commit a token the target gave
+    # near-zero mass. Recording (p, q, coin) for the ones that slip through
+    # localizes which of the two paths is at fault. Empty (default) disables
+    # the hook; it costs one env read per accept call when off.
+    SGLANG_DSPARK_DEBUG_ACCEPT_DUMP_PATH = EnvStr("")
+    SGLANG_DSPARK_DEBUG_ACCEPT_P_THRESHOLD = EnvFloat(1e-6)
     SGLANG_DSPARK_LOG_SPS_PRED_INTERVAL = EnvInt(0)
     SGLANG_DSPARK_STS_COLLECT_PATH = EnvStr("")
     SGLANG_DSPARK_BLOCK_ACCEPT_ESTIMATE_PATH = EnvStr("")
@@ -552,6 +627,11 @@ class Envs:
     SGLANG_DSPARK_NVLINK_VOCAB_GATHER = EnvBool(True)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
+    # Overrides the DFLASH/DSpark draft attention's sliding-window size.
+    # None keeps the checkpoint-declared window unchanged.
+    SGLANG_FORCE_DFLASH_DRAFT_SWA_WINDOW = EnvInt(None)
+    # Debug-only, reference-counted torch profiling for complete requests.
+    SGLANG_DEBUG_AUTO_PROFILE_REQUESTS = EnvBool(False)
 
     # ===================================================================
     # Memory pools and KV-cache sizing
@@ -588,6 +668,18 @@ class Envs:
     SGLANG_AITER_PAGED_PREFILL_ASM = EnvBool(True)
     # size the KV pool after CUDA-graph capture
     SGLANG_ENABLE_POST_CAPTURE_KV_SIZING = EnvBool(False)
+
+    # NVFP4 KV cache (--kv-cache-dtype nvfp4): calibration amax for the fixed
+    # global scale (global_scale = amax / 448; see MHATokenToKVPoolNVFP4).
+    # Must stay constant for the pool's lifetime and be IDENTICAL on all PD
+    # engines; a moderate overestimate is safe (E4M3 block scales keep
+    # relative precision), an underestimate >6x clips block scales.
+    SGLANG_NVFP4_KV_CACHE_AMAX = EnvFloat(64.0)
+    # Kill-switch: fall back from the fused Triton quantize+scatter KV write
+    # to the flashinfer nvfp4_kv_quantize + separate-scatter path (for A/B
+    # debugging on hardware bring-up). Non-power-of-two head_dim selects the
+    # fallback automatically at pool init regardless of this flag.
+    SGLANG_NVFP4_DISABLE_FUSED_KV_WRITE = EnvBool(False)
 
     # ===================================================================
     # Scheduler token budgeting and admission
@@ -631,6 +723,14 @@ class Envs:
     SGLANG_SCHEDULER_SKIP_ALL_GATHER = EnvBool(False)
     SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE = EnvBool(False)
     SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION = EnvBool(False)
+    # TP ranks must agree on the decoded-token counter. Speculative decoding
+    # samples per rank, so a rank that accepts a different number of draft
+    # tokens drifts and the group deadlocks at a later collective; the drift is
+    # visible minutes earlier. 0 disables the check.
+    SGLANG_TP_DRIFT_CHECK_INTERVAL = EnvInt(1)
+    # Consecutive divergent checks before the rank takes itself down. >1 so a
+    # single racy read cannot kill a healthy worker.
+    SGLANG_TP_DRIFT_EXIT_AFTER = EnvInt(3)
     SGLANG_REQ_WAITING_TIMEOUT = EnvFloat(-1)  # in seconds
     SGLANG_REQ_RUNNING_TIMEOUT = EnvFloat(-1)  # in seconds
     # For non-streaming requests, the scheduler still flushes intermediate
@@ -755,6 +855,11 @@ class Envs:
     # HiCache host<->device transfers use the TMA staging kernel when the GPU
     # (sm_90+), row size and page size allow; set to 0 to force the register kernel.
     SGLANG_HICACHE_TMA_TRANSFER = EnvBool(True)
+    # write_back: demote an internal node's SWA KV to host before an SWA-only
+    # tombstone. Off drops it, as without HiCache; only a match ending within a window
+    # below that node loses it. Under CC the synchronous D->H copy took 8% of DSV4.1
+    # PD prefill scheduler time while adding no cache hits (2026-10-18).
+    SGLANG_ENABLE_HICACHE_SWA_TOMBSTONE_BACKUP = EnvBool(True)
     # Base token count for each MLA/DSA dedup broadcast chunk.
     SGLANG_MLA_DEDUP_CHUNK_TOKENS = EnvInt(2048)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
@@ -785,6 +890,11 @@ class Envs:
     # ===================================================================
     # Staging buffer for heterogeneous TP KV transfer
     SGLANG_DISAGG_STAGING_BUFFER = EnvBool(False)
+    # 'allgather' (default): existing behavior, every CP rank materializes the
+    # full sequence's KV. 'ring': zigzag ring-attention, no rank ever holds
+    # more than its own local shard + one transient received shard.
+    SGLANG_CP_ATTN_MODE = EnvStr("allgather")
+    SGLANG_DISAGG_STAGING_BUFFER_SIZE_MB = EnvInt(64)
     SGLANG_DISAGG_STAGING_POOL_SIZE_MB = EnvInt(4096)
     # TODO(yangminl): remove SGLANG_STAGING_USE_TORCH and the torch fallback in
     # staging_buffer.py once Triton kernels are fully validated in production.
@@ -805,6 +915,15 @@ class Envs:
     # ===================================================================
     SGLANG_HICACHE_MOONCAKE_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_MOONCAKE_REUSE_TE = EnvBool(True)
+    # Override the auto-detected hostname the MooncakeTransferEngine binds/
+    # advertises for inter-engine KV transfer. When all engines run as
+    # processes on the same host/kernel (single-node deployment), forcing
+    # this to 127.0.0.1 routes transfer traffic over loopback instead of
+    # whatever interface get_local_ip_auto() picks up -- avoids paying
+    # whatever cost/fragility that interface's networking backend has
+    # (e.g. a VM's usermode/SLIRP netdev) for traffic that never actually
+    # needs to leave the machine. Unset (None) preserves prior behavior.
+    SGLANG_MOONCAKE_HOSTNAME_OVERRIDE = EnvStr(None)
     MOONCAKE_MASTER = EnvStr(None)
     MOONCAKE_CLIENT = EnvStr(None)
     MOONCAKE_LOCAL_HOSTNAME = EnvStr("localhost")
@@ -1061,6 +1180,13 @@ class Envs:
     # traffic with a small accuracy tradeoff and require FC2 reduce outside the
     # kernel.
     SGLANG_FLASHINFER_MEGAMOE_COMBINE_DTYPE = EnvStr("bf16")
+    # Diagnostic-only switches for DSpark/DFlash captured target verification.
+    SGLANG_DISABLE_FAST_ATTENTION_PLAN = EnvBool(False)
+    SGLANG_DSPARK_DEBUG_FORCE_SINGLE_SPLIT = EnvBool(False)
+    SGLANG_DSPARK_DEBUG_LOG_PLAN_INFO = EnvBool(False)
+    SGLANG_DSPARK_DEBUG_STASH_TOPK = EnvBool(False)
+    SGLANG_DSPARK_DEBUG_SHADOW_EAGER_VERIFY = EnvBool(False)
+    SGLANG_DSPARK_DEBUG_PROBE_FI_WORKSPACE = EnvBool(False)
     # Enable per-token FP32 activation scaling for serialized ModelOpt FP4 with
     # FlashInfer TRT-LLM or CuTe DSL v2 MoE.
     SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION = EnvBool(False)
@@ -1341,6 +1467,19 @@ class Envs:
     SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB = EnvInt(16 * 1024)
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PULL_SIZE_KB = EnvInt(None)
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB = EnvInt(None)
+    # Allow CustomAllReduceV2 on a process group that spans nodes (MNNVL
+    # fabric). Requires torch symmetric memory to rendezvous across nodes
+    # (fabric handles + IMEX). Graph zero-copy input registration is not
+    # supported in this mode and is disabled; all-reduce inside CUDA graphs
+    # falls back to eager pull from the symm workspace. Auto-enabled on
+    # MNNVL-fabric devices (GB200/GB300) when nnodes > 1; set 0/1 to
+    # override in either direction.
+    SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE = EnvBool(False)
+    # Override CustomAllReduceV2's pull-buffer size (bytes). Unset: library default (16 MiB),
+    # which caps fp8_all_reduce's compressed staging buffer and silently falls back to NCCL
+    # above that size (see parallel_state.py's fp8_all_reduce). Size to the largest all-reduce
+    # message expected on the fp8 path, e.g. chunked-prefill-size * hidden for prefill traffic.
+    SGLANG_CUSTOM_AR_MAX_PULL_BYTES = EnvInt(None)
 
     # ===================================================================
     # RoPE cache
@@ -1369,6 +1508,26 @@ class Envs:
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
+    # Diagnostic-only: log per-TARGET_VERIFY-step cross-DP-rank request-count
+    # skew (max(global_num_tokens) - min(global_num_tokens)) from the
+    # already-all-gathered MLPSyncBatchInfo list. Used to size the sum_bucket
+    # capture window for DSPARK+DP-attention verify (TODO.md J14c); no effect
+    # on serving behavior.
+    SGLANG_LOG_DP_VERIFY_SKEW = EnvBool(False)
+    # Opt-in: capture DSPARK TARGET_VERIFY CUDA graphs under DP attention with
+    # SUM_LEN dp_padding_mode (bucketed on the cross-rank token-count sum)
+    # instead of the MAX_LEN forced by DpPaddingMode.get_default_mode_in_cuda_graph.
+    # Off by default; only takes effect when spec_algorithm is DSPARK, DP
+    # attention's require_mlp_tp_gather is active, and forward_mode is
+    # TARGET_VERIFY -- plain decode and non-DP topologies are unaffected.
+    SGLANG_ENABLE_DSPARK_DP_VERIFY_SUM_CAPTURE = EnvBool(False)
+    # Benchmark-only oracle replay: tokens committed per verify step for requests
+    # with SamplingParams.forced_token_ids. 0 leaves oracle commits off.
+    SGLANG_ORACLE_FIXED_COMMIT_LEN = EnvInt(0)
+    # Half-width (in capture-bucket steps of the local bs ladder) of the
+    # sum_bucket window captured around dp_size * local_bucket. See TODO.md
+    # J14c Milestone 1.
+    SGLANG_DSPARK_DP_VERIFY_SUM_WINDOW = EnvInt(1)
     SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)
     # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift
@@ -1538,6 +1697,13 @@ class Envs:
     # DeepSeek-V4.1 engram host table: keep the tables in host memory (layout
     # below) and gather rows from the GPU instead of sharding them over HBM.
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
+    # Eager CPU lookup from shared checkpoint mappings; CUDA graphs must be off.
+    SGLANG_DSV41_ENGRAM_CPU_STAGING = EnvBool(False)
+    # CPU staging only: gather the rows of both Engram layers on a worker thread
+    # from one combined id copy at the start of each step (prefill, decode, verify).
+    SGLANG_OPT_DSV41_ENGRAM_STAGING_PREFETCH = EnvBool(False)
+    # OpenMP threads of that worker's gathers; 0 keeps the process-wide torch value.
+    SGLANG_DSV41_ENGRAM_GATHER_THREADS = EnvInt(0)
     # "shared" is one buffer for the whole TP group, mapped by every rank, with no
     # lookup all-reduce (the ranks must share a PID namespace); "per_rank" is one
     # anonymous mapping per rank holding only its rows, gathered with the
@@ -1557,15 +1723,100 @@ class Envs:
     SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS = EnvInt(8192)
     SGLANG_OPT_USE_JIT_INDEXER_METADATA = EnvBool(True)
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
+    SGLANG_OPT_FUSE_C4_FP4_STORE = EnvBool(True)
     SGLANG_EXPERIMENTAL_ONLINE_C128_MTP = EnvBool(False)
     SGLANG_DSV4_COMPRESS_STATE_DTYPE = EnvStr("float32")
     # Run the DeepSeek-V4.1 ratio-1/2 prefill indexer on the torch path instead
     # of the DeepGEMM dense fp4 logits kernel (test oracle / fallback).
     SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
+    # DeepSeek-V4.1 breakable prefill graph: run the ratio-1/2 index layers as an eager
+    # break on the live rows so contexts past the 16K captured-indexer window replay, and
+    # leave an unset prefill max_seq_len uncapped. Not validated with bounded SWA replay;
+    # ignored under context parallelism.
+    SGLANG_OPT_DSV41_PREFILL_GRAPH_EAGER_INDEXER = EnvBool(False)
+    # DeepSeek-V4.1 CED split for PD (set on both workers): prefill builds and runs
+    # only the encoder layers (through the last kv_source layer) and hands their KV
+    # plus a wider SWA window to decode; decode replays each prompt's tail through
+    # every layer (decoder SWA bounded replay) to seed the late-layer windows, the
+    # first token and the DSpark draft ring.
+    SGLANG_OPT_DSV41_CED_SPLIT = EnvBool(False)
+    # DeepSeek-V4.1 prefill-side tail for PD (prefill only, exclusive with the CED
+    # split): a TP1 x PP2 prefill runs every layer, the layers after the last
+    # kv_source layer only over each request's bounded prompt tail, and DSpark on
+    # the last stage; decode takes the ordinary handoff.
+    SGLANG_OPT_DSV41_PREFILL_TAIL = EnvBool(False)
+    # Non-synchronizing scheduler and CUDA-event timing for decode tail replay.
+    SGLANG_DSV41_CED_TAIL_TIMING = EnvBool(False)
+    SGLANG_DSV41_CED_TAIL_PROFILE_DIR = EnvStr("")
+    # A/B the remaining explicit pinned uploads and tail shape synchronization.
+    SGLANG_OPT_DSV41_ASYNC_TAIL_METADATA = EnvBool(False)
+    # CED tail graphs: a revision tag for captured graphs, opt-in encoder and late
+    # layer graphs (encoder graphs at exact live row counts by default), and eager
+    # cross-checks of graph outputs (first replay per shape, or every replay).
+    SGLANG_DSV41_CED_TAIL_GRAPH_REVISION = EnvInt(0)
+    SGLANG_DSV41_CED_TAIL_ENCODER_GRAPH = EnvBool(False)
+    SGLANG_DSV41_CED_TAIL_ENCODER_EXACT_ROWS = EnvBool(True)
+    SGLANG_DSV41_CED_TAIL_LATE_GRAPH = EnvBool(False)
+    SGLANG_DSV41_CED_TAIL_GRAPH_CHECK = EnvBool(False)
+    SGLANG_DSV41_CED_TAIL_GRAPH_CHECK_EVERY = EnvBool(False)
+    # 1 preserves immediate dispatch. Larger values coalesce ready CED tails into
+    # one replay, waiting at most MAX_WAIT_MS for the batch to fill.
+    SGLANG_DSV41_CED_TAIL_BATCH_SIZE = EnvInt(1)
+    SGLANG_DSV41_CED_TAIL_MAX_WAIT_MS = EnvInt(1000)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
 
-    # cache, GEMM, and distributed
+    # ===================================================================
+    # DeepSeek V4 - cache, GEMM, and distributed
+    # ===================================================================
+    # DeepGemm Mega MoE
+    SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE = EnvBool(False)
+    SGLANG_OPT_FIX_MEGA_MOE_MEMORY = EnvBool(False)
+
+    # TopK
+    SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK = EnvBool(True)
+
+    # Reroutes the generic fp8 per-token-group quant (every model, not just MiniMax)
+    # to the V1 JIT kernel. Off by default; V1 is byte-identical to V2.
+    SGLANG_OPT_USE_JIT_PER_TOKEN_GROUP_QUANT = EnvBool(False)
+    # Kill-switch for deferring the FutureMap's blocking exact seq-lens
+    # mirror pull (overlap scheduling + DSPARK) from run_batch entry to the
+    # tick's first exact consumer (the draft plan / verify prep), which lets
+    # host prep overlap the previous verify's GPU tail. Set to 1 to restore
+    # the eager blocking resolve.
+    SGLANG_OPT_DISABLE_SPEC_SEQ_LENS_DEFER = EnvBool(False)
+    # Kill-switch for running fast_prefill_plan's compiled FlashInfer plan on
+    # a per-device side stream with scratch workspaces. Under GPU confidential
+    # computing the plan's internal pinned-to-device copy blocks the HOST
+    # until the target stream drains; on the main stream that serializes the
+    # scheduler behind peer-gated DP-attention allgathers every tick. Set to
+    # 1 to restore the direct main-stream plan call.
+    SGLANG_OPT_DISABLE_FLASHINFER_SIDE_STREAM_PLAN = EnvBool(False)
+    # A uniformly-sliding draft is allocated one KV slot per TARGET token, so it
+    # holds a full-context pool to read a 1024-token window. Opt in to size it as
+    # a per-request ring instead. Off by default: a ring that under-covers the
+    # window degrades accept length SILENTLY, so it must be qualified against a
+    # known accept-length baseline before being trusted.
+    SGLANG_OPT_DRAFT_SWA_RING = EnvBool(False)
+    # Window, in tokens, for the ring above. 0 resolves it from the model:
+    # hf_text_config.sliding_window if set, else the raw checkpoint's value
+    # (HF nulls sliding_window whenever use_sliding_window is absent, which
+    # is why MiniMax-M3-DSpark's declared 1024 does not survive parsing).
+    # Set it explicitly to bound a draft whose config declares no window at
+    # all -- nothing about the draft's attention changes, only how far back
+    # the KV/hidden pool it reads can reach, so a too-small value is not an
+    # error but a silent accept-length cost.
+    SGLANG_OPT_DRAFT_SWA_RING_WINDOW = EnvInt(0)
+
+
+    # DeepSeek-V4 decode/TARGET_VERIFY two-batch-overlap inside CUDA graphs.
+    # This controls both child attention metadata capture/replay and the model
+    # body's capture-time admission. Keep the two decisions coordinated: a TBO
+    # graph using primary/full-batch metadata would silently attend to the
+    # wrong requests. Eager decode/verify TBO does not require this flag.
+    SGLANG_ENABLE_DEEPSEEK_V4_TBO_CUDA_GRAPH = EnvBool(False)
+
+    # GEMM / kernel fusion
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
     # ROCm gfx950: fuse inverse-RoPE into the wo_a mxfp8 quant (aiter
     # inverse_rope_group_quant) instead of a separate fused_rope_inplace + Triton
@@ -1660,6 +1911,12 @@ class Envs:
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)
     SGLANG_DSA_HIP_DISABLE_PRESHUFFLE = EnvBool(False)
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
+    # Opt-in Blackwell paged-MQA/top-k stage fusion. The CuTe MQA epilogue
+    # emits top-k v2's exact 1024-bin coarse histogram while it stores fp32
+    # scores, removing the top-k kernel's first full-width score read. Forced
+    # init/local-token masking is folded into the same epilogue. Keep disabled
+    # until the B300 correctness and end-to-end traffic gates qualify it.
+    SGLANG_OPT_DSA_PAGED_MQA_TOPK_HISTOGRAM = EnvBool(False)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)

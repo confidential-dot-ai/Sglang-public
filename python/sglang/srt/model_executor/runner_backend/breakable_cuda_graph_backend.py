@@ -18,6 +18,7 @@ No torch.compile.
 
 from __future__ import annotations
 
+import dataclasses
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
@@ -26,6 +27,7 @@ import torch
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
@@ -80,6 +82,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         self._debug_eager = debug_eager
         self._shared_output_buffer: Optional[Any] = None
         self._precarve = GraphPoolPrecarve()
+        self._shared_output_rows: int = 0
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
             and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
@@ -99,6 +102,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         set_graph_pool_id(self._pool)
         self._capture_stream = stream
         self._shared_output_buffer = None
+        self._shared_output_rows = 0
         self.begin_cuda_graph_capture()
         try:
             with self.replay_session():
@@ -129,16 +133,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         captured_fn = (
             eager_on_graph(True)(forward_fn) if self._debug_eager else forward_fn
         )
-        size = shape_key.size
-        if self._shared_output_buffer is None:
-            capacity_rows = self._cuda_graph_runner.cuda_graph_output_capacity_rows(
-                warmup_out
-            )
-            if capacity_rows is None:
-                capacity_rows = size
-            self._shared_output_buffer = self._alloc_full_buffer(
-                warmup_out, capacity_rows
-            )
+        buffer_rows = self._ensure_shared_output_buffer(warmup_out)
         with (
             graph_pool_capture_scope(),
             BreakableCUDAGraphCapture(
@@ -150,7 +145,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         ):
             self._precarve.mint()
             out = captured_fn()
-            out_rows = self._output_rows(out, size)
+            out_rows = self._output_rows(out, buffer_rows)
             self._copy_output_to_buffer(out, self._shared_output_buffer, out_rows)
 
         stored = self._slice_output(self._shared_output_buffer, out_rows)
@@ -159,11 +154,83 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         # CUDA graphs retain tensor addresses, not Python tensor lifetimes.
         self._capture_inputs[shape_key] = capture_inputs
 
+    def _ensure_shared_output_buffer(self, warmup_out: Any) -> int:
+        """Allocate (once per capture session) the shared output buffer and
+        return its row capacity.
+
+        The buffer respects the runner's capacity override and the FIRST
+        captured shape's actual output tensors. Capture order is largest-first, so
+        the first shape's rows bound every later shape's. Sized off the
+        output itself, never off shape_key.size, whose unit differs by
+        runner (prefill: tokens; decode: requests) while output rows are
+        always tokens.
+        """
+        rows = self._max_output_rows(warmup_out)
+        capacity_rows = self._cuda_graph_runner.cuda_graph_output_capacity_rows(warmup_out)
+        if capacity_rows is not None:
+            rows = max(rows, capacity_rows)
+        if self._shared_output_buffer is None:
+            self._shared_output_buffer = self._alloc_full_buffer(warmup_out, rows)
+            self._shared_output_rows = rows
+        elif rows > self._shared_output_rows:
+            raise RuntimeError(
+                "BCG capture-order contract violated: a later captured shape "
+                f"produced {rows} output rows but the shared output buffer "
+                f"was sized for {self._shared_output_rows} by the first "
+                "(largest) shape. Capture shapes largest-first."
+            )
+        return self._shared_output_rows
+
+    @classmethod
+    def _max_output_rows(cls, output: Any) -> int:
+        """Largest leading-dim across every tensor in ``output`` (0 if none)."""
+        if output is None:
+            return 0
+        if torch.is_tensor(output):
+            return output.shape[0]
+        if isinstance(output, PPProxyTensors):
+            return max((t.shape[0] for t in output.tensors.values()), default=0)
+        if isinstance(output, LogitsProcessorOutput):
+            return max(
+                (
+                    getattr(output, name).shape[0]
+                    for name in cls._logits_output_tensor_field_names(output)
+                ),
+                default=0,
+            )
+        if isinstance(output, (list, tuple)):
+            return max(
+                (cls._max_output_rows(o) for o in output if o is not None),
+                default=0,
+            )
+        raise TypeError(f"Unsupported BCG output type: {type(output)}")
+
+    @staticmethod
+    def _logits_output_tensor_field_names(output: LogitsProcessorOutput) -> list[str]:
+        """Field names holding a token-row tensor on this instance.
+
+        Only these fields are graph-buffered (allocated once, refreshed by a
+        captured ``.copy_()`` on every replay); every other field (the
+        per-token logprob lists, ``customized_info``, ...) is carried through
+        unchanged from whichever shape captured first. That mirrors the
+        existing post-replay contract: decode/verify capture always runs with
+        ``return_logprob=False`` (decode_cuda_graph_runner), and prefill
+        routes ``return_logprob`` through a required eager tail instead of
+        the graph (prefill_cuda_graph_runner's "requires an eager logits
+        tail" assertion) -- so those fields are never live tensor data here.
+        """
+        return [
+            field.name
+            for field in dataclasses.fields(output)
+            if torch.is_tensor(getattr(output, field.name))
+        ]
+
     def _output_rows(self, output: Any, cap: int) -> int:
         """Leading-dim row count actually produced by the body, clamped to ``cap``.
 
-        A body that shards or prunes its output along dim 0 returns fewer than
-        ``cap`` rows; everything else returns exactly ``cap``.
+        ``cap`` is the shared output buffer's row capacity (the first,
+        largest captured shape's rows). A smaller shape, or a body that
+        shards or prunes its output along dim 0, returns fewer rows.
         """
         runner_rows = self._cuda_graph_runner.cuda_graph_output_rows(output)
         if runner_rows is not None:
@@ -172,6 +239,12 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             return min(cap, output.shape[0])
         if isinstance(output, PPProxyTensors):
             rows = [t.shape[0] for t in output.tensors.values()]
+            return min([cap, *rows])
+        if isinstance(output, LogitsProcessorOutput):
+            rows = [
+                getattr(output, name).shape[0]
+                for name in self._logits_output_tensor_field_names(output)
+            ]
             return min([cap, *rows])
         if isinstance(output, (list, tuple)) and output:
             return min(self._output_rows(o, cap) for o in output if o is not None)
@@ -190,6 +263,16 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                     for key, t in output.tensors.items()
                 }
             )
+        if isinstance(output, LogitsProcessorOutput):
+            return dataclasses.replace(
+                output,
+                **{
+                    name: getattr(output, name).new_empty(
+                        (size, *getattr(output, name).shape[1:])
+                    )
+                    for name in self._logits_output_tensor_field_names(output)
+                },
+            )
         if isinstance(output, tuple):
             return tuple(self._alloc_full_buffer(o, size) for o in output)
         if isinstance(output, list):
@@ -203,6 +286,14 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             return output[:num_tokens]
         if isinstance(output, PPProxyTensors):
             return output[:num_tokens]
+        if isinstance(output, LogitsProcessorOutput):
+            return dataclasses.replace(
+                output,
+                **{
+                    name: getattr(output, name)[:num_tokens]
+                    for name in self._logits_output_tensor_field_names(output)
+                },
+            )
         if isinstance(output, tuple):
             return tuple(self._slice_output(item, num_tokens) for item in output)
         if isinstance(output, list):
@@ -233,6 +324,21 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             for key, tensor in output.tensors.items():
                 self._copy_output_to_buffer(
                     tensor, output_buffer.tensors[key], num_tokens
+                )
+            return
+        if isinstance(output, LogitsProcessorOutput) and isinstance(
+            output_buffer, LogitsProcessorOutput
+        ):
+            names = self._logits_output_tensor_field_names(output)
+            buffer_names = self._logits_output_tensor_field_names(output_buffer)
+            if set(names) != set(buffer_names):
+                raise ValueError(
+                    "BCG LogitsProcessorOutput tensor fields changed between "
+                    f"capture sizes: {sorted(names)} != {sorted(buffer_names)}"
+                )
+            for name in names:
+                self._copy_output_to_buffer(
+                    getattr(output, name), getattr(output_buffer, name), num_tokens
                 )
             return
         if isinstance(output, (list, tuple)) and isinstance(
@@ -276,3 +382,4 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         self._capture_inputs.clear()
         self._pool = None
         self._shared_output_buffer = None
+        self._shared_output_rows = 0

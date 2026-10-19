@@ -205,12 +205,14 @@ def _forward_with_allreduce_fusion(
     post_residual_addition: Optional[torch.Tensor],
     weight: torch.Tensor,
     use_attn_tp_group: bool = True,
+    use_oneshot: Optional[bool] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """Shared allreduce-fused RMSNorm logic usable by any norm."""
     if residual is not None:
         from sglang.srt.distributed import (
             attention_tensor_model_parallel_all_reduce,
-            tensor_model_parallel_all_reduce,
+            moe_expert_parallel_all_reduce,
+            moe_tensor_model_parallel_all_reduce,
             tensor_model_parallel_fused_allreduce_rmsnorm,
         )
         from sglang.srt.layers.flashinfer_comm_fusion import (
@@ -244,6 +246,7 @@ def _forward_with_allreduce_fusion(
                     weight=weight,
                     eps=norm_module.variance_epsilon,
                     max_token_num=max(x.shape[0], 2048),
+                    use_oneshot=use_oneshot,
                     use_attn_tp_group=use_attn_tp_group,
                 )
                 if fused_result[0] is not None:
@@ -259,10 +262,19 @@ def _forward_with_allreduce_fusion(
                     residual = residual.clone()
                 return norm_module.forward(x, residual, None)
 
-            # For AITER route, preserve correctness when fused path is unavailable.
-            if _use_aiter and get_exec().comm.enable_aiter_allreduce_fusion:
-                x = tensor_model_parallel_all_reduce(x)
-                return norm_module.forward(x, residual, None)
+            # Fusion is opportunistic. If its workspace/backend is unavailable
+            # (including the concurrent-decode safety gate), preserve the exact
+            # collective that the unfused communicator path would have used.
+            # Falling through directly to norm_module.forward would silently
+            # normalize a rank-partial tensor.
+            if use_attn_tp_group:
+                x = attention_tensor_model_parallel_all_reduce(x)
+            else:
+                if get_parallel().moe_ep_size > 1:
+                    x = moe_expert_parallel_all_reduce(x)
+                if get_parallel().moe_tp_size > 1:
+                    x = moe_tensor_model_parallel_all_reduce(x)
+            return norm_module.forward(x, residual, None)
 
     return norm_module.forward(x, residual, post_residual_addition)
 
@@ -913,10 +925,17 @@ class RMSNorm(BaseFusedOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
         use_attn_tp_group: bool = True,
+        use_oneshot: Optional[bool] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Forward with allreduce fusion, prioritizing flashinfer fused operations."""
         return _forward_with_allreduce_fusion(
-            self, x, residual, post_residual_addition, self.weight, use_attn_tp_group
+            self,
+            x,
+            residual,
+            post_residual_addition,
+            self.weight,
+            use_attn_tp_group,
+            use_oneshot,
         )
 
     def forward_with_allreduce_fusion_quant_per_group(
@@ -1264,6 +1283,7 @@ class GemmaRMSNorm(BaseFusedOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
         use_attn_tp_group: bool = True,
+        use_oneshot: Optional[bool] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Forward with allreduce fusion; uses 1 + weight for fused kernels."""
         return _forward_with_allreduce_fusion(
@@ -1273,6 +1293,7 @@ class GemmaRMSNorm(BaseFusedOp):
             post_residual_addition,
             self.gemma_weight,
             use_attn_tp_group=True,
+            use_oneshot=use_oneshot,
         )
 
     def forward_with_allreduce_fusion_quant_per_group(

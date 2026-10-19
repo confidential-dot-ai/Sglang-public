@@ -9,11 +9,15 @@ use data_connector::{
 };
 use reqwest::Client;
 use smg_mcp::McpManager;
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 use crate::{
     config::RouterConfig,
-    core::{steps::WorkflowEngines, JobQueue, LoadMonitor, WorkerRegistry, WorkerService},
+    core::{
+        deadlines::{self, DeadlinePolicy},
+        steps::WorkflowEngines,
+        JobQueue, LoadMonitor, WorkerRegistry, WorkerService,
+    },
     middleware::TokenBucket,
     observability::inflight_tracker::InFlightRequestTracker,
     policies::PolicyRegistry,
@@ -328,13 +332,57 @@ impl AppContextBuilder {
         // backend to avoid unnecessary TLS initialization overhead.
         let has_tls_config = config.client_identity.is_some() || !config.ca_certificates.is_empty();
 
+        // Resolved where the client-level clocks are set so the two cannot
+        // drift. `timeout_secs` is the non-streaming total; streaming call
+        // sites replace it via `deadlines::apply_stream_deadline`.
+        let policy = DeadlinePolicy::from_secs(
+            timeout_secs,
+            config.stream_total_timeout_secs,
+            config.request_read_timeout_secs,
+            config.stream_idle_timeout_secs,
+        );
+
         let mut client_builder = Client::builder()
             .pool_idle_timeout(Some(Duration::from_secs(config.pool_idle_timeout_secs)))
             .pool_max_idle_per_host(config.pool_max_idle_per_host)
-            .timeout(Duration::from_secs(timeout_secs))
+            .timeout(policy.total())
             .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
             .tcp_nodelay(true)
             .tcp_keepalive(Some(Duration::from_secs(config.tcp_keepalive_secs)));
+
+        // Covers the wait for response headers, so it bounds a worker that
+        // accepts a connection and never answers. The total deadline above no
+        // longer does that for streams.
+        if let Some(read_timeout) = policy.read() {
+            client_builder = client_builder.read_timeout(read_timeout);
+        }
+
+        if !deadlines::install(policy) {
+            // Not fatal, but this client's clocks and the ones streams
+            // actually get are now different.
+            warn!(
+                "HTTP client rebuilt with a second deadline policy; streaming requests \
+                 continue to use the first one ({:?} total, read {:?}, stream idle {:?})",
+                deadlines::get().total(),
+                deadlines::get().read(),
+                deadlines::get().stream_idle()
+            );
+        }
+
+        info!(
+            "Request deadlines: non-streaming total {:?}, streaming total {}, \
+             socket read {}, stream idle {}",
+            policy.total(),
+            policy
+                .stream_total()
+                .map_or_else(|| "unbounded".to_string(), |d| format!("{:?}", d)),
+            policy
+                .read()
+                .map_or_else(|| "disabled".to_string(), |d| format!("{:?}", d)),
+            policy
+                .stream_idle()
+                .map_or_else(|| "disabled".to_string(), |d| format!("{:?}", d)),
+        );
 
         // Force rustls backend when TLS is configured
         if has_tls_config {
@@ -372,18 +420,20 @@ impl AppContextBuilder {
     }
 
     /// Create rate limiter based on config
+    ///
+    /// `max_concurrent_requests` is a concurrency ceiling, so it needs
+    /// `refill_rate = 0` (the TokenBucket's semaphore mode). A nonzero refill
+    /// makes it an n-per-second throughput limit that never bounds concurrency.
+    /// An explicit `rate_limit_tokens_per_second` opts into that instead.
     fn maybe_rate_limiter(mut self, config: &RouterConfig) -> Self {
         self.rate_limiter = match config.max_concurrent_requests {
             n if n <= 0 => None,
             n => {
-                let rate_limit_tokens = config
+                let refill_rate = config
                     .rate_limit_tokens_per_second
                     .filter(|&t| t > 0)
-                    .unwrap_or(n);
-                Some(Arc::new(TokenBucket::new(
-                    n as usize,
-                    rate_limit_tokens as usize,
-                )))
+                    .unwrap_or(0);
+                Some(Arc::new(TokenBucket::new(n as usize, refill_rate as usize)))
             }
         };
         self

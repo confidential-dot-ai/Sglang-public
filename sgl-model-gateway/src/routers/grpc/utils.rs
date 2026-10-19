@@ -1065,6 +1065,7 @@ mod tests {
                     image_url: ImageUrl {
                         url: "https://example.com/image.jpg".to_string(),
                         detail: None,
+                        extra: Default::default(),
                     },
                 },
                 ContentPart::Text {
@@ -1098,6 +1099,7 @@ mod tests {
                     image_url: ImageUrl {
                         url: "https://example.com/image.jpg".to_string(),
                         detail: Some("high".to_string()),
+                        extra: Default::default(),
                     },
                 },
             ]),
@@ -1156,6 +1158,7 @@ mod tests {
                         image_url: ImageUrl {
                             url: "https://example.com/image.jpg".to_string(),
                             detail: None,
+                            extra: Default::default(),
                         },
                     },
                 ]),
@@ -1183,6 +1186,7 @@ mod tests {
                 image_url: ImageUrl {
                     url: "https://example.com/image.jpg".to_string(),
                     detail: None,
+                    extra: Default::default(),
                 },
             }]),
             name: None,
@@ -1213,6 +1217,7 @@ mod tests {
                         image_url: ImageUrl {
                             url: "https://example.com/image.jpg".to_string(),
                             detail: Some("low".to_string()),
+                            extra: Default::default(),
                         },
                     },
                 ]),

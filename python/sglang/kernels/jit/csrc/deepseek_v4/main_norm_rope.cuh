@@ -8,6 +8,7 @@
 #include <sgl_kernel/vec.cuh>
 #include <sgl_kernel/warp.cuh>
 
+#include <sgl_kernel/deepseek_v4/fp4_utils.cuh>
 #include <sgl_kernel/deepseek_v4/fp8_utils.cuh>
 #include <sgl_kernel/deepseek_v4/kv_layout.cuh>
 
@@ -22,20 +23,6 @@ namespace sglang {
 using deepseek_v4::fp8::cast_to_ue8m0;
 using deepseek_v4::fp8::inv_scale_ue8m0;
 using deepseek_v4::fp8::pack_fp8;
-
-SGL_DEVICE uint8_t quant_fp4_e2m1(float x) {
-  const float ax = fminf(fabsf(x), 6.0f);
-  uint8_t idx = 0;
-  idx += ax > 0.25f;
-  idx += ax > 0.75f;
-  idx += ax > 1.25f;
-  idx += ax > 1.75f;
-  idx += ax > 2.5f;
-  idx += ax > 3.5f;
-  idx += ax > 5.0f;
-  if (x < 0.0f && idx != 0) idx |= 0x8;
-  return idx;
-}
 
 // 8 warps per block: warp-per-(token, head) work-item dispatch (Q kernel).
 // 256 threads lifts scheduler occupancy (~38% -> ~86%) on the fp8-quant path;
@@ -591,7 +578,11 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQ
 
   const uint32_t batch_id = work_id / params.num_heads;
   const auto input_ptr = static_cast<const DType*>(params.q_input) + work_id * kHeadDim;
-  const auto position = static_cast<int32_t>(static_cast<const PosT*>(params.positions)[batch_id]);
+  int32_t position = 0;
+  if (lane_id == 0) {
+    position = static_cast<int32_t>(static_cast<const PosT*>(params.positions)[batch_id]);
+  }
+  position = __shfl_sync(0xFFFFFFFFu, position, 0, kWarpThreads);
   const auto rope_cache = params.rope_cache + position * kRopeDim;
 
   // Lane 0 prefetches the weight scalar for this (token, head) work item.
@@ -602,8 +593,11 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQ
   PDLWaitPrimary<kUsePDL>();
   Float4 data, freq;
   const uint32_t head_id = work_id - batch_id * params.num_heads;
-  const auto weight_val =
-      cast<float>(static_cast<const DType*>(params.weight)[batch_id * params.weight_stride_batch + head_id]);
+  float weight_val = 0.0f;
+  if (lane_id == 0) {
+    weight_val =
+        cast<float>(static_cast<const DType*>(params.weight)[batch_id * params.weight_stride_batch + head_id]);
+  }
 
   // part 1: load (no norm). Each lane owns a 4-elem pack.
   {
@@ -690,7 +684,9 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQ
     // q_fp8 row pointer: 128 fp8 / row = 32 OutStorage / row, one per lane.
     auto out_row = static_cast<uint8_t*>(params.q_fp8) + work_id * kHeadDim;
     result.store(out_row, lane_id);
-    params.weights_out[work_id] = weight_val * params.weight_scale * scale;
+    if (lane_id == 0) {
+      params.weights_out[work_id] = weight_val * params.weight_scale * scale;
+    }
   }
 }
 
@@ -825,12 +821,19 @@ fused_q_indexer_rope_hadamard_fp4_quant(const __grid_constant__ FusedQIndexerRop
 
   const uint32_t batch_id = work_id / params.num_heads;
   const auto input_ptr = static_cast<const DType*>(params.q_input) + work_id * kHeadDim;
-  const auto position = static_cast<int32_t>(static_cast<const PosT*>(params.positions)[batch_id]);
+  int32_t position = 0;
+  if (lane_id == 0) {
+    position = static_cast<int32_t>(static_cast<const PosT*>(params.positions)[batch_id]);
+  }
+  position = __shfl_sync(0xFFFFFFFFu, position, 0, kWarpThreads);
   const auto freqs_cis = params.freqs_cis + position * kRopeDim;
 
   PDLWaitPrimary<kUsePDL>();
   Float4 data, freq;
-  const auto weight_val = cast<float>(static_cast<const DType*>(params.weight)[work_id]);
+  float weight_val = 0.0f;
+  if (lane_id == 0) {
+    weight_val = cast<float>(static_cast<const DType*>(params.weight)[work_id]);
+  }
 
   {
     Storage input_vec;
@@ -904,15 +907,18 @@ fused_q_indexer_rope_hadamard_fp4_quant(const __grid_constant__ FusedQIndexerRop
     const auto scale_raw = fmaxf(1e-4f, local_max) / 6.0f;
     const auto scale_ue8m0 = static_cast<uint8_t>(cast_to_ue8m0(scale_raw));
     const auto inv_scale = inv_scale_ue8m0(scale_ue8m0);
-    const uint8_t packed0 = quant_fp4_e2m1(data[0] * inv_scale) | (quant_fp4_e2m1(data[1] * inv_scale) << 4);
-    const uint8_t packed1 = quant_fp4_e2m1(data[2] * inv_scale) | (quant_fp4_e2m1(data[3] * inv_scale) << 4);
-    const uint16_t packed = static_cast<uint16_t>(packed0) | (static_cast<uint16_t>(packed1) << 8);
+    const uint8_t packed0 =
+        deepseek_v4::fp4::quant_e2m1x2(data[0] * inv_scale, data[1] * inv_scale);
+    const uint8_t packed1 =
+        deepseek_v4::fp4::quant_e2m1x2(data[2] * inv_scale, data[3] * inv_scale);
+    const uint16_t packed =
+        static_cast<uint16_t>(packed0) | (static_cast<uint16_t>(packed1) << 8);
     auto out_row = static_cast<uint8_t*>(params.q_fp4) + work_id * (kHeadDim / 2);
     reinterpret_cast<uint16_t*>(out_row)[lane_id] = packed;
     if ((lane_id & 7) == 0) {
       reinterpret_cast<uint8_t*>(params.q_sf + work_id)[lane_id >> 3] = scale_ue8m0;
     }
-    params.weights_out[work_id] = weight_val * params.weight_scale;
+    if (lane_id == 0) params.weights_out[work_id] = weight_val * params.weight_scale;
   }
 }
 

@@ -83,6 +83,12 @@ logger = logging.getLogger(__name__)
 
 SCHEDULER_PIDS_ARG = "scheduler_pids"
 
+# Token prefix length hashed by the prefix_affinity load-balance method.
+# Long enough that prompts sharing a real cached prefix (shared system
+# prompts, shared document sets) collide, short enough that hashing stays
+# negligible per request. Prompts shorter than this hash their full length.
+PREFIX_AFFINITY_TOKENS = 512
+
 
 class LoadBalanceMethod(Enum):
     """Load balance method."""
@@ -91,6 +97,7 @@ class LoadBalanceMethod(Enum):
     FOLLOW_BOOTSTRAP_ROOM = auto()
     TOTAL_REQUESTS = auto()
     TOTAL_TOKENS = auto()
+    PREFIX_AFFINITY = auto()
 
     @classmethod
     def from_str(cls, method: str):
@@ -168,6 +175,7 @@ class DataParallelController:
             LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM: self.follow_bootstrap_room_scheduler,
             LoadBalanceMethod.TOTAL_REQUESTS: self.total_requests_scheduler,
             LoadBalanceMethod.TOTAL_TOKENS: self.total_tokens_scheduler,
+            LoadBalanceMethod.PREFIX_AFFINITY: self.prefix_affinity_scheduler,
         }
         self.dispatching = dispatch_lookup[self.load_balance_method]
         self.refresh_load_budget_on_dispatch = self.load_balance_method in (
@@ -774,6 +782,35 @@ class DataParallelController:
         )
         target_rank = req.bootstrap_room % len(self.workers)
         sock_send(self.workers[target_rank], req)
+
+    def prefix_affinity_scheduler(self, req: Req):
+        """Route same-prefix requests to the same DP rank.
+
+        Each DP-attention rank owns an independent radix tree, so
+        round-robin scatters requests that share a long cacheable prefix
+        (shared system prompts, shared document sets, repeated prompts)
+        across ranks and every one of them prefills from scratch. Hashing
+        the first PREFIX_AFFINITY_TOKENS input tokens pins all sharers to
+        one rank's tree. Deterministic only within one server lifetime,
+        which is all a per-rank in-memory cache can use anyway. Loadwise
+        this trusts prefix diversity to spread ranks evenly; workloads
+        with a single global prefix should stay on round_robin/
+        total_tokens instead.
+        """
+        if self.maybe_external_dp_rank_routing(req):
+            return
+        active = self._active_workers
+        if not active:
+            raise RuntimeError("No active DP workers are available for routing.")
+        prefix = tuple(req.input_ids[:PREFIX_AFFINITY_TOKENS] or ())
+        slot = active[hash(prefix) % len(active)]
+        if not self.status[slot]:
+            # The affine rank is down; keep serving via round robin rather
+            # than stalling on cache locality.
+            self.round_robin_scheduler(req)
+            return
+        logger.debug(f"Choose worker {slot} (prefix affinity)")
+        sock_send(self.workers[slot], req)
 
     def total_requests_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):

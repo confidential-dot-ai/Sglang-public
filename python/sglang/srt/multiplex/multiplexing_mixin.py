@@ -152,6 +152,13 @@ class SchedulerMultiplexMixin:
                 # process decode batch
                 if running_batch and not running_batch.is_empty():
                     decode_result = self.run_batch(running_batch)
+                    # run_batch can execute a CCD chunk (its overlap branch
+                    # is what serves pdmux decode when enable_overlap is
+                    # on); every loop that reaches it must claim/drain the
+                    # chunk's extra per-tick results, or the tokens are
+                    # silently lost and run_batch's tripwire raises on the
+                    # next chunk (the checkpoint-123 failure class).
+                    ccd_extras, ccd_extras_snapshot = self._take_ccd_extras()
                     decode_done = True
                 else:
                     decode_done = False
@@ -194,6 +201,13 @@ class SchedulerMultiplexMixin:
             with torch.cuda.stream(decode_stream):
                 decode_stream.synchronize()
                 if decode_done:
+                    # Extras are the chunk's ticks 1..N-1; decode_result is
+                    # tick N. Drain extras first so tokens commit in tick
+                    # order (the overlap loops get this ordering for free
+                    # from their one-iteration result delay).
+                    self._drain_ccd_extras(
+                        running_batch, ccd_extras, ccd_extras_snapshot
+                    )
                     self.process_batch_result(running_batch, decode_result)
 
             with torch.cuda.stream(prefill_stream), pdmux_prefill_tp_group():

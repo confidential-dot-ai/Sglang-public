@@ -760,7 +760,7 @@ class ServingChatTestCase(unittest.TestCase):
         self.tm.server_args.reasoning_parser = "kimi_k2"
         self.tm.server_args.tool_call_parser = "kimi_k2"
         self.chat.reasoning_parser = "kimi_k2"
-        self.chat.tool_call_parser = "kimi_k2"
+        self.chat.tokenizer_manager._config_overrides["tool_call_parser"] = "kimi_k2"
 
         req = ChatCompletionRequest(
             model="x",
@@ -830,7 +830,7 @@ class ServingChatTestCase(unittest.TestCase):
         self.tm.server_args.reasoning_parser = "kimi_k2"
         self.tm.server_args.tool_call_parser = "kimi_k2"
         self.chat.reasoning_parser = "kimi_k2"
-        self.chat.tool_call_parser = "kimi_k2"
+        self.chat.tokenizer_manager._config_overrides["tool_call_parser"] = "kimi_k2"
 
         req = ChatCompletionRequest(
             model="x",
@@ -1031,7 +1031,7 @@ class ServingChatTestCase(unittest.TestCase):
         self.tm.server_args.reasoning_parser = "kimi_k2"
         self.tm.server_args.tool_call_parser = "kimi_k2"
         self.chat.reasoning_parser = "kimi_k2"
-        self.chat.tool_call_parser = "kimi_k2"
+        self.chat.tokenizer_manager._config_overrides["tool_call_parser"] = "kimi_k2"
         self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
 
         req = ChatCompletionRequest(
@@ -1066,7 +1066,7 @@ class ServingChatTestCase(unittest.TestCase):
         self.tm.server_args.reasoning_parser = "kimi_k2"
         self.tm.server_args.tool_call_parser = "kimi_k2"
         self.chat.reasoning_parser = "kimi_k2"
-        self.chat.tool_call_parser = "kimi_k2"
+        self.chat.tokenizer_manager._config_overrides["tool_call_parser"] = "kimi_k2"
         self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
 
         req = ChatCompletionRequest(
@@ -1102,7 +1102,7 @@ class ServingChatTestCase(unittest.TestCase):
         self.tm.server_args.reasoning_parser = "kimi_k2"
         self.tm.server_args.tool_call_parser = "kimi_k2"
         self.chat.reasoning_parser = "kimi_k2"
-        self.chat.tool_call_parser = "kimi_k2"
+        self.chat.tokenizer_manager._config_overrides["tool_call_parser"] = "kimi_k2"
         self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
 
         req = ChatCompletionRequest(
@@ -1217,7 +1217,7 @@ class ServingChatTestCase(unittest.TestCase):
         self.tm.server_args.reasoning_parser = "kimi_k2"
         self.tm.server_args.tool_call_parser = "kimi_k2"
         self.chat.reasoning_parser = "kimi_k2"
-        self.chat.tool_call_parser = "kimi_k2"
+        self.chat.tokenizer_manager._config_overrides["tool_call_parser"] = "kimi_k2"
         self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
 
         req = ChatCompletionRequest(
@@ -1260,7 +1260,7 @@ class ServingChatTestCase(unittest.TestCase):
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"
         self.chat.chat_encoding_spec = "kimi_k3"
-        self.chat.tool_call_parser = "kimi_k3"
+        self.chat.tokenizer_manager._config_overrides["tool_call_parser"] = "kimi_k3"
         self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
         tool = {
             "type": "function",
@@ -1315,7 +1315,7 @@ class ServingChatTestCase(unittest.TestCase):
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"
         self.chat.chat_encoding_spec = "kimi_k3"
-        self.chat.tool_call_parser = "kimi_k3"
+        self.chat.tokenizer_manager._config_overrides["tool_call_parser"] = "kimi_k3"
         self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
         request = ChatCompletionRequest(
             model="x",
@@ -1926,7 +1926,7 @@ class ServingChatTestCase(unittest.TestCase):
         """Ensure non-streaming tool_call.id increase with tool calls history for kimi_k2 parser."""
 
         # Force kimi_k2 parser
-        self.chat.tool_call_parser = "kimi_k2"
+        self.chat.tokenizer_manager._config_overrides["tool_call_parser"] = "kimi_k2"
 
         # Prepare request with tool calls history
         req = ChatCompletionRequest(
@@ -2014,7 +2014,7 @@ class ServingChatTestCase(unittest.TestCase):
     def test_non_streaming_tool_call_index_is_the_call_ordinal(self):
         """Two calls to one tool are numbered 0 and 1, as in the streaming deltas,
         not by the detector's tool_index (0 for both)."""
-        self.chat.tool_call_parser = "deepseekv4"
+        self.chat.tokenizer_manager._config_overrides["tool_call_parser"] = "deepseekv4"
         tools = [{"type": "function", "function": {"name": "get_weather"}}]
         with patch(
             "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser"
@@ -2050,7 +2050,7 @@ class ServingChatTestCase(unittest.TestCase):
     def test_required_tool_choice_skips_json_fallback_for_native_parser(self):
         """A structural-tag parser owns the output format, so a missing tool
         call must not be pushed through the json_schema array fallback."""
-        self.chat.tool_call_parser = "kimi_k3"
+        self.chat.tokenizer_manager._config_overrides["tool_call_parser"] = "kimi_k3"
         tools = [
             {
                 "type": "function",
@@ -2094,7 +2094,7 @@ class ServingChatTestCase(unittest.TestCase):
     def test_truncated_native_tool_call_logs_and_drops(self):
         """A tools section cut off before its closing tag parses to zero calls
         without raising; the sync path used to drop it with no log at all."""
-        self.chat.tool_call_parser = "kimi_k3"
+        self.chat.tokenizer_manager._config_overrides["tool_call_parser"] = "kimi_k3"
         tools = [
             {
                 "type": "function",
@@ -2130,7 +2130,7 @@ class ServingChatTestCase(unittest.TestCase):
     def test_required_tool_choice_json_fallback_tolerates_odd_shapes(self):
         """Parsers without a structural tag keep the JSON array fallback, but a
         non-array payload degrades instead of raising an opaque TypeError."""
-        self.chat.tool_call_parser = "glm45"
+        self.chat.tokenizer_manager._config_overrides["tool_call_parser"] = "glm45"
         tools = [
             {
                 "type": "function",
@@ -2236,7 +2236,7 @@ class ServingChatTestCase(unittest.TestCase):
         """Ensure streaming first chunk tool_call.id increase with tool calls history for kimi_k2 parser."""
 
         # Force kimi_k2 parser
-        self.chat.tool_call_parser = "kimi_k2"
+        self.chat.tokenizer_manager._config_overrides["tool_call_parser"] = "kimi_k2"
 
         # Prepare request with tool calls history
         req = ChatCompletionRequest(
@@ -3036,7 +3036,7 @@ class ServingChatTestCase(unittest.TestCase):
 
     def test_streaming_logprobs_flushed_when_tool_parser_buffers_delta(self):
         """Logprobs must be flushed on a standalone chunk when the tool parser emits no content delta."""
-        self.chat.tool_call_parser = "hermes"
+        self.chat.tokenizer_manager._config_overrides["tool_call_parser"] = "hermes"
 
         content = {
             "text": "(<",
@@ -3087,7 +3087,7 @@ class ServingChatTestCase(unittest.TestCase):
         empty-delta logprobs chunk — clients expect each chunk to carry real
         content/reasoning/tool_calls or a finish_reason."""
         self.chat.reasoning_parser = None
-        self.chat.tool_call_parser = None
+        self.chat.tokenizer_manager._config_overrides["tool_call_parser"] = None
 
         async def _mock_generate():
             yield {
@@ -4340,6 +4340,172 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(t, tool_calls)
 
 
+def _call(call_id, name="get_weather", args='{"location":"Beijing"}'):
+    return {
+        "id": call_id,
+        "type": "function",
+        "function": {"name": name, "arguments": args},
+    }
+
+
+class TestToolCallIdValidation(CustomTestCase):
+    """Tool replies must line up with the calls that were made.
+
+    Both shapes below were previously served as if valid: a reply attributed
+    to no call, and an assistant turn continued from a state that never
+    existed because only some of its calls were answered.
+    """
+
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        self.chat = OpenAIServingChat(_MockTokenizerManager(), _MockTemplateManager())
+
+    def _req(self, messages):
+        return ChatCompletionRequest(model="test-model", messages=messages)
+
+    def test_clean_conversation_passes(self):
+        self.assertIsNone(
+            self.chat._validate_tool_call_ids(
+                self._req([{"role": "user", "content": "hi"}])
+            )
+        )
+
+    def test_outstanding_calls_are_valid_mid_flight(self):
+        # The caller is about to run the tools. This must stay valid.
+        req = self._req(
+            [
+                {"role": "user", "content": "x"},
+                {"role": "assistant", "content": None, "tool_calls": [_call("c1")]},
+            ]
+        )
+        self.assertIsNone(self.chat._validate_tool_call_ids(req))
+
+    def test_orphan_tool_call_id_rejected(self):
+        req = self._req(
+            [
+                {"role": "user", "content": "x"},
+                {"role": "assistant", "content": None, "tool_calls": [_call("c1")]},
+                {"role": "tool", "tool_call_id": "nope", "content": "sunny"},
+            ]
+        )
+        err = self.chat._validate_tool_call_ids(req)
+        self.assertIsNotNone(err)
+        self.assertIn("nope", err)
+
+    def test_partially_answered_turn_rejected(self):
+        req = self._req(
+            [
+                {"role": "user", "content": "x"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [_call("c1"), _call("c2")],
+                },
+                {"role": "tool", "tool_call_id": "c1", "content": "sunny"},
+            ]
+        )
+        err = self.chat._validate_tool_call_ids(req)
+        self.assertIsNotNone(err)
+        self.assertIn("c2", err)
+
+    def test_fully_answered_turn_passes(self):
+        req = self._req(
+            [
+                {"role": "user", "content": "x"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [_call("c1"), _call("c2")],
+                },
+                {"role": "tool", "tool_call_id": "c1", "content": "sunny"},
+                {"role": "tool", "tool_call_id": "c2", "content": "rainy"},
+            ]
+        )
+        self.assertIsNone(self.chat._validate_tool_call_ids(req))
+
+
+class TestModelNameValidation(CustomTestCase):
+    """An unserved model name used to be answered normally and echoed back, so
+    a client that typo'd a name or failed over to the wrong deployment got
+    plausible output from the wrong model with no signal.
+    """
+
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        tm = _MockTokenizerManager()
+        # A bare Mock() makes enable_lora truthy, which sends the check down
+        # the adapter-registry path; pin it so the base-name rule is exercised.
+        tm.server_args.enable_lora = False
+        self.chat = OpenAIServingChat(tm, _MockTemplateManager())
+
+    def test_served_name_accepted(self):
+        self.assertIsNone(self.chat._validate_model_name("test-model"))
+
+    def test_model_path_accepted(self):
+        self.assertIsNone(
+            self.chat._validate_model_name("deepseek-ai/DeepSeek-V4-Flash")
+        )
+
+    def test_unknown_name_rejected(self):
+        err = self.chat._validate_model_name("nonexistent-model-xyz")
+        self.assertIsNotNone(err)
+        self.assertIn("nonexistent-model-xyz", err)
+
+    def test_adapter_suffix_validates_base_name(self):
+        # `base:adapter` syntax -- the base half is what must be served.
+        self.assertIsNone(self.chat._validate_model_name("test-model:some-adapter"))
+        self.assertIsNotNone(self.chat._validate_model_name("wrong-base:some-adapter"))
+
+    def test_absent_model_is_not_rejected(self):
+        # `model` has always been optional here; tightening that is a separate
+        # decision from rejecting a name that is simply wrong.
+        self.assertIsNone(self.chat._validate_model_name(None))
+        self.assertIsNone(self.chat._validate_model_name("   "))
+
+
+class TestToolParserEngagement(CustomTestCase):
+    """A conversation can establish its tool vocabulary through history alone.
+    Gating the parser on declared `tools` meant the model's tool-call markup
+    was passed through as visible content with finish_reason "stop".
+    """
+
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        self.chat = OpenAIServingChat(_MockTokenizerManager(), _MockTemplateManager())
+
+    def test_parsing_active_without_tools_or_history(self):
+        # The provider API contract requires tool calls to be parsed "even when
+        # no tools are defined". Gating on declared tools, or on tool calls in
+        # the history, leaks raw <tool_call> markup as visible content on a
+        # first turn that declares neither.
+        req = ChatCompletionRequest(
+            model="test-model", messages=[{"role": "user", "content": "hi"}]
+        )
+        self.assertTrue(self.chat._tool_call_parsing_active(req))
+
+    def test_parsing_inactive_when_caller_opts_out(self):
+        # tool_choice="none" is only an opt-out next to declared tools; with
+        # no tools the validator injects it, so it says nothing about intent.
+        req = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {"name": "get_weather", "parameters": {}},
+                }
+            ],
+            tool_choice="none",
+        )
+        self.assertFalse(self.chat._tool_call_parsing_active(req))
+
+
 class TestProcessToolCallsWithRequiredToolChoice(unittest.TestCase):
     """Test _process_tool_calls with tool_choice='required' uses model-specific parser."""
 
@@ -4405,7 +4571,7 @@ class TestProcessToolCallsWithRequiredToolChoice(unittest.TestCase):
 
     def test_required_without_parser_falls_back_to_json(self):
         """tool_choice='required' without parser should parse as JSON array."""
-        self.chat.tool_call_parser = None
+        self.chat.tokenizer_manager._config_overrides["tool_call_parser"] = None
 
         finish_reason = {"type": "stop", "matched": None}
         tools = [{"type": "function", "function": {"name": "get_weather"}}]
@@ -4423,7 +4589,7 @@ class TestProcessToolCallsWithRequiredToolChoice(unittest.TestCase):
 
     def test_required_without_parser_invalid_json_returns_none(self):
         """tool_choice='required' without parser and invalid JSON returns tool_calls=None."""
-        self.chat.tool_call_parser = None
+        self.chat.tokenizer_manager._config_overrides["tool_call_parser"] = None
 
         finish_reason = {"type": "stop", "matched": None}
         tools = [{"type": "function", "function": {"name": "get_weather"}}]

@@ -199,6 +199,14 @@ class TritonAttnBackend(AttentionBackend):
         self.verify_splitkv_fwd = torch.compiler.disable(verify_splitkv_fwd)
         # Grouped-head split-KV verify kernel for MLA or one shared local KV head.
         self.verify_shared_kv_fwd = torch.compiler.disable(verify_shared_kv_fwd)
+        # Cache for the TARGET_VERIFY extend_seq_lens fallback below -- draft_token_num
+        # is constant across steps for non-adaptive speculative decoding, so a fresh
+        # torch.full((bs,), draft_token_num, ...) every verify step is pure allocator/
+        # launch overhead. Reused via slicing whenever bs/draft_token_num match; falls
+        # back to a real allocation otherwise (safe for adaptive speculative decoding
+        # too, since a value/size change just misses the cache).
+        self._target_verify_extend_seq_lens_buf: Optional[torch.Tensor] = None
+        self._target_verify_extend_seq_lens_value: Optional[int] = None
 
         # Parse args
         self.skip_prefill = skip_prefill
@@ -823,8 +831,9 @@ class TritonAttnBackend(AttentionBackend):
         lean_Mp = lean_Lp = lean_Op = lean_locks = None
 
         if forward_batch.forward_mode.is_decode_or_idle():
-            if spec_info is None or spec_info.kv_indptr is None:
-                # kv_indptr is None for draft-extend's idle batch; build from seq_lens.
+            if spec_info is None or getattr(spec_info, "kv_indptr", None) is None:
+                # kv_indptr is absent/None for DFlash-family idle participation
+                # and draft-extend idle batches; build it from seq_lens.
                 if self.dcp_size > 1:
                     # DCP: per-rank sharded KV indices, else each rank reads the
                     # whole KV instead of its owner shard.

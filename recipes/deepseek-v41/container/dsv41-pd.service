@@ -1,0 +1,28 @@
+# One DeepSeek-V4.1 PD pair (prefill + decode + router) in a container. The unit
+# is active while the pair runs, and becomes active only after its smoke completion.
+[Unit]
+Description=DeepSeek-V4.1 PD pair (container)
+Requires=dsv41-engram-cache.service
+After=dsv41-engram-cache.service nvidia-persistenced.service network-online.target
+Wants=network-online.target
+# A pair that keeps dying needs a person, not a fourth relaunch.
+StartLimitIntervalSec=4h
+StartLimitBurst=3
+
+[Service]
+WorkingDirectory=/home/ubuntu/sglang-private/recipes/deepseek-v41/container
+# Each start is a fresh pair with a new output directory; it exits when any worker dies.
+ExecStart=/usr/bin/docker compose -f compose.yaml --env-file dsv41.env up --no-deps --exit-code-from pd pd
+ExecStartPost=/home/ubuntu/sglang-private/recipes/deepseek-v41/container/wait-healthy.sh dsv41-pd-1
+ExecStop=/usr/bin/docker compose -f compose.yaml --env-file dsv41.env stop pd
+ExecStopPost=/usr/bin/docker compose -f compose.yaml --env-file dsv41.env rm -f pd
+# `docker compose up` exits 130 when systemd stops it; that is a clean stop.
+SuccessExitStatus=130
+Restart=on-failure
+# GPUs must settle before a relaunch (Agent_Readme: >=180 s after a worker death).
+RestartSec=240
+TimeoutStartSec=5400
+TimeoutStopSec=300
+
+[Install]
+WantedBy=multi-user.target

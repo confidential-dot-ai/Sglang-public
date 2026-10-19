@@ -70,6 +70,26 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         false // Default: most policies don't need request text
     }
 
+    /// Number of leading tokens this policy needs for HTTP-path routing, if any.
+    ///
+    /// `None` (default) means the policy doesn't route on token ids -- callers
+    /// should leave `SelectWorkerInfo.tokens` as `None` and skip tokenizing.
+    /// `Some(n)` means the caller should tokenize a bounded prefix of the
+    /// request text and supply up to `n` leading token ids.
+    fn prefix_tokens_needed(&self) -> Option<usize> {
+        None
+    }
+
+    /// Whether the tokens this policy routes on (see `prefix_tokens_needed`)
+    /// should come from `GenerationRequest::extract_text_for_prefix_hash_routing`
+    /// (leading system/developer content excluded) instead of the regular
+    /// `extract_text_for_routing` text. Default `false` -- only policies that
+    /// hash a bounded leading window (today: `PrefixHashPolicy`) want this;
+    /// exact-match policies like `cache_aware` need the full served text.
+    fn wants_system_prompt_excluded(&self) -> bool {
+        false
+    }
+
     /// Update worker load information
     ///
     /// This is called periodically with current load information for load-aware policies.
@@ -132,12 +152,16 @@ impl Default for BucketConfig {
     }
 }
 
-/// Helper function to filter healthy workers and return their indices
+/// Helper function to filter routable workers and return their indices
+///
+/// Delegates to `is_available` rather than repeating its predicate: a second
+/// copy here is how a worker state (drain, circuit) ends up honoured on one
+/// routing path and ignored on the other.
 pub(crate) fn get_healthy_worker_indices(workers: &[Arc<dyn Worker>]) -> Vec<usize> {
     workers
         .iter()
         .enumerate()
-        .filter(|(_, w)| w.is_healthy() && w.circuit_breaker().can_execute())
+        .filter(|(_, w)| w.is_available())
         .map(|(idx, _)| idx)
         .collect()
 }

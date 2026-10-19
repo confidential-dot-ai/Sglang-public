@@ -1,4 +1,6 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import torch
 
@@ -71,6 +73,9 @@ def make_obs(
         verify_tokens_graph_key=num_verify_tokens,
         predicted_step_ms=predicted_step_ms,
         predicted_theta=predicted_theta,
+        can_run_cuda_graph=True,
+        proposal_folded=True,
+        acceptance_path="folded_greedy_graph",
         verify_lens=torch.full((bs,), 6, dtype=torch.int32),
         confidence=torch.full((bs, 5), 0.9),
         req_pool_indices=torch.arange(bs, dtype=torch.int64),
@@ -145,6 +150,29 @@ class TestCoreAndCpuTiming(CustomTestCase):
         dumper.observe_decode_step(make_obs(forward_ct=1))
         self.assertIsNone(dumper.dump())
 
+    def test_all_rank_diagnostic_enables_non_root_and_exports_rank_file(self):
+        clock = FakeClock()
+        with TemporaryDirectory() as output_dir:
+            with envs.SGLANG_DSPARK_DEBUG_DUMP_ALL_RANKS.override(True):
+                with envs.SGLANG_DSPARK_DEBUG_DUMP_DIR.override(output_dir):
+                    dumper = DsparkInfoDumper(
+                        components={"core"},
+                        gamma=5,
+                        verify_num_draft_tokens=6,
+                        attn_tp_rank=1,
+                        tp_rank=3,
+                        device=torch.device("cpu"),
+                        mode_value="static",
+                        clock=clock,
+                    )
+                    self.assertTrue(dumper.enabled)
+                    dumper.observe_decode_step(make_obs(forward_ct=7))
+                    dumped = dumper.dump()
+                    self.assertEqual(dumped["tp_rank"], 3)
+                    path = Path(output_dir) / "dspark-critical-path-tp3.json"
+                    self.assertTrue(path.is_file())
+                    self.assertIn(b'"forward_ct":7', path.read_bytes())
+
     def test_one_record_per_step_including_the_last(self):
         dumper, clock = make_dumper({"core", "step_cpu_time"})
         for forward_ct in range(1, 4):
@@ -164,6 +192,22 @@ class TestCoreAndCpuTiming(CustomTestCase):
         self.assertNotIn("step_cpu_ms", first)
         self.assertAlmostEqual(second["step_cpu_ms"], 20.0, places=3)
 
+    def test_begin_step_records_host_work_and_inter_step_cpu_gap(self):
+        dumper, clock = make_dumper({"core", "step_cpu_time"})
+        dumper.begin_step()
+        clock.advance(0.004)
+        dumper.observe_decode_step(make_obs(forward_ct=1))
+        clock.advance(0.003)
+        dumper.begin_step()
+        clock.advance(0.005)
+        dumper.observe_decode_step(make_obs(forward_ct=2))
+        records = dumper.dump()["records"]
+        first, second = records
+        self.assertAlmostEqual(first["host_step_ms"], 4.0, places=3)
+        self.assertAlmostEqual(second["host_step_ms"], 5.0, places=3)
+        self.assertAlmostEqual(second["cpu_gap_ms"], 3.0, places=3)
+        self.assertLess(first["host_begin_ns"], first["host_end_ns"])
+
     def test_core_fields_present(self):
         dumper, _ = make_dumper({"core"})
         dumper.observe_decode_step(make_obs(forward_ct=7, bs=3, num_verify_tokens=18))
@@ -172,6 +216,9 @@ class TestCoreAndCpuTiming(CustomTestCase):
         self.assertEqual(record["num_running_reqs"], 3)
         self.assertEqual(record["num_verify_tokens"], 18)
         self.assertEqual(record["mode"], "static")
+        self.assertTrue(record["can_run_cuda_graph"])
+        self.assertTrue(record["proposal_folded"])
+        self.assertEqual(record["acceptance_path"], "folded_greedy_graph")
 
     def test_core_only_omits_timing_fields(self):
         dumper, clock = make_dumper({"core"})
@@ -266,6 +313,10 @@ def _pending(*, bs, budget, num_verify_tokens, predicted_step_ms):
         verify_tokens_graph_key=num_verify_tokens,
         predicted_step_ms=predicted_step_ms,
         predicted_theta=1.0,
+        host_begin_ns=None,
+        host_end_ns=None,
+        host_step_ms=None,
+        cpu_gap_ms=None,
         step_cpu_ms=None,
         rids=None,
         future=None,
@@ -381,6 +432,10 @@ class TestReqsAndGpuTiming(CustomTestCase):
         self.assertEqual(req["acc_len"], 4)
         self.assertEqual(req["correct_drafts"], 3)
         self.assertEqual(len(req["survival"]), 5)
+        self.assertEqual(record["accepted_tokens"], 12)
+        self.assertEqual(record["context_len_min"], 128)
+        self.assertEqual(record["context_len_p50"], 128.0)
+        self.assertEqual(record["context_len_max"], 128)
 
     def test_gpu_timing_populates_segment_fields(self):
         dumper = self._make(

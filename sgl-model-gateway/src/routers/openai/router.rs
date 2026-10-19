@@ -29,8 +29,8 @@ use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
     core::{
-        is_retryable_status, model_type::Endpoint, ModelCard, ProviderType, RetryExecutor,
-        RuntimeType, Worker, WorkerRegistry,
+        deadlines, is_retryable_status, model_type::Endpoint, ModelCard, ProviderType,
+        RetryExecutor, RuntimeType, Worker, WorkerRegistry,
     },
     observability::metrics::{bool_to_static_str, metrics_labels, Metrics},
     protocols::{
@@ -42,7 +42,7 @@ use crate::{
     },
     routers::{
         header_utils::{apply_provider_headers, extract_auth_header},
-        streaming_utils::BreakerTrackedStream,
+        streaming_utils::guarded_tracked_stream,
     },
 };
 
@@ -580,6 +580,8 @@ impl crate::routers::RouterTrait for OpenAIRouter {
 
                     if is_streaming {
                         req = req.header("Accept", "text/event-stream");
+                        // Not the non-streaming total; see core::deadlines.
+                        req = deadlines::apply_stream_deadline(req);
                     }
 
                     let resp = match req.send().await {
@@ -634,7 +636,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                         // the wrapper as Errored — otherwise the small error
                         // body would stream cleanly to `None` and Drop would
                         // record a spurious success.
-                        let mut tracked = BreakerTrackedStream::new(
+                        let mut tracked = guarded_tracked_stream(
                             resp.bytes_stream(),
                             Arc::clone(&worker),
                             url.clone(),

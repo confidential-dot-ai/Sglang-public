@@ -179,6 +179,7 @@ async fn create_test_app_with_wasm() -> (axum::Router, Arc<AppContext>, TempDir)
         context: app_context.clone(),
         concurrency_queue_tx: None,
         router_manager: None,
+        api_keys: None,
         mesh_handler: None,
         mesh_sync_manager: None,
     });
@@ -188,6 +189,11 @@ async fn create_test_app_with_wasm() -> (axum::Router, Arc<AppContext>, TempDir)
     let app = build_app(
         app_state,
         smg::middleware::AuthConfig { api_key: None },
+        smg::middleware::AdminAuthConfig {
+            admin_api_key: Some("test-admin-key".to_string()),
+            ops_api_key: None,
+            key_store: None,
+        },
         None, // No control plane auth for tests
         256 * 1024 * 1024,
         request_id_headers,

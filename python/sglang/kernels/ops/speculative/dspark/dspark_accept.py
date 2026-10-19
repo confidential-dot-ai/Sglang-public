@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import itertools
+import json
 from typing import Optional
 
 import msgspec
@@ -24,6 +26,152 @@ else:
     from sglang.kernels.ops.speculative.reject_sampling import (
         chain_speculative_sampling_triton,
     )
+from sglang.srt.environ import envs
+
+
+def _server_args():
+    # Imported lazily (matching dflash_utils' own threshold lookup): the
+    # runtime context is not populated at module import time.
+    from sglang.srt.runtime_context import get_server_args
+
+    return get_server_args()
+
+
+_accept_dump_ct = itertools.count()
+
+
+def _maybe_dump_accept(
+    *,
+    candidates: torch.Tensor,
+    target_probs: torch.Tensor,
+    draft_probs: torch.Tensor,
+    uniform_samples: torch.Tensor,
+    uniform_samples_final: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_token_num: torch.Tensor,
+    predicts: torch.Tensor,
+) -> None:
+    """Record accepted tokens the target model gave near-zero probability.
+
+    Both accept paths are supposed to make this impossible: a draft token is
+    accepted with probability min(1, p/q), and the bonus token is drawn from
+    the residual (p-q)+ which is bounded above by p. So an accepted token with
+    p ~ 1e-16 means one of the two is not doing what it claims, and the (p, q,
+    coin) triple says which -- a draft accept with coin*q >= p is a broken
+    accept test, while a bonus token with tiny p is a broken residual sample.
+
+    Host-side on purpose: everything needed is already materialized after the
+    kernel, so this needs no kernel change and compiles to nothing when off.
+    Syncs the device, so it is a debugging tool only.
+    """
+    path = envs.SGLANG_DSPARK_DEBUG_ACCEPT_DUMP_PATH.get()
+    if not path:
+        return
+    threshold = envs.SGLANG_DSPARK_DEBUG_ACCEPT_P_THRESHOLD.get()
+
+    bs, num_slots = candidates.shape
+    num_accept = accept_token_num.to(torch.long).tolist()
+    cand = candidates.tolist()
+    coins = uniform_samples.tolist()
+    coins_final = uniform_samples_final.tolist()
+    records = []
+
+    for row in range(bs):
+        k = int(num_accept[row])
+        # Accepted draft tokens: candidates[row, j] was proposed from
+        # draft_probs[row, j-1] and verified against target_probs[row, j-1].
+        for j in range(1, k + 1):
+            token = int(cand[row][j])
+            p = float(target_probs[row, j - 1, token])
+            if p >= threshold:
+                continue
+            q = float(draft_probs[row, j - 1, token])
+            coin = float(coins[row][j - 1])
+            records.append(
+                {
+                    "kind": "draft_accept",
+                    "row": row,
+                    "step": j,
+                    "token": token,
+                    "p": p,
+                    "q": q,
+                    "coin": coin,
+                    # The kernel's test. Should be False for a tiny-p token
+                    # unless q is degenerate (q == 0 makes it always True).
+                    "coin_times_q_lt_p": coin * q < p,
+                    "num_accept": k,
+                }
+            )
+        # Bonus token: sampled from the residual at row k.
+        bonus_pos = int(accept_index[row, k])
+        bonus = int(predicts[bonus_pos])
+        p_bonus = float(target_probs[row, k, bonus])
+        if p_bonus < threshold:
+            q_bonus = (
+                float(draft_probs[row, k, bonus])
+                if k < draft_probs.shape[1]
+                else None
+            )
+            records.append(
+                {
+                    "kind": "bonus",
+                    "row": row,
+                    "step": k,
+                    "token": bonus,
+                    "p": p_bonus,
+                    "q": q_bonus,
+                    "coin_final": float(coins_final[row]),
+                    "all_drafts_accepted": k == num_slots - 1,
+                    "num_accept": k,
+                }
+            )
+
+    ct = next(_accept_dump_ct)
+    if not records:
+        # Heartbeat: prove the sampling path is running even when nothing
+        # crosses the threshold, so "no records" cannot be misread as "never
+        # called". Carries the smallest accepted p seen this call.
+        if ct % 200 == 0:
+            min_p = None
+            for row in range(bs):
+                k = int(num_accept[row])
+                for j in range(1, k + 1):
+                    p = float(target_probs[row, j - 1, int(cand[row][j])])
+                    min_p = p if min_p is None else min(min_p, p)
+            # Alignment check. target_probs[r, j] must be the distribution for
+            # the token AFTER candidates[r, j] -- i.e. it should score
+            # candidates[r, j+1] ("next"), not candidates[r, j] ("same"). If
+            # "same" is ~1.0 while "next" is small, the rows are off by one and
+            # every draft token is being scored against a distribution that
+            # already saw it, which accepts the whole block unverified.
+            row0 = [int(t) for t in cand[0]]
+            p_same = [
+                float(target_probs[0, j, row0[j]]) for j in range(len(row0))
+            ]
+            p_next = [
+                float(target_probs[0, j, row0[j + 1]]) for j in range(len(row0) - 1)
+            ]
+            with open(path, "a") as f:
+                f.write(
+                    json.dumps(
+                        {
+                            "kind": "heartbeat",
+                            "ct": ct,
+                            "min_accepted_p": min_p,
+                            "num_accept_row0": int(num_accept[0]),
+                            "candidates_row0": row0,
+                            "argmax_row0": target_probs[0].argmax(dim=-1).tolist(),
+                            "p_same": p_same,
+                            "p_next": p_next,
+                        }
+                    )
+                    + "\n"
+                )
+        return
+    with open(path, "a") as f:
+        for rec in records:
+            rec["ct"] = ct
+            f.write(json.dumps(rec) + "\n")
 
 
 class AcceptSampling:
@@ -143,9 +291,24 @@ def _accept_sampling_core(
         uniform_samples_for_final_sampling=uniform_samples_final,
         target_probs=target_probs,
         draft_probs=draft_probs,
-        threshold_single=1.0,
-        threshold_acc=1.0,
+        # Relaxed-acceptance knobs, previously pinned to the lossless 1.0/1.0
+        # here so --speculative-accept-threshold-* silently did nothing for
+        # DSPARK (they were already honored by EAGLE and DFlash). Reading the
+        # server args makes the documented flags apply to DSPARK too; the
+        # defaults are still 1.0/1.0, so unset behavior is unchanged.
+        threshold_single=_server_args().speculative_accept_threshold_single,
+        threshold_acc=_server_args().speculative_accept_threshold_acc,
         deterministic=True,
+    )
+    _maybe_dump_accept(
+        candidates=candidates,
+        target_probs=target_probs,
+        draft_probs=draft_probs,
+        uniform_samples=uniform_samples,
+        uniform_samples_final=uniform_samples_final,
+        accept_index=accept_index,
+        accept_token_num=accept_token_num,
+        predicts=predicts,
     )
     correct_len = accept_token_num
     if cutoff_verify_lens is not None:

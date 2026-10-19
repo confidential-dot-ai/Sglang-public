@@ -82,6 +82,32 @@ class SchedulerProfilerManager:
         # For ROCM
         self.rpd_profiler = None
 
+        if envs.SGLANG_PROFILER_WARMUP_ON_INIT.get():
+            self._warmup_profiler_backend()
+
+    def _warmup_profiler_backend(self) -> None:
+        # The first torch.profiler.profile(...).start() call in a process's
+        # lifetime pays a one-time CUPTI/kineto backend-init cost (~18s
+        # observed, synchronized across TP ranks) that can desync PD-disagg
+        # NIXL bootstrap handshakes if it lands mid-handshake. Paying it here,
+        # at scheduler startup before the event loop (and before any real
+        # traffic) begins, keeps a real /start_profile call fast and safe.
+        # See tdx-checkpoints/077-profiler-investigation-correction-and-vm-crisis.md.
+        t0 = time.monotonic()
+        warmup_profiler = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ]
+        )
+        warmup_profiler.start()
+        with torch.profiler.record_function("profiler_backend_warmup"):
+            pass
+        warmup_profiler.stop()
+        logger.info(
+            f"Profiler backend warm-up finished in {time.monotonic() - t0:.3f}s"
+        )
+
     def _init_profile(
         self,
         output_dir: Optional[str],

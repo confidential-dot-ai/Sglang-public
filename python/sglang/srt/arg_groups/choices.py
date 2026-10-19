@@ -126,7 +126,7 @@ DISAGG_TRANSFER_BACKEND_CHOICES = [
     "mooncake_tcp",
 ]
 
-GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
+GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "device_fsm", "none"]
 
 SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend", "intel_xpu"}
 

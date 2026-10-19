@@ -12,6 +12,11 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.storage.mmap import alloc_mmap
 from sglang.srt.runtime_context import get_memory
 from sglang.srt.utils import is_hip
+from sglang.srt.utils.common import is_host_pinning_effective
+from sglang.srt.utils.hardwire_memory_registry import (
+    register_hardwire_allocation,
+    unregister_hardwire_allocation,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +26,8 @@ _CUDA_HOST_REGISTERED_RANGES_ATTR = "_sglang_cuda_host_registered_ranges"
 
 
 class HostTensorAllocator:
+    requires_host_registration = True
+
     def __init__(self):
         """Initialize the HostTensorAllocator."""
         self.dtype = None
@@ -33,6 +40,80 @@ class HostTensorAllocator:
         self.dtype = dtype
         self.dims = dims
         return alloc_mmap(dims, dtype)
+
+
+class HardwireHostTensorAllocator(HostTensorAllocator):
+    """Allocate TD-private, CUDA-pinned host tensors through Hardwire."""
+
+    requires_host_registration = False
+
+    def __init__(self):
+        super().__init__()
+        self._registry_keys: list[str] = []
+        self._allocation_counter = 0
+
+    def allocate(self, dims: tuple, dtype: torch.dtype, device: str) -> torch.Tensor:
+        if device != "cpu":
+            raise ValueError(
+                "HardwireHostTensorAllocator only supports CPU allocations; "
+                f"got device={device!r}"
+            )
+
+        try:
+            import hardwire_torch
+        except ImportError as exc:
+            raise RuntimeError(
+                "Hardwire host memory requires the hardwire_torch extension. "
+                "Install connector/torch from confidential-dot-ai/hardwire."
+            ) from exc
+
+        self.dtype = dtype
+        self.dims = dims
+        buffer = hardwire_torch.createHardWireHostPinnedTensor(
+            shape=dims,
+            dtype=dtype,
+            mode="doorbell",
+        )
+        info = hardwire_torch.hardwireTensorInfo(buffer)
+        if info.get("kind") != "pinned":
+            raise RuntimeError(
+                "Hardwire doorbell allocation did not return pinned storage: "
+                f"{info!r}"
+            )
+        if not torch.cuda.is_available():
+            raise RuntimeError("Hardwire host-pinned memory requires CUDA.")
+        if not buffer.is_pinned():
+            raise RuntimeError(
+                "Hardwire returned a tensor CUDA does not recognize as pinned."
+            )
+
+        logger.info(
+            "Allocated %.2f GB of TD-private Hardwire host-pinned memory at %#x",
+            buffer.numel() * buffer.element_size() / 1e9,
+            buffer.data_ptr(),
+        )
+        registry_key = f"hicache:{id(self)}:{self._allocation_counter}"
+        self._allocation_counter += 1
+        self._registry_keys.append(registry_key)
+        register_hardwire_allocation(
+            registry_key,
+            component="hicache",
+            tensor=buffer,
+            kind=info["kind"],
+            metadata={"dtype": str(dtype), "shape": list(dims)},
+        )
+        return buffer
+
+    def close(self) -> None:
+        for key in self._registry_keys:
+            unregister_hardwire_allocation(key)
+        self._registry_keys.clear()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except (AttributeError, RuntimeError):
+            pass
 
 
 class ShmHostTensorAllocator(HostTensorAllocator):
@@ -73,7 +154,9 @@ class ShmHostTensorAllocator(HostTensorAllocator):
 
 
 def get_allocator_from_storage(allocator_type):
-    if allocator_type == "mooncake":
+    if allocator_type == "hardwire":
+        return HardwireHostTensorAllocator()
+    elif allocator_type == "mooncake":
         try:
             from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
                 MooncakeHostTensorAllocator,
@@ -121,6 +204,10 @@ def get_allocator_from_storage(allocator_type):
 
 def get_allocator_type() -> str:
     """The host-allocator kind the published HiCache configuration asks for."""
+
+    host_backend = get_memory().hicache_host_memory_backend
+    if host_backend != "auto":
+        return host_backend
 
     backend = get_memory().hicache_storage_backend
     if backend == "shm":
@@ -245,10 +332,33 @@ def alloc_with_host_register(
     Allocate tensor and register host memory with cudaHostRegister.
     CudaHostRegister only applies when pin_memory=True.
     """
-    buffer = allocator.allocate(dims, dtype=dtype, device=device)
-    if pin_memory:
+    if pin_memory and getattr(allocator, "requires_host_registration", True):
+        # A GPU-CC guest refuses cudaHostRegister outright (rc=801: user-space
+        # cannot hand its own pages to the compute cores), so allocate-then-
+        # register cannot build a host tier there at all. Ask before calling:
+        # a refused register leaves a sticky per-thread CUDA error that fails
+        # every later call in the context. torch's own pinned allocation still
+        # works there -- the driver backs it with CUDA Managed memory, which
+        # the GPU reads correctly (hardwire's doorbell probe, rung 3).
+        if not is_host_pinning_effective():
+            if type(allocator) is not HostTensorAllocator:
+                raise RuntimeError(
+                    "cudaHostRegister is unavailable; the selected storage "
+                    "allocator cannot be replaced with torch-owned memory."
+                )
+            logger.warning(
+                "cudaHostRegister is unavailable (confidential-compute guest); "
+                "allocating the host tier as torch pinned (driver-managed) "
+                "memory instead. Device reads are correct, but throughput is "
+                "throttled by the CC sysmem path."
+            )
+            buffer = torch.empty(dims, dtype=dtype, device=device, pin_memory=True)
+            setattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, [])
+            return buffer
+        buffer = allocator.allocate(dims, dtype=dtype, device=device)
         _cuda_host_register(buffer, registration_granularity_bytes)
-    return buffer
+        return buffer
+    return allocator.allocate(dims, dtype=dtype, device=device)
 
 
 def alloc_with_pin_memory(
@@ -263,6 +373,8 @@ def alloc_with_pin_memory(
     Allocate tensor using PyTorch's built-in pin_memory flag.
     """
     buffer = torch.empty(dims, dtype=dtype, device=device, pin_memory=pin_memory)
+    # Torch owns any pinning registration; host-pool teardown must not undo it.
+    setattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, [])
     return buffer
 
 

@@ -314,6 +314,17 @@ class BaseSpecWorker(ABC):
         if self.draft_worker is not None:
             self.draft_worker.init_attention_backends()
 
+    def pre_target_capture_setup(self) -> None:
+        """Hook called before the TARGET model's own regular CUDA graph
+        capture (scheduler.py's init_all_cuda_graphs, before
+        self.tp_worker.init_cuda_graphs()). Default no-op; a subclass whose
+        forward pass has a communication fast-path that depends on eagerly
+        built, cached state (e.g. CC conditional decode's replicated LM head
+        weight) must build that state here -- not in its own
+        init_cuda_graphs(), which runs after the target's capture has
+        already happened and would be too late to prevent a live collective
+        from getting captured into the target's own graph structure."""
+
     def init_cuda_graphs(self):
         if self.draft_worker is not None:
             self.draft_worker.init_cuda_graphs()

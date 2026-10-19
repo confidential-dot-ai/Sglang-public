@@ -147,6 +147,7 @@ from sglang.srt.managers.io_struct import (
     SendWeightsToRemoteInstanceReqInput,
     SeparateReasoningReqInput,
     SetInternalStateReq,
+    SetToolCallParserReqInput,
     SlowDownReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
@@ -838,6 +839,37 @@ async def get_server_info():
     return await server_info()
 
 
+def _build_hardwire_memory_block(
+    server_args: ServerArgs,
+    internal_states: List[Dict[Any, Any]],
+) -> Dict[str, Any]:
+    """Aggregate verified process-local Hardwire allocations across DP ranks."""
+    from sglang.srt.utils.hardwire_memory_registry import (
+        aggregate_hardwire_memory_snapshots,
+    )
+
+    requested_components = set()
+    if (
+        getattr(server_args, "cuda_graph_host_memory_backend", "default")
+        == "hardwire"
+    ):
+        requested_components.add("graph_staging")
+    if getattr(server_args, "hicache_host_memory_backend", "auto") == "hardwire":
+        requested_components.add("hicache")
+    if getattr(server_args, "lmcache_host_memory_backend", "default") == "hardwire":
+        requested_components.add("lmcache")
+
+    snapshots = [
+        state.get("hardwire_memory")
+        for state in internal_states
+        if isinstance(state, dict) and isinstance(state.get("hardwire_memory"), dict)
+    ]
+    return aggregate_hardwire_memory_snapshots(
+        snapshots,
+        requested_components=requested_components,
+    )
+
+
 @app.get("/server_info")
 async def server_info():
     """The startup configuration, plus live scheduler state.
@@ -866,6 +898,9 @@ async def server_info():
             "internal_states": internal_states,
             "version": __version__,
             "frontend": "python",
+            "hardwire_memory": _build_hardwire_memory_block(
+                server_args, internal_states
+            ),
             # Structured KV-event publisher descriptor for KV-aware routers.
             # `None` when publishing is disabled or misconfigured; see
             # `runtime_context.describe_kv_events_publisher` for the contract.
@@ -1493,6 +1528,53 @@ async def update_weight_version(
             {
                 "success": False,
                 "message": f"Failed to update weight version: {str(e)}",
+            },
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+
+
+@app.post("/set_tool_call_parser")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def set_tool_call_parser(
+    obj: Annotated[SetToolCallParserReqInput, Body()], request: Request
+):
+    """Update the tool-call parser used by /v1/chat/completions. Takes effect
+    on the next request; does not require a restart or active-request drain.
+    """
+    from sglang.srt.function_call.function_call_parser import FunctionCallParser
+
+    if (
+        obj.tool_call_parser is not None
+        and obj.tool_call_parser not in FunctionCallParser.ToolCallParserEnum
+    ):
+        return ORJSONResponse(
+            {
+                "success": False,
+                "message": (
+                    f"Unknown tool_call_parser '{obj.tool_call_parser}'. "
+                    f"Valid values: {sorted(FunctionCallParser.ToolCallParserEnum)}"
+                ),
+            },
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+
+    try:
+        _global_state.tokenizer_manager.record_config_updates(
+            "http.set_tool_call_parser", tool_call_parser=obj.tool_call_parser
+        )
+        return ORJSONResponse(
+            {
+                "success": True,
+                "message": f"tool_call_parser updated to {obj.tool_call_parser!r}",
+                "tool_call_parser": obj.tool_call_parser,
+            },
+            status_code=HTTPStatus.OK,
+        )
+    except Exception as e:
+        return ORJSONResponse(
+            {
+                "success": False,
+                "message": f"Failed to update tool_call_parser: {str(e)}",
             },
             status_code=HTTPStatus.BAD_REQUEST,
         )

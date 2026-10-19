@@ -283,9 +283,29 @@ struct CliArgs {
     #[arg(long, num_args = 0.., help_heading = "Request Handling")]
     request_id_headers: Vec<String>,
 
-    /// Request timeout in seconds
+    /// Total deadline for a non-streaming request, in seconds. Does not apply
+    /// to streaming responses -- see --stream-total-timeout-secs.
     #[arg(long, default_value_t = 1800, help_heading = "Request Handling")]
     request_timeout_secs: u64,
+
+    /// Total deadline for a streaming request, in seconds. 0 (the default)
+    /// means unbounded: a healthy stream is bounded by the two silence
+    /// timeouts below rather than by elapsed generation time. Set a value only
+    /// to cap generation length outright.
+    #[arg(long, default_value_t = 0, help_heading = "Request Handling")]
+    stream_total_timeout_secs: u64,
+
+    /// Silence tolerated on the worker socket, in seconds, including the wait
+    /// for response headers. Must exceed the worst legitimate
+    /// time-to-first-token or slow cold prefills are cancelled. 0 disables.
+    #[arg(long, default_value_t = 600, help_heading = "Request Handling")]
+    request_read_timeout_secs: u64,
+
+    /// Silence tolerated between SSE frames once a stream has started, in
+    /// seconds. Arms only after the first frame, so it can be far tighter than
+    /// --request-read-timeout-secs. Must be strictly less than it. 0 disables.
+    #[arg(long, default_value_t = 120, help_heading = "Request Handling")]
+    stream_idle_timeout_secs: u64,
 
     /// Grace period in seconds to wait for in-flight requests during shutdown
     #[arg(long, default_value_t = 180, help_heading = "Request Handling")]
@@ -564,6 +584,78 @@ struct CliArgs {
     /// API key for worker authorization
     #[arg(long, help_heading = "Control Plane Authentication")]
     api_key: Option<String>,
+
+    /// Admin API key for management endpoints (/admission, /flush_cache, /wasm,
+    /// /v1/tokenizers, profiling). When set, those endpoints require this key and
+    /// do NOT accept --api-key. When unset they are refused with 403.
+    #[arg(
+        long,
+        env = "SMG_ADMIN_API_KEY",
+        help_heading = "Control Plane Authentication"
+    )]
+    admin_api_key: Option<String>,
+
+    /// Reaches the admission ceiling only; not metrics or key minting.
+    #[arg(
+        long,
+        env = "SMG_OPS_API_KEY",
+        help_heading = "Control Plane Authentication"
+    )]
+    ops_api_key: Option<String>,
+
+    /// JSON file backing keys minted via /admin/keys. Unset disables minting.
+    #[arg(
+        long,
+        env = "SMG_API_KEY_STORE",
+        help_heading = "Control Plane Authentication"
+    )]
+    api_key_store: Option<String>,
+
+    /// Refuse chat requests carrying video parts with 400. Set this when the
+    /// deployment has declared it does not accept video traffic.
+    #[arg(long, env = "SMG_REJECT_VIDEO")]
+    reject_video: bool,
+
+    /// Reject with 429 any chat/responses request whose image parts would push
+    /// the number of images in flight on this gateway above N. 0 disables.
+    #[arg(
+        long,
+        value_name = "N",
+        env = "SMG_MAX_INFLIGHT_IMAGES",
+        default_value_t = 0,
+        help_heading = "Rate Limiting"
+    )]
+    max_inflight_images: i64,
+
+    /// Image area admitted concurrently, in megapixels (0 = disabled)
+    #[arg(
+        long,
+        value_name = "MP",
+        env = "SMG_MAX_INFLIGHT_MEGAPIXELS",
+        default_value_t = 0,
+        help_heading = "Rate Limiting"
+    )]
+    max_inflight_megapixels: i64,
+
+    /// Images accepted in a single request (0 = disabled)
+    #[arg(
+        long,
+        value_name = "N",
+        env = "SMG_MAX_IMAGES_PER_REQUEST",
+        default_value_t = 0,
+        help_heading = "Rate Limiting"
+    )]
+    max_images_per_request: i64,
+
+    /// Area charged to an image whose dimensions cannot be read, in megapixels
+    #[arg(
+        long,
+        value_name = "MP",
+        env = "SMG_UNMEASURED_IMAGE_MEGAPIXELS",
+        default_value_t = 0,
+        help_heading = "Rate Limiting"
+    )]
+    unmeasured_image_megapixels: i64,
 
     /// JWT issuer URL for OIDC authentication
     #[arg(
@@ -1008,6 +1100,9 @@ impl CliArgs {
             .port(self.port)
             .max_payload_size(self.max_payload_size)
             .request_timeout_secs(self.request_timeout_secs)
+            .stream_total_timeout_secs(self.stream_total_timeout_secs)
+            .request_read_timeout_secs(self.request_read_timeout_secs)
+            .stream_idle_timeout_secs(self.stream_idle_timeout_secs)
             .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
             .worker_startup_check_interval_secs(self.worker_startup_check_interval)
             .pool_idle_timeout_secs(self.pool_idle_timeout_secs)
@@ -1048,6 +1143,14 @@ impl CliArgs {
             .history_backend(history_backend)
             .log_level(&self.log_level)
             .maybe_api_key(self.api_key.as_ref())
+            .maybe_admin_api_key(self.admin_api_key.as_ref())
+            .maybe_ops_api_key(self.ops_api_key.as_ref())
+            .maybe_api_key_store(self.api_key_store.as_ref())
+            .reject_video(self.reject_video)
+            .max_inflight_images(self.max_inflight_images)
+            .max_inflight_megapixels(self.max_inflight_megapixels)
+            .max_images_per_request(self.max_images_per_request)
+            .unmeasured_image_megapixels(self.unmeasured_image_megapixels)
             .maybe_discovery(discovery)
             .maybe_metrics(metrics)
             .maybe_trace(trace_config)

@@ -339,6 +339,9 @@ class LogitsMetadata:
     # rows (see EagleDraftExtendInput.select_index).
     draft_extend_select_index: Optional[torch.Tensor] = None
 
+    # CC conditional decode only: see ForwardBatch.ccd_replicated_lm_head_weight.
+    ccd_replicated_lm_head_weight: Optional[torch.Tensor] = None
+
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
         # MLP-sync may turn an idle rank into a dummy EXTEND for DP prefill
@@ -401,6 +404,7 @@ class LogitsMetadata:
             dp_padding_mode=DpPaddingMode.SUM_LEN,
             mm_input_embeds=forward_batch.mm_input_embeds,
             draft_extend_select_index=draft_extend_select_index,
+            ccd_replicated_lm_head_weight=forward_batch.ccd_replicated_lm_head_weight,
         )
 
     def compute_dp_attention_metadata(self):
@@ -899,7 +903,54 @@ class LogitsProcessor(nn.Module):
             else LoRABatchLayout.DP_LOCAL
         )
         with get_forward().scoped(lora_batch_layout=lora_batch_layout):
-            logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
+            replicated_weight = logits_metadata.ccd_replicated_lm_head_weight
+            if replicated_weight is None:
+                # ForwardBatch.ccd_replicated_lm_head_weight is only threaded
+                # through on CC conditional decode's own forward calls
+                # (dflash_worker_v2.run_ccd_chunk explicitly assigns it). The
+                # REGULAR (non-CCD) decode/verify forward pass -- the one
+                # actually captured into the per-shape graphs at server
+                # startup, which CCD later clones as child nodes -- never
+                # populates it. Fall back to the process-wide mirror so the
+                # real AllGather below (and its illegal-inside-a-conditional-
+                # body cross-stream event join) never gets captured into any
+                # graph CCD might later clone, regardless of which forward
+                # path built it. See dflash_worker_v2._CCD_REPLICATED_LM_HEAD_
+                # WEIGHT's docstring.
+                from sglang.srt.speculative.dflash_worker_v2 import (
+                    _CCD_REPLICATED_LM_HEAD_WEIGHT,
+                )
+
+                replicated_weight = _CCD_REPLICATED_LM_HEAD_WEIGHT
+            use_ccd_local_logits = (
+                replicated_weight is not None
+                and self.do_tensor_parallel_all_gather
+                and not self.use_attn_tp_group
+            )
+            import os as _os_dbg2
+            if _os_dbg2.environ.get("SGLANG_CCD_LMHEAD_DEBUG") == "1":
+                import sys as _sys_dbg2
+                _sys_dbg2.stderr.write(
+                    f"CCD_LMHEAD_DEBUG[logits]: use_ccd_local_logits={use_ccd_local_logits} "
+                    f"replicated_weight_is_none={replicated_weight is None} "
+                    f"do_tensor_parallel_all_gather={self.do_tensor_parallel_all_gather} "
+                    f"use_attn_tp_group={self.use_attn_tp_group}\n"
+                )
+                _sys_dbg2.stderr.flush()
+            if use_ccd_local_logits:
+                # CC conditional decode: the AllGather below is illegal inside
+                # CCD's captured region (see tdx-checkpoints/080 -- GPU CC blocks
+                # the multicast path this gatherer otherwise uses, forcing a
+                # plain NCCL AllGather fallback, which CUDA graph capture
+                # forbids). The weight is static, so compute full-vocab logits
+                # fully locally instead of sharded-matmul-then-gather -- the
+                # same trick already used for DFlash's draft greedy sampler
+                # (dflash_worker_v2.py::_greedy_sample_from_vocab_parallel_head).
+                logits = torch.matmul(
+                    hidden_states.to(replicated_weight.dtype), replicated_weight.T
+                )
+            else:
+                logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
         _trace_e2e_logits("lm_head_returned", logits_shape=tuple(logits.shape))
         if envs.SGLANG_TRACE_LOGITS_E2E_SYNC.get():
             _trace_e2e_logits("post_lm_head_sync_enter")
@@ -910,7 +961,7 @@ class LogitsProcessor(nn.Module):
             logits.mul_(self.logit_scale)
 
         used_tp_lm_head_all_to_all = False
-        if self.do_tensor_parallel_all_gather:
+        if self.do_tensor_parallel_all_gather and not use_ccd_local_logits:
             _trace_e2e_logits(
                 "tp_logits_gather_enter", logits_shape=tuple(logits.shape)
             )

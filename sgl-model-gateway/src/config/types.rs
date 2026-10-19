@@ -12,6 +12,14 @@ pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 pub const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 500;
 pub const DEFAULT_TCP_KEEPALIVE_SECS: u64 = 30;
 
+pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 1800;
+/// Unbounded: a healthy stream is bounded by the silence clocks below.
+pub const DEFAULT_STREAM_TOTAL_TIMEOUT_SECS: u64 = 0;
+/// Sized off measured TTFT p50 of 8.55-50.30s on this workload; >10x headroom.
+pub const DEFAULT_REQUEST_READ_TIMEOUT_SECS: u64 = 600;
+/// Sized off measured ITL p50 of 14.5-39.6ms.
+pub const DEFAULT_STREAM_IDLE_TIMEOUT_SECS: u64 = 120;
+
 /// Main router configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouterConfig {
@@ -22,11 +30,65 @@ pub struct RouterConfig {
     pub host: String,
     pub port: u16,
     pub max_payload_size: usize,
+    /// Total deadline for a NON-STREAMING request. Does not apply to streams;
+    /// see [`crate::core::deadlines`] for the split.
     pub request_timeout_secs: u64,
+    /// Total deadline for a STREAMING request. 0 means unbounded.
+    #[serde(default = "default_stream_total_timeout_secs")]
+    pub stream_total_timeout_secs: u64,
+    /// Socket silence tolerated before a request fails, including the wait for
+    /// response headers. Must exceed the worst legitimate TTFT. 0 disables.
+    #[serde(default = "default_request_read_timeout_secs")]
+    pub request_read_timeout_secs: u64,
+    /// Silence tolerated between SSE frames once a stream has started. 0
+    /// disables.
+    #[serde(default = "default_stream_idle_timeout_secs")]
+    pub stream_idle_timeout_secs: u64,
     pub worker_startup_timeout_secs: u64,
     pub worker_startup_check_interval_secs: u64,
     pub dp_aware: bool,
     pub api_key: Option<String>,
+    /// Gates the admin route group. When set, admin endpoints require this key
+    /// and do NOT accept `api_key`; when unset they are refused outright. Mirrors
+    /// the worker's `--admin-api-key` (server_args.py).
+    pub admin_api_key: Option<String>,
+    /// Narrower static credential: reaches the admission ceiling but not
+    /// metric recording or key minting. Optional.
+    pub ops_api_key: Option<String>,
+    /// Path backing runtime-minted keys. Unset disables `/admin/keys`.
+    pub api_key_store: Option<String>,
+    /// Refuse chat requests carrying video parts. Set when the deployment has
+    /// declared that it does not accept video traffic.
+    pub reject_video: bool,
+    /// Ceiling on the number of images in flight on this gateway. A chat or
+    /// responses request whose image parts would push the total above it is
+    /// refused with 429. Image retention on the base GPU grows with the number
+    /// of images processed concurrently, so this bounds worker memory rather
+    /// than request count. 0 disables.
+    #[serde(default)]
+    pub max_inflight_images: i64,
+    /// Image area admitted concurrently, in megapixels. 0 disables.
+    ///
+    /// The ceiling that protects base-GPU memory. Count alone cannot: 200
+    /// thumbnails and 200 full-resolution photographs are the same count and
+    /// ~14x apart in preprocessing cost. Measured on a B300 node at
+    /// max_total_tokens=5000000, ~1000 MP in flight was clean and ~1250 MP
+    /// exhausted the base GPU and wedged the replica. Re-derive if the pool
+    /// size changes.
+    #[serde(default)]
+    pub max_inflight_megapixels: i64,
+    /// Images accepted in a SINGLE request. 0 disables.
+    ///
+    /// The in-flight ceilings bound concurrency; this bounds the request
+    /// itself, so the boundary does not move with load.
+    #[serde(default)]
+    pub max_images_per_request: i64,
+    /// Area charged to an image whose dimensions cannot be read, in megapixels.
+    ///
+    /// Remote URLs above all: the router does not fetch them, so their size is
+    /// unknowable at admission. 0 falls back to the spec's max_total_pixels.
+    #[serde(default)]
+    pub unmeasured_image_megapixels: i64,
     pub discovery: Option<DiscoveryConfig>,
     pub metrics: Option<MetricsConfig>,
     pub trace_config: Option<TraceConfig>,
@@ -45,7 +107,10 @@ pub struct RouterConfig {
     pub max_concurrent_requests: i32,
     pub queue_size: usize,
     pub queue_timeout_secs: u64,
-    /// If not set, defaults to max_concurrent_requests
+    /// Token bucket refill rate. If not set, the bucket runs in pure
+    /// concurrency mode (permits return only on request completion), which is
+    /// what `max_concurrent_requests` and `POST /admission` describe. Setting
+    /// this opts into throughput rate limiting instead.
     pub rate_limit_tokens_per_second: Option<i32>,
     pub cors_allowed_origins: Vec<String>,
     pub retry: RetryConfig,
@@ -146,6 +211,18 @@ fn default_pool_max_idle_per_host() -> usize {
 
 fn default_tcp_keepalive_secs() -> u64 {
     DEFAULT_TCP_KEEPALIVE_SECS
+}
+
+fn default_stream_total_timeout_secs() -> u64 {
+    DEFAULT_STREAM_TOTAL_TIMEOUT_SECS
+}
+
+fn default_request_read_timeout_secs() -> u64 {
+    DEFAULT_REQUEST_READ_TIMEOUT_SECS
+}
+
+fn default_stream_idle_timeout_secs() -> u64 {
+    DEFAULT_STREAM_IDLE_TIMEOUT_SECS
 }
 
 impl TokenizerCacheConfig {
@@ -509,12 +586,23 @@ impl Default for RouterConfig {
             policy: PolicyConfig::Random,
             host: "0.0.0.0".to_string(),
             port: 3001,
-            max_payload_size: 536_870_912,     // 512MB
-            request_timeout_secs: 1800,        // 30 minutes
+            max_payload_size: 536_870_912, // 512MB
+            request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
+            stream_total_timeout_secs: default_stream_total_timeout_secs(),
+            request_read_timeout_secs: default_request_read_timeout_secs(),
+            stream_idle_timeout_secs: default_stream_idle_timeout_secs(),
             worker_startup_timeout_secs: 1800, // 30 minutes for large model loading
             worker_startup_check_interval_secs: 30,
             dp_aware: false,
             api_key: None,
+            admin_api_key: None,
+            ops_api_key: None,
+            api_key_store: None,
+            reject_video: false,
+            max_inflight_images: 0,
+            max_inflight_megapixels: 0,
+            max_images_per_request: 0,
+            unmeasured_image_megapixels: 0,
             discovery: None,
             metrics: None,
             trace_config: None,
@@ -558,6 +646,15 @@ impl Default for RouterConfig {
 }
 
 impl RouterConfig {
+    /// Pixels charged to an image whose dimensions cannot be read.
+    pub fn unmeasured_image_pixels(&self) -> u64 {
+        if self.unmeasured_image_megapixels <= 0 {
+            crate::media_policy::UNMEASURED_IMAGE_PIXELS
+        } else {
+            (self.unmeasured_image_megapixels as u64).saturating_mul(1_000_000)
+        }
+    }
+
     /// Create a new configuration with mode and policy
     pub fn new(mode: RoutingMode, policy: PolicyConfig) -> Self {
         Self {

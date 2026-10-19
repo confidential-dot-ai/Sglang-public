@@ -431,6 +431,9 @@ def handle_cache_compatibility(server_args: Any) -> None:
         raise ValueError("--swa-prefix-tails should be a non-negative integer.")
 
     if cfg.enable_lmcache:
+        from sglang.srt.mem_cache.storage.lmcache import validate_connector_options
+
+        validate_connector_options(cfg.lmcache_mode, cfg.lmcache_host_memory_backend)
         if cfg.enable_hierarchical_cache:
             raise ValueError(
                 "--enable-lmcache and --enable-hierarchical-cache are "

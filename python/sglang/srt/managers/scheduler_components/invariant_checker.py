@@ -554,4 +554,5 @@ def create_scheduler_watchdog(
         watchdog_timeout=watchdog_timeout,
         soft=soft,
         dump_info=dump_info,
+        is_starting_up=lambda: scheduler.is_initializing,
     )

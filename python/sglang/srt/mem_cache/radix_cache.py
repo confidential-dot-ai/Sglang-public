@@ -499,6 +499,42 @@ class RadixCache(BasePrefixCache):
         radix_key, _, _ = self._insert_cache(req, token_ids, split_prompt=True)
         req.kv.cache_protected_len = len(radix_key)
 
+    def cache_finished_req(self, req: Req, *, owned_kv_len: int):
+        """Cache request when it finishes."""
+        # Ring-attention CP local-shard allocation (mem_cache/allocation.py's
+        # alloc_for_extend) writes this rank's owned tokens to two scattered
+        # absolute offsets, not the contiguous [0:len) run every other path
+        # below assumes -- reading kv_indices as a contiguous slice would
+        # silently pick up unwritten/garbage positions for any shard that
+        # doesn't start at offset 0, freeing the wrong slots while the real
+        # allocated shards leak forever. These requests always have
+        # skip_radix_cache_insert=True (set by _cp_shard_info_for_batch's
+        # caller), so there is no tree-insertion case to handle here -- just
+        # free the two real ranges directly.
+        cp_shard_offsets = getattr(req, "cp_local_shard_offsets", None)
+        if cp_shard_offsets is not None:
+            cp_shard_lens = req.cp_local_shard_lens
+            indices_to_free = torch.cat(
+                [
+                    self.req_to_token_pool.req_to_token[
+                        req.req_pool_idx, offset : offset + length
+                    ]
+                    for offset, length in zip(cp_shard_offsets, cp_shard_lens)
+                ]
+            )
+            self.token_to_kv_pool_allocator.free(indices_to_free)
+            if req.last_node is not None:
+                self.dec_lock_ref(req.last_node)
+            return
+
+        if not self.disable:
+            token_ids = (req.origin_input_ids + req.output_ids)[:owned_kv_len]
+            radix_key, _, _ = self._adopt(req, token_ids, split_prompt=True)
+            req.kv.cache_protected_len = len(radix_key)
+        # The protected prefix is not this req's to free.
+        self.free_kv_row(req.kv, [(req.kv.cache_protected_len, owned_kv_len)])
+        self.unpin(req)
+
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""
         if self.disable:

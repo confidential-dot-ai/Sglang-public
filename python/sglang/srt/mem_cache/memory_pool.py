@@ -1904,6 +1904,17 @@ class KVCache(abc.ABC):
         k_buffer, v_buffer = self.get_kv_buffer(self.start_layer)
         return k_buffer.shape, v_buffer.shape
 
+    @property
+    def kv_buffer_dtype(self) -> torch.dtype:
+        """Dtype of the tensors get_key_buffer/get_value_buffer/get_kv_buffer
+        hand to attention backends. Equals self.dtype for pools whose accessor
+        is a bit-reinterpreting view; pools whose accessor materializes a
+        converted copy (FP4 dequant-on-read) override this -- backends that
+        plan kernels around a KV dtype (flashinfer) must use this, not the
+        configured --kv-cache-dtype, or plan/runtime dtypes diverge.
+        """
+        return self.dtype
+
     @abc.abstractmethod
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
         raise NotImplementedError()
@@ -3318,6 +3329,17 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
         del self.k_scale_buffer
         del self.v_scale_buffer
 
+    @property
+    def kv_buffer_dtype(self) -> torch.dtype:
+        # _get_key_buffer/_get_value_buffer dequantize the packed FP4 pool via
+        # BlockFP4KVQuantizeUtil.batched_dequantize, whose output dtype is
+        # bf16 (its default, never overridden here) -- NOT the configured
+        # float4_e2m1fn_x2. Backends planning kernels around the KV dtype
+        # must see bf16 or their plan/runtime dtype check fails.
+        if self.store_dtype != self.dtype:
+            return torch.bfloat16
+        return self.dtype
+
     def _get_key_buffer(self, layer_id: int):
         # for internal use of referencing
         if self.store_dtype != self.dtype:
@@ -4119,6 +4141,11 @@ class HybridLinearKVPool(KVCache):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
+    @property
+    def kv_buffer_dtype(self) -> torch.dtype:
+        # get_kv_buffer delegates to full_kv_pool, so its dtype does too.
+        return self.full_kv_pool.kv_buffer_dtype
+
     def get_key_buffer(self, layer_id: int, scale: Optional[float] = None):
         self._wait_for_layer(layer_id)
         layer_id = self._transfer_full_attention_id(layer_id)
@@ -4758,6 +4785,14 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
     def _clear_buffers(self):
         del self.kv_buffer
         del self.kv_scale_buffer
+
+    @property
+    def kv_buffer_dtype(self) -> torch.dtype:
+        # get_key_buffer dequantizes the packed FP4 pool to bf16
+        # (batched_dequantize's default) -- same contract as MHATokenToKVPoolFP4.
+        if self.store_dtype != self.dtype:
+            return torch.bfloat16
+        return self.dtype
 
     def get_key_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:

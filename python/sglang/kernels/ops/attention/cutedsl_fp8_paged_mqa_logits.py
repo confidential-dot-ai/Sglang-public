@@ -62,7 +62,7 @@ import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
-from cutlass import Float16, Int32
+from cutlass import Float16, Int32, Uint32
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm, vector
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
@@ -107,6 +107,67 @@ def unpack_f16x2(
         vector.extract(v, dynamic_position=[], static_position=[1], loc=loc, ip=ip)
     )
     return r0, r1
+
+
+@dsl_user_op
+def atomic_add_i32(
+    value: Int32,
+    gmem_ptr: cute.Pointer,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Fire-and-forget global int32 reduction for the top-k histogram."""
+    llvm.inline_asm(
+        None,
+        [
+            gmem_ptr.toint(loc=loc, ip=ip).ir_value(),
+            Int32(value).ir_value(loc=loc, ip=ip),
+        ],
+        "red.global.add.u32 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def elem_pointer(
+    tensor: cute.Tensor,
+    coord: cute.Coord,
+    *,
+    loc=None,
+    ip=None,
+) -> cute.Pointer:
+    return tensor.iterator + cute.crd2idx(coord, tensor.layout, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def warp_match_any_i32(
+    value: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> Uint32:
+    """Return the active-lane mask whose int32 value matches this lane's."""
+    return Uint32(
+        llvm.inline_asm(
+            Uint32.mlir_type,
+            [Int32(value).ir_value(loc=loc, ip=ip)],
+            "{\n\t"
+            ".reg .b32 active;\n\t"
+            "activemask.b32 active;\n\t"
+            "match.any.sync.b32 $0, $1, active;\n\t"
+            "}",
+            "=r,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 @dsl_user_op
@@ -217,6 +278,9 @@ class FP8MQALogitsKernel:
         acc_dtype=cutlass.Float32,
         output_dtype=cutlass.Float32,
         enable_pdl: bool = True,
+        emit_topk_histogram: bool = False,
+        num_init_tokens: int = 0,
+        num_local_tokens: int = 0,
     ):
         self.block_kv = block_kv
         self.phys_block_kv = phys_block_kv
@@ -237,6 +301,9 @@ class FP8MQALogitsKernel:
         self.N = next_n * num_heads
         self.num_sms = num_sms
         self.enable_pdl = enable_pdl
+        self.emit_topk_histogram = emit_topk_histogram
+        self.num_init_tokens = num_init_tokens
+        self.num_local_tokens = num_local_tokens
         self.num_epi_subtiles = num_epi_subtiles
         self.epi_dtype = epi_dtype
         self.epi_bytes = 2 if epi_dtype == cutlass.Float16 else 4
@@ -377,6 +444,8 @@ class FP8MQALogitsKernel:
         b: cute.Tensor,  # Q: [N, head_dim, batch_size]
         weights: cute.Tensor,  # [N, batch_size] (transposed for TMA)
         logits: cute.Tensor,  # [batch_size * next_n, max_context_len]
+        topk_histogram: cute.Tensor,  # [batch_size * next_n, 1024] int32, or dummy
+        topk_lengths: cute.Tensor,  # [batch_size * next_n] int32, or dummy
         block_table: cute.Tensor,  # [batch_size, max_blocks_per_seq]
         context_lens: cute.Tensor,  # [batch_size]
         schedule_meta: cute.Tensor,  # [num_sms+1, 2] int32
@@ -523,6 +592,8 @@ class FP8MQALogitsKernel:
             tma_atom_s,
             tma_tensor_s,
             logits,
+            topk_histogram,
+            topk_lengths,
             block_table,
             context_lens,
             schedule_meta,
@@ -556,6 +627,8 @@ class FP8MQALogitsKernel:
         tma_atom_s: cute.CopyAtom,
         mS_tma: cute.Tensor,  # Scales TMA coord tensor [block_kv, num_phys_blocks]
         mLogits: cute.Tensor,  # [batch_size * next_n, max_context_len]
+        mTopkHistogram: cute.Tensor,  # [batch_size * next_n, 1024] int32
+        mTopkLengths: cute.Tensor,  # [batch_size * next_n] int32
         mBlockTable: cute.Tensor,  # [batch_size, max_blocks_per_seq]
         mContextLens: cute.Tensor,  # [batch_size]
         mScheduleMeta: cute.Tensor,  # [num_sms+1, 2] int32
@@ -1543,13 +1616,46 @@ class FP8MQALogitsKernel:
                             result_t = (s0x + s0y + s1x + s1y) * cutlass.Float32(0.5)
                         out_row = q_idx * next_n + t
                         if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
-                            mLogits[(out_row, kv_pos)] = self.output_dtype(
-                                result_t * Float16(scale_val)
-                            )
+                            score = result_t * Float16(scale_val)
                         else:
-                            mLogits[(out_row, kv_pos)] = self.output_dtype(
-                                result_t * scale_val
-                            )
+                            score = result_t * scale_val
+                        score_out = self.output_dtype(score)
+                        if cutlass.const_expr(self.emit_topk_histogram):
+                            row_len = mTopkLengths[out_row]
+                            is_forced = False
+                            if cutlass.const_expr(self.num_init_tokens > 0):
+                                is_forced = kv_pos < self.num_init_tokens
+                            if cutlass.const_expr(self.num_local_tokens > 0):
+                                is_forced = is_forced | (
+                                    kv_pos + self.num_local_tokens >= row_len
+                                )
+                            if kv_pos < row_len and is_forced:
+                                score_out = self.output_dtype(float("inf"))
+                            if kv_pos < row_len:
+                                # Match extract_coarse_bin<10>: round to fp16,
+                                # map sign/magnitude bits to an ordered key, and
+                                # retain its ten most significant bits.
+                                packed = pack_f16x2(
+                                    Float16(score_out), Float16(score_out)
+                                )
+                                fp16_bits = packed & 0xFFFF
+                                if (fp16_bits & 0x8000) != 0:
+                                    ordered = (~fp16_bits) & 0xFFFF
+                                else:
+                                    ordered = fp16_bits | 0x8000
+                                hist_bin = ordered >> 6
+                                peers = warp_match_any_i32(hist_bin)
+                                lanes_before = (
+                                    Uint32(1) << cute.arch.lane_idx()
+                                ) - 1
+                                if (peers & lanes_before) == 0:
+                                    atomic_add_i32(
+                                        Int32(cute.arch.popc(peers)),
+                                        elem_pointer(
+                                            mTopkHistogram, (out_row, hist_bin)
+                                        ),
+                                    )
+                        mLogits[(out_row, kv_pos)] = score_out
 
                     # Advance: inline fetch_next_task
                     next_kv_idx = kv_idx + NUM_MATH_WG
@@ -1781,13 +1887,43 @@ class FP8MQALogitsKernel:
                             result_t = (s0x + s0y + s1x + s1y) * cutlass.Float32(0.5)
                         out_row = q_idx * next_n + t
                         if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
-                            mLogits[(out_row, kv_pos)] = self.output_dtype(
-                                result_t * Float16(scale_val)
-                            )
+                            score = result_t * Float16(scale_val)
                         else:
-                            mLogits[(out_row, kv_pos)] = self.output_dtype(
-                                result_t * scale_val
-                            )
+                            score = result_t * scale_val
+                        score_out = self.output_dtype(score)
+                        if cutlass.const_expr(self.emit_topk_histogram):
+                            row_len = mTopkLengths[out_row]
+                            is_forced = False
+                            if cutlass.const_expr(self.num_init_tokens > 0):
+                                is_forced = kv_pos < self.num_init_tokens
+                            if cutlass.const_expr(self.num_local_tokens > 0):
+                                is_forced = is_forced | (
+                                    kv_pos + self.num_local_tokens >= row_len
+                                )
+                            if kv_pos < row_len and is_forced:
+                                score_out = self.output_dtype(float("inf"))
+                            if kv_pos < row_len:
+                                packed = pack_f16x2(
+                                    Float16(score_out), Float16(score_out)
+                                )
+                                fp16_bits = packed & 0xFFFF
+                                if (fp16_bits & 0x8000) != 0:
+                                    ordered = (~fp16_bits) & 0xFFFF
+                                else:
+                                    ordered = fp16_bits | 0x8000
+                                hist_bin = ordered >> 6
+                                peers = warp_match_any_i32(hist_bin)
+                                lanes_before = (
+                                    Uint32(1) << cute.arch.lane_idx()
+                                ) - 1
+                                if (peers & lanes_before) == 0:
+                                    atomic_add_i32(
+                                        Int32(cute.arch.popc(peers)),
+                                        elem_pointer(
+                                            mTopkHistogram, (out_row, hist_bin)
+                                        ),
+                                    )
+                        mLogits[(out_row, kv_pos)] = score_out
 
                     # Advance: inline fetch_next_task
                     next_kv_idx = kv_idx + NUM_MATH_WG

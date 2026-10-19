@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, Optional
 import torch
 import triton
 import triton.language as tl
-
 from sglang.kernels.ops.memory.common import (
     get_last_loc_triton,
     get_last_loc_triton_safe,
@@ -27,7 +26,11 @@ from sglang.srt.mem_cache.common import (
     evict_from_tree_cache,
 )
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
-from sglang.srt.runtime_context import attention_backends, get_parallel
+from sglang.srt.runtime_context import (
+    attention_backends,
+    get_parallel,
+    get_schedule,
+)
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -341,6 +344,111 @@ def _alloc_page_size(batch: ScheduleBatch) -> int:
     return batch.tree_cache.page_size
 
 
+def _cp_shard_info_for_batch(batch: "ScheduleBatch"):
+    """
+    If this extend batch is eligible for ring-attention CP's local-shard-only
+    allocation, return (local_shard_offsets, local_shard_lens) for this rank
+    -- the same pair cp_ring_attn_forward_extend/cp_save_kv_cache_local_only
+    derive from ContextParallelMetadata, recomputed here from the same
+    prepare_context_parallel_metadata() so there is one formula, not two.
+
+    Deliberately more conservative than can_cp_split() (used by the model's
+    forward pass to decide whether to run CP compute): excludes chunked
+    requests and any cached prefix. Safe by construction -- if this function
+    returns None but compute still runs CP, cp_save_kv_cache_local_only still
+    writes correctly into the (larger, standard-allocated) out_cache_loc by
+    absolute offset; the only cost is a missed memory-saving opportunity,
+    never a correctness gap.
+    """
+    from sglang.srt.environ import envs
+
+    if envs.SGLANG_CP_ATTN_MODE.get() != "ring":
+        return None
+
+    from sglang.srt.layers.utils.cp_utils import (
+        is_prefill_context_parallel_enabled,
+        prepare_context_parallel_metadata,
+    )
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    if not is_prefill_context_parallel_enabled():
+        return None
+    if get_parallel().attn_cp_size <= 1:
+        return None
+    if len(batch.reqs) != 1:
+        return None
+    if batch.forward_mode != ForwardMode.EXTEND:
+        return None
+    req = batch.reqs[0]
+    if getattr(req, "is_chunked", 0):
+        return None
+    if batch.prefix_lens[0] != 0:
+        return None
+    if batch.extend_lens[0] // (get_parallel().attn_cp_size * 2) == 0:
+        return None
+    _page_size = get_schedule().page_size
+    if _page_size and _page_size > 1:
+        if batch.extend_lens[0] // (get_parallel().attn_cp_size * 2) < _page_size:
+            return None
+
+    cp_meta = prepare_context_parallel_metadata(
+        batch.extend_lens[0],
+        get_parallel().attn_cp_rank,
+        get_parallel().attn_cp_size,
+        batch.seq_lens_cpu.tolist(),
+        extend_seqs_len=[batch.extend_lens[0]],
+    )
+    if cp_meta.local_shard_offsets is None:
+        return None
+    return cp_meta.local_shard_offsets, cp_meta.local_shard_lens
+
+
+def write_cache_indices_cp(
+    out_cache_loc: torch.Tensor,
+    req_pool_idx: int,
+    local_shard_offsets: list,
+    local_shard_lens: list,
+    req_to_token_pool: ReqToTokenPool,
+):
+    """
+    Ring-attention CP counterpart to write_cache_indices: writes the
+    cp_local_total_len allocated slots into the two (non-contiguous)
+    absolute positions this rank actually owns, instead of one contiguous
+    [prefix_len, seq_len) run. can_cp_split() restricts CP to batch size 1,
+    so this is always a single request.
+    """
+    pt = 0
+    for offset, length in zip(local_shard_offsets, local_shard_lens):
+        req_to_token_pool.write(
+            (req_pool_idx, slice(offset, offset + length)),
+            out_cache_loc[pt : pt + length],
+        )
+        pt += length
+
+
+def preallocated_extend_locs(
+    batch: ScheduleBatch,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``alloc_for_extend`` for requests whose extend slots already sit in
+    req_to_token (a PD decode replaying a transferred prompt tail)."""
+    req_pool_indices = [r.kv.req_pool_idx for r in batch.reqs]
+    req_to_token = batch.req_to_token_pool.req_to_token
+    out_cache_loc = torch.cat(
+        [
+            req_to_token[idx, prefix_len : prefix_len + extend_len]
+            for idx, prefix_len, extend_len in zip(
+                req_pool_indices, batch.prefix_lens, batch.extend_lens
+            )
+        ]
+    ).to(torch.int64)
+    req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
+    return (
+        out_cache_loc,
+        req_pool_indices_cpu.to(batch.device, non_blocking=True),
+        req_pool_indices_cpu,
+    )
+
+
 def alloc_for_extend(
     batch: ScheduleBatch,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -379,6 +487,102 @@ def alloc_for_extend(
         req_pool_indices, dtype=torch.int64, pin_memory=pin_memory
     )
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
+
+    # Ring-attention CP: this rank only ever needs pool slots for its own
+    # local shard, not the full extend length -- see
+    # _cp_shard_info_for_batch's docstring for why this check is safe to be
+    # more conservative than the model forward pass's own can_cp_split().
+    cp_shard_info = _cp_shard_info_for_batch(batch)
+    if cp_shard_info is not None:
+        local_shard_offsets, local_shard_lens = cp_shard_info
+        req = batch.reqs[0]
+        req.skip_radix_cache_insert = True
+        # Stashed for disaggregation transfer, which needs these same two
+        # absolute offsets/lens to read this rank's owned positions out of
+        # req_to_token before converting to page indices.
+        req.cp_local_shard_offsets = local_shard_offsets
+
+        if _alloc_page_size(batch) == 1:
+            cp_local_total_len = sum(local_shard_lens)
+            out_cache_loc = alloc_token_slots(batch.tree_cache, cp_local_total_len)
+            alloc_lens = local_shard_lens
+        else:
+            # Two *separate* allocator calls, one per zigzag block, each
+            # treated as its own fresh (prefix_len=0) allocation -- so each
+            # block independently starts at a page boundary in the
+            # underlying pool. A single combined-length call split
+            # afterward would only guarantee the *first* piece starts on a
+            # page boundary.
+            page_size = _alloc_page_size(batch)
+            extend_len = batch.extend_lens[0]
+            block_locs = []
+            alloc_lens = []
+            for offset, block_len in zip(local_shard_offsets, local_shard_lens):
+                # prepare_context_parallel_metadata already floors every
+                # segment but the sequence-final one to a page multiple, so
+                # only the block whose range ends at extend_len (always
+                # rank 0's "next" block) can still have a non-page-aligned
+                # real length. Round *only that block's* physical
+                # allocation up to the next page boundary -- the extra
+                # slots are never written by compute and never read by
+                # decode, so they sit as harmless unused tail space.
+                alloc_len = block_len
+                if offset + block_len == extend_len and block_len % page_size != 0:
+                    alloc_len = (
+                        (block_len + page_size - 1) // page_size
+                    ) * page_size
+                cp_seq_lens_cpu = torch.tensor([alloc_len], dtype=torch.int64)
+                cp_seq_lens_device = cp_seq_lens_cpu.to(
+                    batch.device, non_blocking=True
+                )
+                cp_prefix_lens_cpu = torch.tensor([0], dtype=torch.int64)
+                cp_prefix_lens_device = cp_prefix_lens_cpu.to(
+                    batch.device, non_blocking=True
+                )
+                cp_last_loc = torch.tensor([-1], device=batch.device)
+                block_locs.append(
+                    alloc_paged_token_slots_extend(
+                        tree_cache=batch.tree_cache,
+                        prefix_lens=cp_prefix_lens_device,
+                        prefix_lens_cpu=cp_prefix_lens_cpu,
+                        seq_lens=cp_seq_lens_device,
+                        seq_lens_cpu=cp_seq_lens_cpu,
+                        last_loc=cp_last_loc,
+                        extend_num_tokens=alloc_len,
+                    )
+                )
+                alloc_lens.append(alloc_len)
+            out_cache_loc = torch.cat(block_locs)
+
+        # cp_local_total_len / cp_local_shard_lens reflect the *allocated*
+        # (possibly page-padded) lengths, not the real split-list lengths --
+        # this is what's actually reserved in the pool, so it's what
+        # radix_cache.py's CP-aware free path and the disaggregated
+        # transfer must both use to stay consistent with what
+        # write_cache_indices_cp below actually wrote into req_to_token.
+        # Compute never sees this value -- it derives its own real lengths
+        # from split_list independently.
+        req.cp_local_total_len = sum(alloc_lens)
+        req.cp_local_shard_lens = alloc_lens
+
+        write_cache_indices_cp(
+            out_cache_loc,
+            req_pool_indices[0],
+            local_shard_offsets,
+            alloc_lens,
+            batch.req_to_token_pool,
+        )
+
+        from sglang.srt.managers.schedule_batch import ReqKvInfo
+
+        if req.kv is None:
+            req.kv = ReqKvInfo(
+                kv_allocated_len=req.cp_local_total_len, swa_evicted_seqlen=0
+            )
+        else:
+            req.kv.kv_allocated_len = req.cp_local_total_len
+
+        return out_cache_loc, req_pool_indices_device, req_pool_indices_cpu
 
     # Allocate KV cache (throws exception on failure)
     alloc_page_size = _alloc_page_size(batch)
@@ -711,6 +915,74 @@ def assign_req_to_token_pool_func(
         out_cache_loc,
         req_to_token.shape[1],
         next_power_of_2(batch_size),
+    )
+
+
+@triton.jit
+def assign_req_to_token_pool_padded(
+    req_pool_indices,
+    req_to_token,
+    start_offset,
+    length,
+    out_cache_loc,
+    pool_len: tl.constexpr,
+    stride: tl.constexpr,
+):
+    """Same per-request copy as assign_req_to_token_pool (writes
+    out_cache_loc's slice for this request into token_pool[start:start+len]),
+    but reads `out_cache_loc` at a FIXED per-request stride (pid * stride)
+    instead of a ragged, data-dependent cumulative offset
+    (sum(end[j]-start[j] for j<pid), what assign_req_to_token_pool computes)
+    -- see CCD-compact-draft-cache-under-capture design note in
+    dflash_worker_v2.py. Caller must build `out_cache_loc` as a padded
+    (batch_size, stride) layout (flattened row-major) via a matching gather
+    (DFlashWorkerV2._gather_req_to_token_segments_padded), not a ragged one;
+    `length[pid]` (a real per-request device value, loaded fresh here, never
+    a host-side/Python value) is what correctly masks off each row's unused
+    padding columns on both the read and the write side.
+    """
+    BLOCK_SIZE: tl.constexpr = 32
+    pid = tl.program_id(axis=0)
+    kv_start = tl.load(start_offset + pid)
+    kv_len = tl.load(length + pid)
+    token_pool = req_to_token + tl.load(req_pool_indices + pid) * pool_len
+    out_cache_ptr = out_cache_loc + pid * stride
+
+    save_offset = tl.arange(0, BLOCK_SIZE) + kv_start
+    load_offset = tl.arange(0, BLOCK_SIZE)
+
+    num_loop = tl.cdiv(stride, BLOCK_SIZE)
+    for _ in range(num_loop):
+        mask = load_offset < kv_len
+        data = tl.load(out_cache_ptr + load_offset, mask=mask)
+        tl.store(token_pool + save_offset, data, mask=mask)
+        save_offset += BLOCK_SIZE
+        load_offset += BLOCK_SIZE
+
+
+def assign_req_to_token_pool_padded_func(
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    start_offset: torch.Tensor,
+    length: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    batch_size: int,
+    stride: int,
+):
+    """GPU-only (no CPU fallback -- unlike assign_req_to_token_pool_func,
+    this has no sgl_kernel CPU counterpart; only ever called from CCD's
+    compact-draft-cache path, which is itself CUDA-only). `out_cache_loc`
+    must be exactly `batch_size * stride` elements, built by
+    DFlashWorkerV2._gather_req_to_token_segments_padded with the same
+    `stride`/max_len."""
+    assign_req_to_token_pool_padded[(batch_size,)](
+        req_pool_indices,
+        req_to_token,
+        start_offset,
+        length,
+        out_cache_loc,
+        req_to_token.shape[1],
+        stride,
     )
 
 

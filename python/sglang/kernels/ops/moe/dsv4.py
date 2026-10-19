@@ -10,6 +10,7 @@ from sglang.kernels.jit.utils import (
     make_cpp_args,
 )
 from sglang.srt.utils import is_xpu
+from sglang.srt.utils.custom_op import register_custom_op_from_extern
 
 _is_xpu = is_xpu()
 
@@ -107,8 +108,17 @@ def _jit_silu_and_mul_clamp_module(dtype: torch.dtype):
     )
 
 
-def mask_topk_ids(topk_ids: torch.Tensor, num_token_non_padded: torch.Tensor):
-    return _jit_mask_topk_module().run(topk_ids, num_token_non_padded)
+def _mask_topk_ids_impl(
+    topk_ids: torch.Tensor, num_token_non_padded: torch.Tensor
+) -> None:
+    _jit_mask_topk_module().run(topk_ids, num_token_non_padded)
+
+
+mask_topk_ids = register_custom_op_from_extern(
+    _mask_topk_ids_impl,
+    op_name="mask_topk_ids",
+    mutates_args=["topk_ids"],
+)
 
 
 def hash_topk(

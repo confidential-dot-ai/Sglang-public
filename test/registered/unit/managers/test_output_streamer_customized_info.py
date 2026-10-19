@@ -210,6 +210,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         quiet = _FakeReq("quiet", [10, 11])
         quiet.stream = True
         quiet.sampling_params.stream_interval = 2
+        quiet.send_token_offset = 1  # First token was already emitted.
         terminal = _FakeReq("terminal", [20], finished=True)
 
         streamer._stream_output_generation([quiet, terminal], False)
@@ -247,6 +248,7 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
         quiet = _FakeReq("quiet", [10, 11])
         quiet.stream = True
         quiet.sampling_params.stream_interval = 2
+        quiet.send_token_offset = 1  # First token was already emitted.
 
         streamer._stream_output_generation([terminal, quiet], False)
 

@@ -569,6 +569,65 @@ def async_d2h(tensor: torch.Tensor) -> torch.Tensor:
     return host
 
 
+@lru_cache(maxsize=1)
+def is_confidential_compute() -> bool:
+    """Whether the GPU is running in NVIDIA Confidential Computing (CC) mode.
+
+    Under bounce-buffer CC, device<->host copies are forced synchronous even
+    with ``non_blocking=True`` (the host destination is staged through an
+    encrypted bounce buffer). That breaks the overlap scheduler's per-step D2H
+    token readback. Detected once via NVML and cached. Overridable with
+    ``SGLANG_CONFIDENTIAL_COMPUTE=1/0`` (lets non-CC CI exercise the CC path,
+    and lets the NVML query be bypassed where pynvml is unavailable).
+    """
+    forced = os.environ.get("SGLANG_CONFIDENTIAL_COMPUTE")
+    if forced is not None:
+        return forced == "1"
+    if not torch.cuda.is_available():
+        return False
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+        try:
+            state = pynvml.nvmlSystemGetConfComputeState()
+            # ccFeature != 0 means CC is enabled (ON or devtools).
+            return int(getattr(state, "ccFeature", 0)) != 0
+        finally:
+            pynvml.nvmlShutdown()
+    except Exception as e:
+        logger.debug("Confidential-compute detection failed: %r", e)
+        return False
+
+
+@lru_cache(maxsize=1)
+def is_host_pinning_effective() -> bool:
+    """Whether ``pin_memory=True`` actually yields page-locked host memory.
+
+    Distinct from ``is_pin_memory_available``, which only reports whether the
+    allocation is *permitted*. Under GPU confidential compute the driver backs
+    "pinned" allocations with CUDA Managed memory instead
+    (``cudaPointerGetAttributes`` reports ``cudaMemoryTypeManaged``, and
+    ``cudaHostRegister`` is refused outright), which inverts the usual advice:
+    a host-to-device copy from such a buffer blocks the calling thread until
+    the target stream can execute it -- measured at 509 ms behind a busy
+    stream on B300 CC, versus 0.5 ms for a pageable source. Prefer a pageable
+    source for small host-to-device staging when this returns False; a
+    pageable source is also safe to overwrite immediately after the copy call,
+    because CUDA stages it before returning.
+
+    Device-to-host is unaffected either way: that direction waits on the data
+    dependency, not on the memory type.
+    """
+    if not torch.cuda.is_available():
+        return False
+    try:
+        return bool(torch.empty(1, dtype=torch.uint8, pin_memory=True).is_pinned())
+    except Exception as e:
+        logger.debug("Host-pinning effectiveness probe failed: %r", e)
+        return False
+
+
 def get_dispatch_device_backend():
     if is_cuda_alike():
         dispatch_key = "CUDA"
@@ -1744,7 +1803,9 @@ def load_audio(
     elif isinstance(audio_file, str) and (
         audio_file.startswith("http://") or audio_file.startswith("https://")
     ):
-        timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
+        # Same reasoning as the image path below; audio objects are bounded by
+        # the same --media-url-max-file-size-mb cap, not by 5s.
+        timeout = int(os.getenv("REQUEST_TIMEOUT", "30"))
         source = download_remote_media(audio_file, timeout=timeout)
     elif isinstance(audio_file, str) and audio_file.startswith("file://"):
         source = unquote(urlparse(audio_file).path)
@@ -2011,7 +2072,11 @@ def get_image_bytes(image_file: Union[str, bytes]) -> bytes:
     if isinstance(image_file, bytes):
         return image_file
     if image_file.startswith(("http://", "https://")):
-        timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
+        # 3s could not fetch a media object of the size this server accepts: a
+        # 10 MB image needs a sustained 26 Mbps to land inside it, and a real
+        # 9 MB fixture measured 3.2s -- a timeout, reported to the client as a
+        # 400. 30s covers 10 MB down to ~2.7 Mbps.
+        timeout = int(os.getenv("REQUEST_TIMEOUT", "30"))
         return download_remote_media(image_file, timeout=timeout)
     if image_file.startswith(("file://", "/")):
         with open(image_file, "rb") as f:
@@ -2037,7 +2102,10 @@ def _normalize_video_input(
         return video_file
     elif isinstance(video_file, str):
         if video_file.startswith(("http://", "https://")):
-            timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
+            # Sized against --media-url-max-file-size-mb (64 MB by default),
+            # which is what this server will actually accept: 10s demanded
+            # 51 Mbps. 120s covers the cap down to ~4.3 Mbps.
+            timeout = int(os.getenv("REQUEST_TIMEOUT", "120"))
             return download_remote_media(video_file, timeout=timeout)
         elif video_file.startswith("data:"):
             _, encoded = video_file.split(",", 1)
@@ -2529,10 +2597,17 @@ def broadcast_pyobj(
     dist_group: Optional[torch.distributed.ProcessGroup] = None,
     src: int = 0,
     force_cpu_device: bool = True,
+    encode_fn: Callable[[List[Any]], bytes] = pickle.dumps,
+    decode_fn: Callable[[bytes], List[Any]] = pickle.loads,
 ):
     """Broadcast inputs from src rank to all other ranks with torch.dist backend.
     The `rank` here refer to the source rank on global process group (regardless
     of dist_group argument).
+
+    `encode_fn`/`decode_fn` default to pickle, matching every existing caller's
+    behavior. Pass a different codec (e.g. a msgspec-msgpack-based one) only
+    for payloads known to be safe for it -- see
+    sglang.srt.managers.io_struct.msgpack_encode_list/msgpack_decode_list.
     """
     device = torch.device(
         "cuda"
@@ -2542,12 +2617,16 @@ def broadcast_pyobj(
         else "cpu"
     )
 
+    _bench_timing = os.environ.get("SGLANG_BCAST_PYOBJ_TIMING")
+
     if rank == src:
         if len(data) == 0:
             tensor_size = torch.tensor([0], dtype=torch.long, device=device)
             dist.broadcast(tensor_size, src=src, group=dist_group)
         else:
-            serialized_data = pickle.dumps(data)
+            _t0 = time.perf_counter() if _bench_timing else 0.0
+            serialized_data = encode_fn(data)
+            _t1 = time.perf_counter() if _bench_timing else 0.0
             size = len(serialized_data)
 
             tensor_data = torch.ByteTensor(
@@ -2557,6 +2636,12 @@ def broadcast_pyobj(
 
             dist.broadcast(tensor_size, src=src, group=dist_group)
             dist.broadcast(tensor_data, src=src, group=dist_group)
+            if _bench_timing:
+                _t2 = time.perf_counter()
+                logger.info(
+                    f"broadcast_pyobj[src] n={len(data)} size_bytes={size} "
+                    f"encode_s={_t1 - _t0:.5f} bcast_s={_t2 - _t1:.5f}"
+                )
         return data
     else:
         tensor_size = torch.tensor([0], dtype=torch.long, device=device)
@@ -2566,11 +2651,19 @@ def broadcast_pyobj(
         if size == 0:
             return []
 
+        _t0 = time.perf_counter() if _bench_timing else 0.0
         tensor_data = torch.empty(size, dtype=torch.uint8, device=device)
         dist.broadcast(tensor_data, src=src, group=dist_group)
+        _t1 = time.perf_counter() if _bench_timing else 0.0
 
         serialized_data = bytes(tensor_data.cpu().numpy())
-        data = pickle.loads(serialized_data)
+        data = decode_fn(serialized_data)
+        if _bench_timing:
+            _t2 = time.perf_counter()
+            logger.info(
+                f"broadcast_pyobj[dst] n={len(data)} size_bytes={size} "
+                f"bcast_s={_t1 - _t0:.5f} decode_s={_t2 - _t1:.5f}"
+            )
         return data
 
 
@@ -2962,36 +3055,141 @@ def direct_register_custom_op(
         raise error
 
 
+def _gpu_proc_affinity_cpu_ids(
+    *,
+    pp_size: int,
+    tp_size: int,
+    nnodes: int,
+    gpu_id: int,
+    total_pcores: int,
+    logical_cpus: int,
+    mode: str,
+    affinity_world_size: int = 0,
+    rank_offset: int = 0,
+) -> list[int]:
+    nnodes_per_tp_group = max(nnodes // pp_size, 1)
+    tp_size_per_node = tp_size // nnodes_per_tp_group
+    if tp_size_per_node <= 0:
+        raise ValueError(
+            f"Invalid TP placement: tp_size={tp_size}, nnodes={nnodes}, "
+            f"pp_size={pp_size}"
+        )
+
+    mode = mode.strip().lower()
+    if mode == "contiguous":
+        # Preserve the historical layout, including its support for multiple
+        # DP replicas per node through the modulo operation.
+        num_cores_bind = total_pcores // tp_size_per_node
+        start_cpu_id = (gpu_id * num_cores_bind) % total_pcores
+        lower_cpu_ids = list(range(start_cpu_id, start_cpu_id + num_cores_bind))
+    elif mode == "strided":
+        world_size = affinity_world_size or tp_size_per_node
+        affinity_rank = rank_offset + (gpu_id % tp_size_per_node)
+        if world_size <= 0 or affinity_rank >= world_size:
+            raise ValueError(
+                "Invalid strided CPU affinity placement: "
+                f"world_size={world_size}, rank_offset={rank_offset}, "
+                f"gpu_id={gpu_id}, tp_size_per_node={tp_size_per_node}"
+            )
+        lower_cpu_ids = list(range(affinity_rank, total_pcores, world_size))
+    else:
+        raise ValueError(
+            f"Unsupported SGLANG_CPU_AFFINITY_MODE={mode!r}; "
+            "expected 'contiguous' or 'strided'"
+        )
+
+    if not lower_cpu_ids:
+        raise ValueError(
+            f"CPU affinity mode {mode!r} assigned no cores to gpu_id={gpu_id}"
+        )
+
+    if logical_cpus != total_pcores:
+        # HT on
+        upper_cpu_ids = [cpu_id + total_pcores for cpu_id in lower_cpu_ids]
+        return list(itertools.chain(lower_cpu_ids, upper_cpu_ids))
+    return lower_cpu_ids
+
+
+def _set_process_thread_cpu_affinity(
+    process: psutil.Process,
+    cpu_ids: list[int],
+    max_passes: int = 5,
+) -> int:
+    """Apply a CPU mask to every current Linux thread in ``process``.
+
+    Affinity is a per-thread kernel property. Iterate to close the small race
+    with thread creation; once every existing thread is pinned, future threads
+    inherit the corrected mask from their creator.
+    """
+    if not hasattr(os, "sched_setaffinity") or not hasattr(
+        os, "sched_getaffinity"
+    ):
+        raise RuntimeError("All-thread CPU affinity requires sched_setaffinity")
+
+    target = set(cpu_ids)
+    for _ in range(max_passes):
+        for thread in process.threads():
+            try:
+                os.sched_setaffinity(thread.id, target)
+            except ProcessLookupError:
+                # The thread exited between psutil's snapshot and the syscall.
+                pass
+
+        live_thread_ids = [thread.id for thread in process.threads()]
+        all_pinned = True
+        for thread_id in live_thread_ids:
+            try:
+                if os.sched_getaffinity(thread_id) != target:
+                    all_pinned = False
+                    break
+            except ProcessLookupError:
+                pass
+        if all_pinned:
+            return len(live_thread_ids)
+
+    raise RuntimeError(
+        f"Failed to apply CPU affinity to every thread after {max_passes} passes"
+    )
+
+
 def set_gpu_proc_affinity(gpu_id: int):
-    # current process
     pid = os.getpid()
-    p = psutil.Process(pid)
+    process = psutil.Process(pid)
 
     parallel = get_parallel()
-    nnodes_per_tp_group = max(parallel.nnodes // parallel.pp_size, 1)
-    tp_size_per_node = parallel.tp_size // nnodes_per_tp_group
-
-    # total physical cores
     total_pcores = psutil.cpu_count(logical=False)
-    # physical cores per TP (N.B. more Cores than GPUs on node)
-    num_cores_bind = total_pcores // tp_size_per_node
+    logical_cpus = psutil.cpu_count(logical=True)
+    if total_pcores is None or logical_cpus is None:
+        raise RuntimeError("Could not determine host CPU topology")
 
-    # able to handle multiple DP per node
-    start_cpu_id = (gpu_id * num_cores_bind) % total_pcores
-    end_cpu_id = start_cpu_id + num_cores_bind
+    mode = envs.SGLANG_CPU_AFFINITY_MODE.get()
+    bind_cpu_ids = _gpu_proc_affinity_cpu_ids(
+        pp_size=parallel.pp_size,
+        tp_size=parallel.tp_size,
+        nnodes=parallel.nnodes,
+        gpu_id=gpu_id,
+        total_pcores=total_pcores,
+        logical_cpus=logical_cpus,
+        mode=mode,
+        affinity_world_size=envs.SGLANG_CPU_AFFINITY_WORLD_SIZE.get(),
+        rank_offset=envs.SGLANG_CPU_AFFINITY_RANK_OFFSET.get(),
+    )
 
-    if psutil.cpu_count() != psutil.cpu_count(logical=False):
-        # HT on
-        lower_cpu_ids = [id for id in range(start_cpu_id, end_cpu_id)]
-        upper_cpu_ids = [id + total_pcores for id in range(start_cpu_id, end_cpu_id)]
-        bind_cpu_ids = list(itertools.chain(lower_cpu_ids, upper_cpu_ids))
-    else:
-        # HT off
-        bind_cpu_ids = [id for id in range(start_cpu_id, end_cpu_id)]
-
-    # set cpu_affinity to current process
-    p.cpu_affinity(bind_cpu_ids)
-    logger.info(f"Process {pid} gpu_id {gpu_id} is running on CPUs: {p.cpu_affinity()}")
+    process.cpu_affinity(bind_cpu_ids)
+    thread_count = 1
+    all_threads = envs.SGLANG_CPU_AFFINITY_ALL_THREADS.get()
+    if all_threads:
+        thread_count = _set_process_thread_cpu_affinity(process, bind_cpu_ids)
+    logger.info(
+        "Process %s gpu_id %s CPU affinity mode=%s all_threads=%s "
+        "thread_count=%s CPUs=%s",
+        pid,
+        gpu_id,
+        mode,
+        all_threads,
+        thread_count,
+        process.cpu_affinity(),
+    )
 
 
 class MultiprocessingSerializer:

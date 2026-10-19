@@ -2062,6 +2062,12 @@ class UpdateWeightVersionReqOutput(BaseReq, kw_only=True):
     pass
 
 
+class SetToolCallParserReqInput(BaseReq, kw_only=True):
+    # The new tool-call parser name (e.g. "deepseekv4"), or None to disable
+    # tool-call parsing.
+    tool_call_parser: Optional[str] = None
+
+
 class GetWeightsByNameReqInput(BaseReq, kw_only=True):
     name: str
     truncate_size: int = 100
@@ -2241,8 +2247,9 @@ class GetInternalStateReqOutput(BaseReq, kw_only=True):
 
 
 class SetInternalStateReq(BaseReq, kw_only=True):
-    # Only numeric scheduler knobs are accepted (see Scheduler.set_internal_state).
-    server_args: Dict[str, Union[int, float]]
+    # Numeric scheduler knobs and validated structured worker commands (CED).
+    # Scheduler.set_internal_state owns the command/key/value allowlist.
+    server_args: Dict[str, Union[int, float, Dict[str, Any]]]
 
 
 class SetInternalStateReqOutput(BaseReq, kw_only=True):
@@ -2572,14 +2579,20 @@ _msgpack_encoder = msgspec.msgpack.Encoder(enc_hook=enc_hook)
 _msgpack_decoder = msgspec.msgpack.Decoder(
     Union[_all_types], dec_hook=dec_hook, ext_hook=ext_hook
 )
+_msgpack_list_decoder = msgspec.msgpack.Decoder(
+    List[Union[_all_types]], dec_hook=dec_hook, ext_hook=ext_hook
+)
 _USE_PICKLE_IPC = envs.SGLANG_USE_PICKLE_IPC.get()
 
 
 def hook_custom_types(*new_types: Type):
-    global _msgpack_decoder, _all_types
+    global _msgpack_decoder, _msgpack_list_decoder, _all_types
     _all_types = tuple(dict.fromkeys(_all_types + new_types))
     _msgpack_decoder = msgspec.msgpack.Decoder(
         Union[_all_types], dec_hook=dec_hook, ext_hook=ext_hook
+    )
+    _msgpack_list_decoder = msgspec.msgpack.Decoder(
+        List[Union[_all_types]], dec_hook=dec_hook, ext_hook=ext_hook
     )
 
 
@@ -2610,6 +2623,14 @@ def msgpack_encode(obj: Any) -> bytes:
 
 def msgpack_decode(data: bytes) -> Any:
     return _maybe_unwrap_pickle(_msgpack_decoder.decode(data))
+
+
+def msgpack_encode_list(objs: List[Any]) -> bytes:
+    return _msgpack_encoder.encode([_maybe_wrap_pickle(o) for o in objs])
+
+
+def msgpack_decode_list(data: bytes) -> List[Any]:
+    return [_maybe_unwrap_pickle(o) for o in _msgpack_list_decoder.decode(data)]
 
 
 def sock_send(socket: zmq.Socket, obj: Any, flags: int = 0) -> None:

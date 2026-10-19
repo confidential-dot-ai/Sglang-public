@@ -317,6 +317,7 @@ mod pd_responses_routing_tests {
         PDRouter {
             worker_registry: Arc::new(WorkerRegistry::new()),
             policy_registry: Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+            tokenizer_registry: Arc::new(smg::tokenizer::TokenizerRegistry::new()),
             client: reqwest::Client::new(),
             retry_config: RetryConfig::default(),
             api_key: None,

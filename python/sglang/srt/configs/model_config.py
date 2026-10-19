@@ -1027,7 +1027,104 @@ class ModelConfig:
             self.hf_config.architectures[0] = "HYV4ForCausalLMNextN"
             self.hf_config.num_nextn_predict_layers = 1
 
+    def _draft_swa_ring_window(self) -> int:
+        """Window, in tokens, to bound the draft's KV/hidden pool to. 0 = none.
+
+        Deliberately NOT "does the model implement sliding-window attention".
+        Nothing about the draft's math changes here; what slides is the pool it
+        reads from, so the question is only how far back its KV must reach.
+
+        Three sources, most explicit first:
+
+        1. SGLANG_OPT_DRAFT_SWA_RING_WINDOW, an operator's stated window. This
+           forces the ring onto a draft whose config asks for nothing of the
+           sort, which is the intended use -- the trade is a decision about
+           memory versus accept length, not a property of the checkpoint.
+        2. hf_text_config.sliding_window, when the config carries one.
+        3. The raw checkpoint's sliding_window. HF nulls this whenever
+           use_sliding_window is absent or false -- a DSpark draft that
+           declares sliding_window and every layer "sliding_attention" but
+           omits use_sliding_window has it silently rewritten to None by
+           Qwen3Config, and the ring never engages. Reading the checkpoint back recovers the
+           number the checkpoint actually states.
+        """
+        override = int(envs.SGLANG_OPT_DRAFT_SWA_RING_WINDOW.get() or 0)
+        if override > 0:
+            return override
+        configured = int(getattr(self.hf_text_config, "sliding_window", 0) or 0)
+        if configured > 0:
+            return configured
+        try:
+            import json
+            import os
+
+            with open(os.path.join(self.model_path, "config.json")) as handle:
+                raw = json.load(handle)
+        except (OSError, ValueError):
+            return 0
+        text = raw.get("text_config", raw)
+        return int(text.get("sliding_window") or 0)
+
+    def _uniform_swa_draft_layer_pattern(self) -> Optional[List[int]]:
+        """A [1]*N hybrid pattern to pool the draft's KV as a ring, else None.
+
+        Gated on SGLANG_OPT_DRAFT_SWA_RING; see that var for why it is opt-in.
+        The pattern is what the generic hybrid-SWA pooling path consumes; it
+        describes how we intend to POOL the draft's KV, not what attention the
+        draft was trained to do.
+        """
+        if not (self.is_draft_model and envs.SGLANG_OPT_DRAFT_SWA_RING.get()):
+            return None
+        window = self._draft_swa_ring_window()
+        if window <= 0:
+            logger.warning(
+                "SGLANG_OPT_DRAFT_SWA_RING=1 but no draft window could be "
+                "resolved (config declares none and no override was given), so "
+                "the draft keeps a full-context KV pool. Set "
+                "SGLANG_OPT_DRAFT_SWA_RING_WINDOW to bound it."
+            )
+            return None
+        n = self.hf_text_config.num_hidden_layers
+        layer_types = getattr(self.hf_text_config, "layer_types", None) or []
+        uniformly_sliding = len(layer_types) == n and all(
+            t == "sliding_attention" for t in layer_types
+        )
+        if not uniformly_sliding:
+            # Allowed on purpose: bounding the pool is a serving decision, and a
+            # draft that reads its whole context is exactly the case where the
+            # full-size pool is most wasteful. It is also where a too-small
+            # window costs the most accept length, so say so rather than let it
+            # pass as configuration.
+            logger.warning(
+                "Forcing a %d-token sliding KV pool on a draft whose config "
+                "does not describe uniformly-sliding layers (layer_types=%r). "
+                "The draft's attention is unchanged; only the KV/hidden pool it "
+                "can reach is bounded. This is an APPROXIMATION -- qualify "
+                "accept length against a known baseline before trusting any "
+                "throughput number from this run.",
+                window,
+                layer_types or None,
+            )
+        # The pooling path reads the window off hf_text_config, so publish the
+        # resolved value rather than leaving it None for everyone downstream.
+        self.hf_text_config.sliding_window = window
+        return [1] * n
+
     def _derive_hybrid_model(self):
+        # A uniformly-sliding draft opts into the generic hybrid-SWA path so it can
+        # pool a ring instead of one slot per target token; kv_cache_configurator
+        # sizes the ring. Set before is_hybrid_swa is read below.
+        uniform_swa_pattern = self._uniform_swa_draft_layer_pattern()
+        if uniform_swa_pattern is not None:
+            self.hf_text_config.is_hybrid_swa = True
+            self.hf_text_config.hybrid_layer_pattern = uniform_swa_pattern
+            logger.info(
+                "Draft model has %d uniformly-sliding layers (window %d): "
+                "opting into hybrid-SWA ring pooling",
+                len(uniform_swa_pattern),
+                self.hf_text_config.sliding_window,
+            )
+
         # Use self.context_len after it has been initialized to prevent using context_len which may be None.
         self.is_hybrid_swa = (
             is_hybrid_swa_model(self.hf_config.architectures, self.hf_text_config)
@@ -1604,7 +1701,12 @@ class ModelConfig:
                         )
                     with open(quant_config_file) as f:
                         quant_config_dict = json.load(f)
-                    quant_cfg = self._parse_modelopt_quant_config(quant_config_dict)
+                    parsed_cfg = self._parse_modelopt_quant_config(quant_config_dict)
+                    quant_cfg = (
+                        {**quant_config_dict.get("quantization", {}), **parsed_cfg}
+                        if parsed_cfg
+                        else parsed_cfg
+                    )
                 except huggingface_hub.errors.LocalEntryNotFoundError:
                     # Offline mode and file not in cache - this is normal for non-quantized models
                     logger.debug(
@@ -1628,7 +1730,12 @@ class ModelConfig:
                 )
                 with open(quant_config_file) as f:
                     quant_config_dict = json.load(f)
-                quant_cfg = self._parse_modelopt_quant_config(quant_config_dict)
+                parsed_cfg = self._parse_modelopt_quant_config(quant_config_dict)
+                quant_cfg = (
+                    {**quant_config_dict.get("quantization", {}), **parsed_cfg}
+                    if parsed_cfg
+                    else parsed_cfg
+                )
         return quant_cfg
 
     def _find_quant_modelslim_config(self):
@@ -2580,14 +2687,12 @@ def get_hybrid_layer_ids(
     elif "InklingForConditionalGeneration" in model_architectures:
         local_layer_ids = hf_text_config.local_layer_ids
         local_layer_id_set = set(local_layer_ids)
-        assert len(local_layer_id_set) == len(local_layer_ids), (
-            f"Inkling local_layer_ids must be unique: {local_layer_ids}"
-        )
+        assert len(local_layer_id_set) == len(
+            local_layer_ids
+        ), f"Inkling local_layer_ids must be unique: {local_layer_ids}"
         assert all(
             0 <= layer_id < num_hidden_layers for layer_id in local_layer_id_set
-        ), (
-            f"Inkling local_layer_ids must be in [0, {num_hidden_layers}): {local_layer_ids}"
-        )
+        ), f"Inkling local_layer_ids must be in [0, {num_hidden_layers}): {local_layer_ids}"
         swa_attention_layer_ids = [
             i for i in range(num_hidden_layers) if i in local_layer_id_set
         ]

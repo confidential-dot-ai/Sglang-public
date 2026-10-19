@@ -20,6 +20,17 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Draft compute dtype must match the target's resolved dtype: the DFLASH-family
+# draft consumes the target's embeddings and captured hidden states directly
+# (F.linear rejects mixed dtypes), so a draft checkpoint serialized in fp32
+# must not resolve `--dtype auto` independently (fp32 config -> fp16, while a
+# bf16 target stays bf16).
+_TORCH_DTYPE_TO_SERVER_ARG_DTYPE = {
+    torch.bfloat16: "bfloat16",
+    torch.float16: "float16",
+    torch.float32: "float32",
+}
+
 
 class DraftWorkerBundle(msgspec.Struct, frozen=True):
     draft_worker: TpModelWorker
@@ -75,7 +86,36 @@ def build_draft_tp_worker(
     draft_backend = attention_backend_override or (
         _resolve_draft_attention_backend_fallback(algo_label=algo_label)
     )
+
+    import copy
+
     from sglang.srt.layers.moe.utils import draft_model_build_scope
+
+    # Pin the draft's dtype to the target's resolved dtype (see
+    # _TORCH_DTYPE_TO_SERVER_ARG_DTYPE). The DFLASH-family draft consumes the
+    # target's embeddings and captured hidden states directly (F.linear rejects
+    # mixed dtypes), so a draft checkpoint serialized in fp32 must not resolve
+    # `--dtype auto` independently (fp32 config -> fp16, while a bf16 target
+    # stays bf16). Weight loaders cast
+    # checkpoint tensors to the parameter dtype on copy, so an fp32-serialized
+    # draft loads as (e.g.) bf16 the same way any bf16-config draft would.
+    target_dtype_arg = _TORCH_DTYPE_TO_SERVER_ARG_DTYPE.get(
+        target_model_config.dtype
+    )
+    if target_dtype_arg is not None:
+        # Post-resolution ServerArgs rejects bare assignment. ServerArgs.derive
+        # was retired; write the Struct field directly on a private deep copy
+        # so the target's args stay untouched.
+        draft_server_args = copy.deepcopy(server_args)
+        msgspec.Struct.__setattr__(draft_server_args, "dtype", target_dtype_arg)
+    else:
+        logger.warning(
+            "%s draft worker: target dtype %s has no server-args equivalent; "
+            "leaving the draft dtype resolution unchanged.",
+            algo_label,
+            target_model_config.dtype,
+        )
+        draft_server_args = server_args
 
     # The draft's model construction runs its own MoE gates; the scope routes
     # their fusion decision to the speculative leaf and gives the target its
@@ -84,7 +124,7 @@ def build_draft_tp_worker(
     # construction-only swap would build and execute under different backends.
     with draft_model_build_scope():
         draft_worker = draft_worker_cls(
-            server_args=server_args,
+            server_args=draft_server_args,
             gpu_id=gpu_id,
             nccl_port=nccl_port,
             is_draft_worker=True,

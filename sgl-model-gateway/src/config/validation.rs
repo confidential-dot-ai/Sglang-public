@@ -278,6 +278,40 @@ impl ConfigValidator {
             });
         }
 
+        // Unless the inter-frame clock is strictly tighter, the socket read
+        // timeout always fires first and it silently does nothing.
+        if config.request_read_timeout_secs > 0
+            && config.stream_idle_timeout_secs >= config.request_read_timeout_secs
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "stream_idle_timeout_secs".to_string(),
+                value: config.stream_idle_timeout_secs.to_string(),
+                reason: format!(
+                    "Must be < request_read_timeout_secs ({}) or the socket read timeout \
+                     fires first and inter-frame stall detection never runs; use 0 to \
+                     disable it deliberately",
+                    config.request_read_timeout_secs
+                ),
+            });
+        }
+
+        // All three off means a wedged worker holds the connection until the
+        // client gives up.
+        if config.stream_total_timeout_secs == 0
+            && config.stream_idle_timeout_secs == 0
+            && config.request_read_timeout_secs == 0
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "stream_idle_timeout_secs".to_string(),
+                value: "0".to_string(),
+                reason: "stream_total_timeout_secs, stream_idle_timeout_secs and \
+                         request_read_timeout_secs are all 0, so a streaming request has \
+                         no deadline of any kind and a wedged worker is never detected. \
+                         Set at least one."
+                    .to_string(),
+            });
+        }
+
         if config.queue_size > 0 && config.queue_timeout_secs == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "queue_timeout_secs".to_string(),
@@ -654,6 +688,55 @@ impl ConfigValidator {
 mod tests {
     use super::*;
     use crate::core::ConnectionMode;
+
+    fn deadline_config() -> RouterConfig {
+        RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".to_string()],
+            },
+            PolicyConfig::Random,
+        )
+    }
+
+    #[test]
+    fn shipped_deadline_defaults_validate() {
+        assert!(ConfigValidator::validate(&deadline_config()).is_ok());
+    }
+
+    #[test]
+    fn an_idle_timeout_the_read_timeout_would_preempt_is_refused() {
+        let mut config = deadline_config();
+        config.request_read_timeout_secs = 100;
+        config.stream_idle_timeout_secs = 100;
+        let err = ConfigValidator::validate(&config).unwrap_err().to_string();
+        assert!(err.contains("stream_idle_timeout_secs"), "{}", err);
+
+        config.stream_idle_timeout_secs = 99;
+        assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    /// Disabling it deliberately is allowed; the read timeout still applies.
+    #[test]
+    fn a_zero_idle_timeout_is_not_treated_as_preempted() {
+        let mut config = deadline_config();
+        config.request_read_timeout_secs = 100;
+        config.stream_idle_timeout_secs = 0;
+        assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    #[test]
+    fn a_stream_with_no_clock_at_all_is_refused() {
+        let mut config = deadline_config();
+        config.stream_total_timeout_secs = 0;
+        config.stream_idle_timeout_secs = 0;
+        config.request_read_timeout_secs = 0;
+        let err = ConfigValidator::validate(&config).unwrap_err().to_string();
+        assert!(err.contains("no deadline of any kind"), "{}", err);
+
+        // Any one of the three is enough.
+        config.stream_total_timeout_secs = 7200;
+        assert!(ConfigValidator::validate(&config).is_ok());
+    }
 
     #[test]
     fn test_validate_regular_mode() {

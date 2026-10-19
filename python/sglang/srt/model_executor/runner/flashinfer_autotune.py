@@ -44,7 +44,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-FLASHINFER_AUTOTUNE_WORKAROUND_SKIPS = frozenset()
+FLASHINFER_AUTOTUNE_WORKAROUND_SKIPS = frozenset({"mxfp8_gemm"})  # autotuning it hits an IMA
 
 
 def get_flashinfer_autotune_skip_ops(model_runner: ModelRunner) -> set[str]:
@@ -152,6 +152,9 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
         str(mr.attn_dp_size),
         str(mr.moe_ep_size),
         str(mr.model_config.hf_config.__class__.__name__),
+        # PD roles tune different profiles and must not overwrite each other's
+        # rank files when sharing a compiled-kernel cache on one machine.
+        str(get_disagg().disaggregation_mode),
     ]
     # A different skip policy must not reuse previously tuned tactics.
     skip_ops = get_flashinfer_autotune_skip_ops(mr)
@@ -284,14 +287,30 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
         tuner = AutoTuner.get()
         if reuse_cache and autotune_cache.is_file():
             tuner.load_configs(str(autotune_cache))
+        maybe_skip_logits = autotune_dummy_run_mode(run_lm_head=run_lm_head)
+        # Older flashinfer releases (< 0.6.12) lack the cache/skip_ops kwargs;
+        # drop whichever ones this build's signature doesn't accept.
+        import inspect
+
+        autotune_kwargs = {
+            "cache": None if reuse_cache else str(autotune_cache),
+            "skip_ops": skip_ops,
+        }
+        try:
+            accepted = inspect.signature(autotune).parameters
+            autotune_kwargs = {
+                k: v for k, v in autotune_kwargs.items() if k in accepted
+            }
+        except (ValueError, TypeError):
+            pass
         with (
             _autotune_process_group(sync_group),
+            torch.inference_mode(),
             autotune(
                 True,
-                cache=None if reuse_cache else str(autotune_cache),
-                skip_ops=skip_ops,
+                **autotune_kwargs,
             ),
-            autotune_dummy_run_mode(run_lm_head=run_lm_head),
+            maybe_skip_logits,
         ):
             yield
         if reuse_cache:

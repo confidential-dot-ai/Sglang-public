@@ -185,7 +185,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
                 num_experts,
                 2 * intermediate_size_per_partition,
                 hidden_size // fp4_block_k,
-                dtype=torch.float32,
+                dtype=torch.float8_e8m0fnu,
             ),
             requires_grad=False,
         )
@@ -194,7 +194,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
                 num_experts,
                 hidden_size,
                 intermediate_size_per_partition // fp4_block_k,
-                dtype=torch.float32,
+                dtype=torch.float8_e8m0fnu,
             ),
             requires_grad=False,
         )
@@ -217,11 +217,14 @@ class Mxfp4FlashinferTrtllmMoEMethod:
 
         _pad_intermediate_size(layer)
 
+        # torch.cat has no CUDA kernel for e8m0, so reorder the scales as bytes.
         w13_w, w13_s = reorder_w1w3_to_w3w1(
-            layer.w13_weight.data, layer.w13_weight_scale_inv.data
+            layer.w13_weight.data, layer.w13_weight_scale_inv.data.view(torch.uint8)
         )
         layer.w13_weight = Parameter(w13_w, requires_grad=False)
-        layer.w13_weight_scale_inv = Parameter(w13_s, requires_grad=False)
+        layer.w13_weight_scale_inv = Parameter(
+            w13_s.view(torch.float8_e8m0fnu), requires_grad=False
+        )
 
         log_info_on_rank0(
             logger,
@@ -234,10 +237,6 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         w13_scale = layer.w13_weight_scale_inv.data
         w2_scale = layer.w2_weight_scale_inv.data
         num_experts = w13.shape[0]
-
-        if w13_scale.dtype == torch.float32:
-            w13_scale = w13_scale.to(torch.float8_e8m0fnu)
-            w2_scale = w2_scale.to(torch.float8_e8m0fnu)
 
         epilogue_tile_m = 128
         g1_w, g1_s, g2_w, g2_s = [], [], [], []

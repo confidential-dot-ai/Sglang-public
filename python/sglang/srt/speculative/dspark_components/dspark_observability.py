@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import statistics
 import time
 from collections import deque
 from contextlib import contextmanager, nullcontext
 from enum import Enum
+from pathlib import Path
 from typing import Callable, ContextManager, Iterator, Optional, Union
 
 import msgspec
@@ -104,10 +106,21 @@ class DecodeStepRecord(msgspec.Struct, omit_defaults=True):
     verify_tokens_graph_key: int = -1
     predicted_step_ms: Optional[float] = None
     predicted_theta: Optional[float] = None
+    can_run_cuda_graph: Optional[bool] = None
+    proposal_folded: Optional[bool] = None
+    acceptance_path: Optional[str] = None
+    host_begin_ns: Optional[int] = None
+    host_end_ns: Optional[int] = None
+    host_step_ms: Optional[float] = None
+    cpu_gap_ms: Optional[float] = None
     step_cpu_ms: Optional[float] = None
     step_gpu_ms: Optional[float] = None
     draft_gpu_ms: Optional[float] = None
     target_verify_gpu_ms: Optional[float] = None
+    accepted_tokens: Optional[int] = None
+    context_len_min: Optional[int] = None
+    context_len_p50: Optional[float] = None
+    context_len_max: Optional[int] = None
     reqs: Optional[list[ReqDetail]] = None
 
 
@@ -123,6 +136,9 @@ class DecodeStepObservation(msgspec.Struct):
     verify_tokens_graph_key: int
     predicted_step_ms: Optional[float]
     predicted_theta: Optional[float]
+    can_run_cuda_graph: bool
+    proposal_folded: bool
+    acceptance_path: str
     verify_lens: Optional[torch.Tensor]
     confidence: Optional[torch.Tensor]
     req_pool_indices: torch.Tensor
@@ -147,6 +163,13 @@ class _PendingStep(msgspec.Struct):
     verify_tokens_graph_key: int
     predicted_step_ms: Optional[float]
     predicted_theta: Optional[float]
+    can_run_cuda_graph: bool
+    proposal_folded: bool
+    acceptance_path: str
+    host_begin_ns: Optional[int]
+    host_end_ns: Optional[int]
+    host_step_ms: Optional[float]
+    cpu_gap_ms: Optional[float]
     step_cpu_ms: Optional[float]
     rids: Optional[list[str]]
     future: Optional[FutureTensors]
@@ -161,6 +184,7 @@ class DsparkInfoDumper:
         gamma: int,
         verify_num_draft_tokens: int,
         attn_tp_rank: int,
+        tp_rank: Optional[int] = None,
         device: torch.device,
         mode_value: str,
         sps_report_interval: int = 0,
@@ -171,6 +195,7 @@ class DsparkInfoDumper:
         self.gamma = int(gamma)
         self.verify_num_draft_tokens = int(verify_num_draft_tokens)
         self.attn_tp_rank = int(attn_tp_rank)
+        self.tp_rank = self.attn_tp_rank if tp_rank is None else int(tp_rank)
         self.device = device
         self.mode_value = mode_value
         self._clock = clock
@@ -182,16 +207,23 @@ class DsparkInfoDumper:
         self._sps_report_interval = int(sps_report_interval)
         if self._sps_report_interval > 0:
             self._components.add(InfoComponent.STEP_GPU_TIME)
-        # Dedup within an attention-TP group only: records describe the
-        # DP-rank-local batch, so under dp-attention every DP rank must keep
-        # dumping (the SPS profiler reads one payload per DP rank).
-        self.enabled = bool(self._components) and self.attn_tp_rank == 0
+        # Normally dedup within an attention-TP group: records describe the
+        # DP-rank-local batch, so under dp-attention every DP rank keeps one
+        # payload. Critical-path diagnosis can explicitly retain every TP
+        # rank so rank skew can be computed offline without an in-band
+        # collective that would perturb the path being measured.
+        self.enabled = bool(self._components) and (
+            self.attn_tp_rank == 0
+            or envs.SGLANG_DSPARK_DEBUG_DUMP_ALL_RANKS.get()
+        )
         self._sps_window: list[tuple[float, float]] = []
         self._sps_mismatched = 0
 
         self._records: deque[DecodeStepRecord] = deque(maxlen=max_records)
         self._pending: Optional[_PendingStep] = None
         self._prev_stamp: Optional[float] = None
+        self._current_begin_stamp: Optional[float] = None
+        self._current_cpu_gap_ms: Optional[float] = None
 
         self._d2h_stream: Optional[torch.cuda.Stream] = None
         if self.enabled and InfoComponent.REQS in self._components:
@@ -205,6 +237,11 @@ class DsparkInfoDumper:
     def begin_step(self) -> None:
         if not self.enabled:
             return
+        now = self._clock()
+        self._current_begin_stamp = now
+        self._current_cpu_gap_ms = self._bounded_ms(
+            None if self._prev_stamp is None else now - self._prev_stamp
+        )
         self._current_segments = {}
         self._open_segments = {}
         if InfoComponent.STEP_GPU_TIME in self._components:
@@ -234,6 +271,10 @@ class DsparkInfoDumper:
 
         now = self._clock()
         step_cpu_ms = self._step_cpu_ms(now=now)
+        begin = self._current_begin_stamp
+        host_begin_ns = None if begin is None else round(begin * 1e9)
+        host_end_ns = round(now * 1e9)
+        host_step_ms = self._bounded_ms(None if begin is None else now - begin)
         self._drain_pending()
 
         future = (
@@ -251,12 +292,21 @@ class DsparkInfoDumper:
             verify_tokens_graph_key=int(obs.verify_tokens_graph_key),
             predicted_step_ms=obs.predicted_step_ms,
             predicted_theta=obs.predicted_theta,
+            can_run_cuda_graph=bool(obs.can_run_cuda_graph),
+            proposal_folded=bool(obs.proposal_folded),
+            acceptance_path=obs.acceptance_path,
+            host_begin_ns=host_begin_ns,
+            host_end_ns=host_end_ns,
+            host_step_ms=host_step_ms,
+            cpu_gap_ms=self._current_cpu_gap_ms,
             step_cpu_ms=step_cpu_ms,
             rids=obs.rids,
             future=future,
             segment_events=self._current_segments,
         )
         self._current_segments = {}
+        self._current_begin_stamp = None
+        self._current_cpu_gap_ms = None
         self._prev_stamp = now
 
     def note_non_decode_step(self) -> None:
@@ -264,6 +314,8 @@ class DsparkInfoDumper:
             return
         self._drain_pending()
         self._prev_stamp = None
+        self._current_begin_stamp = None
+        self._current_cpu_gap_ms = None
         self._current_segments = {}
         self._open_segments = {}
 
@@ -276,6 +328,8 @@ class DsparkInfoDumper:
         self._records.clear()
         self._pending = None
         self._prev_stamp = None
+        self._current_begin_stamp = None
+        self._current_cpu_gap_ms = None
         self._current_segments = {}
         self._open_segments = {}
         self._sps_window = []
@@ -285,13 +339,28 @@ class DsparkInfoDumper:
         if not self.enabled:
             return None
         self.flush()
-        return {
+        payload = {
             "mode": self.mode_value,
             "gamma": self.gamma,
             "verify_num_draft_tokens": self.verify_num_draft_tokens,
+            "tp_rank": self.tp_rank,
+            "attn_tp_rank": self.attn_tp_rank,
             "components": sorted(component.value for component in self._components),
             "records": [msgspec.to_builtins(record) for record in self._records],
         }
+        self._maybe_export_dump(payload)
+        return payload
+
+    def _maybe_export_dump(self, payload: dict) -> None:
+        output_dir = envs.SGLANG_DSPARK_DEBUG_DUMP_DIR.get()
+        if not output_dir:
+            return
+        directory = Path(output_dir).expanduser()
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"dspark-critical-path-tp{self.tp_rank}.json"
+        temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+        temporary.write_bytes(msgspec.json.encode(payload))
+        os.replace(temporary, path)
 
     def _segment_enabled(self, segment: InfoSegment) -> bool:
         if segment is InfoSegment.STEP:
@@ -350,8 +419,15 @@ class DsparkInfoDumper:
             record.verify_tokens_graph_key = pending.verify_tokens_graph_key
             record.predicted_step_ms = pending.predicted_step_ms
             record.predicted_theta = pending.predicted_theta
+            record.can_run_cuda_graph = pending.can_run_cuda_graph
+            record.proposal_folded = pending.proposal_folded
+            record.acceptance_path = pending.acceptance_path
         if InfoComponent.STEP_CPU_TIME in self._components:
             record.step_cpu_ms = pending.step_cpu_ms
+            record.host_begin_ns = pending.host_begin_ns
+            record.host_end_ns = pending.host_end_ns
+            record.host_step_ms = pending.host_step_ms
+            record.cpu_gap_ms = pending.cpu_gap_ms
         if InfoComponent.STEP_GPU_TIME in self._components:
             record.step_gpu_ms = self._segment_ms(pending, InfoSegment.STEP)
         if InfoComponent.DRAFT_GPU_TIME in self._components:
@@ -364,6 +440,12 @@ class DsparkInfoDumper:
             record.reqs = self._build_reqs(
                 host=pending.future.wait(), bs=pending.bs, rids=pending.rids
             )
+            record.accepted_tokens = sum(req.acc_len for req in record.reqs)
+            contexts = sorted(req.prefix_len for req in record.reqs)
+            if contexts:
+                record.context_len_min = contexts[0]
+                record.context_len_p50 = float(statistics.median(contexts))
+                record.context_len_max = contexts[-1]
         elif pending.future is not None:
             pending.future.wait()
 
@@ -414,10 +496,12 @@ class DsparkInfoDumper:
         prev = self._prev_stamp
         if prev is None:
             return None
-        step_cpu = now - prev
-        if not (0.0 < step_cpu <= self._max_step_cpu_seconds):
+        return self._bounded_ms(now - prev)
+
+    def _bounded_ms(self, seconds: Optional[float]) -> Optional[float]:
+        if seconds is None or not (0.0 <= seconds <= self._max_step_cpu_seconds):
             return None
-        return round(step_cpu * 1000.0, 4)
+        return round(seconds * 1000.0, 4)
 
     def _segment_ms(
         self, pending: _PendingStep, segment: InfoSegment
@@ -753,6 +837,7 @@ class DsparkStepObservers:
             gamma=gamma,
             verify_num_draft_tokens=verify_num_draft_tokens,
             attn_tp_rank=get_parallel().attn_tp_rank,
+            tp_rank=tp_rank,
             device=device,
             mode_value=planner.mode_value,
             sps_report_interval=envs.SGLANG_DSPARK_LOG_SPS_PRED_INTERVAL.get(),
@@ -768,6 +853,25 @@ class DsparkStepObservers:
             )
         self._sts_collect_path = envs.SGLANG_DSPARK_STS_COLLECT_PATH.get()
         self._sts_recorder: Optional[StsDataRecorder] = None
+
+    @property
+    def has_capture_unsafe_sink(self) -> bool:
+        """True when any per-step observability sink is active. Every active
+        sink does per-tick work that is illegal inside a captured CUDA graph
+        body (CUDA event records + synchronize for segment timing,
+        FutureTensors D2H staging, .tolist() flushes), so CCD's eligibility
+        gate (DSparkWorkerV2.ccd_capture_incompatible_reason) refuses to
+        capture while any is enabled. The confidence probe's device-side
+        accumulators would not crash a capture, but its per-step records
+        would silently count only the single trace-time tick of every chunk,
+        so it is treated as unsafe too rather than quietly producing wrong
+        calibration tables."""
+        return (
+            self._info_dumper.enabled
+            or self._block_accept_recorder is not None
+            or bool(self._sts_collect_path)
+            or bool(envs.SGLANG_DSPARK_DEBUG_CONFIDENCE_METRICS.get())
+        )
 
     # --- step lifecycle -------------------------------------------------
 
@@ -836,6 +940,8 @@ class DsparkStepObservers:
         req_pool_indices: torch.Tensor,
         verify_tier_num_tokens: int,
         dp_tier_num_tokens: Optional[int],
+        can_run_cuda_graph: bool,
+        folded_accept: bool,
     ) -> None:
         planner = self._planner
         if not proposal_folded:
@@ -898,6 +1004,15 @@ class DsparkStepObservers:
                 if layout is not None
                 else int(verify_ids_2d.numel())
             )
+            if sampling_info is None or sampling_info.is_all_greedy:
+                sampling_mode = "greedy"
+            elif sampling_info.is_any_greedy:
+                sampling_mode = "mixed"
+            else:
+                sampling_mode = "stochastic"
+            acceptance_path = (
+                "folded_greedy_graph" if folded_accept else f"eager_{sampling_mode}"
+            )
             self._info_dumper.observe_decode_step(
                 DecodeStepObservation(
                     forward_ct=forward_ct,
@@ -913,6 +1028,9 @@ class DsparkStepObservers:
                     verify_tokens_graph_key=num_verify_tokens,
                     predicted_step_ms=predicted_step_ms,
                     predicted_theta=predicted_theta,
+                    can_run_cuda_graph=can_run_cuda_graph,
+                    proposal_folded=proposal_folded,
+                    acceptance_path=acceptance_path,
                     verify_lens=layout.verify_lens if layout is not None else None,
                     confidence=confidence,
                     req_pool_indices=req_pool_indices,
