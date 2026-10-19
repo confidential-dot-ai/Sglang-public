@@ -59,7 +59,7 @@ DEVICE = torch.device("cpu")
 def _make_req(rid, pool_idx, *, output_len=10_000):
     return types.SimpleNamespace(
         rid=rid,
-        req_pool_idx=pool_idx,
+        kv=types.SimpleNamespace(req_pool_idx=pool_idx),
         sampling_params=types.SimpleNamespace(
             top_k=1, max_new_tokens=100_000, forced_token_ids=None
         ),
@@ -109,11 +109,11 @@ def _make_batch(reqs, *, seq_len=100, pool_width=4096, **overrides):
         seq_lens=torch.full((bs,), seq_len, dtype=torch.int64),
         seq_lens_cpu=torch.full((bs,), seq_len, dtype=torch.int64),
         req_pool_indices=torch.tensor(
-            [r.req_pool_idx for r in reqs], dtype=torch.int64
+            [r.kv.req_pool_idx for r in reqs], dtype=torch.int64
         ),
         req_to_token_pool=types.SimpleNamespace(
             req_to_token=torch.zeros(
-                (max(r.req_pool_idx for r in reqs) + 1 if reqs else 1, pool_width),
+                (max(r.kv.req_pool_idx for r in reqs) + 1 if reqs else 1, pool_width),
                 dtype=torch.int32,
             )
         ),
@@ -315,7 +315,7 @@ class TestSlotTableRewrite(CustomTestCase):
         for i in range(CHUNK_CAP):
             for r, req in enumerate(self.batch.reqs):
                 self.assertEqual(
-                    int(req_to_token[req.req_pool_idx, int(pos[i, r])]),
+                    int(req_to_token[req.kv.req_pool_idx, int(pos[i, r])]),
                     int(self.chunk.slot_table[i, r]),
                 )
 

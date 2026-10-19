@@ -330,7 +330,7 @@ def ccspec_capture_fingerprint(
     """
     return (
         int(batch.batch_size()),
-        tuple((req.rid, int(req.req_pool_idx)) for req in batch.reqs),
+        tuple((req.rid, int(req.kv.req_pool_idx)) for req in batch.reqs),
         int(chunk_cap),
         tuple(int(e) for e in eos_ids_host),
         int(batch.req_to_token_pool.req_to_token.data_ptr()),

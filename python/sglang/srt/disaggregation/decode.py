@@ -182,7 +182,7 @@ def _bind_root_prefix(req: Req, tree_cache: BasePrefixCache) -> None:
 def _prebuilt_extend_input_ids(batch: ScheduleBatch) -> torch.Tensor:
     """The extend tokens of a PREBUILT batch, which prepare_for_prebuilt leaves
     as input_ids=None; the draft-KV recompute runs that batch as an EXTEND."""
-    ids = [req.get_fill_ids()[len(req.prefix_indices) :] for req in batch.reqs]
+    ids = [req.get_fill_ids()[req.prefix_len :] for req in batch.reqs]
     assert [len(x) for x in ids] == list(batch.extend_lens), (
         [len(x) for x in ids],
         batch.extend_lens,
@@ -3364,14 +3364,10 @@ class SchedulerDisaggregationDecodeMixin:
         set_time_batch(reqs, "set_forward_entry_time")
 
         page_size = self.token_to_kv_pool_allocator.page_size
-        req_to_token = self.req_to_token_pool.req_to_token
         for req in reqs:
             req.init_next_round_input(self.tree_cache)
             seq_len = len(req.origin_input_ids)
             tail_start = ced_tail_start(seq_len, self.sliding_window_size, page_size)
-            req.prefix_indices = req_to_token[req.kv.req_pool_idx, :tail_start].to(
-                torch.int64
-            )
             req.prefix_len = tail_start
             req.extend_end = seq_len
             # The prompt before the tail was computed on prefill, not cached here.

@@ -4478,7 +4478,7 @@ class Scheduler(
                         req.kv.mamba_pool_idx = None
                 stop_reason = (
                     f"{res.name} next_uncached="
-                    f"{len(req.full_untruncated_fill_ids) - len(req.prefix_indices)} "
+                    f"{len(req.full_untruncated_fill_ids) - req.prefix_len} "
                     f"added={added}"
                 )
                 break

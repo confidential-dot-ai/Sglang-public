@@ -2218,7 +2218,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             grammar = getattr(req, "grammar", None)
             if isinstance(grammar, DeviceFSMGrammar):
                 rows.append(
-                    (row, int(req.req_pool_idx), grammar.fsm.on_device(self.device))
+                    (row, int(req.kv.req_pool_idx), grammar.fsm.on_device(self.device))
                 )
         return rows
 
