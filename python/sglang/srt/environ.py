@@ -1880,6 +1880,9 @@ class Envs:
     # every layer (decoder SWA bounded replay) to seed the late-layer windows, the
     # first token and the DSpark draft ring.
     SGLANG_OPT_DSV41_CED_SPLIT = EnvBool(False)
+    # CED-split prefill runs without DSpark; decode's DSpark verify window (gamma + 1)
+    # sizes its request-scoped compress rings so their PD items match decode's.
+    SGLANG_DSV41_CED_DECODE_DRAFT_TOKENS = EnvInt(0)
     # DeepSeek-V4.1 prefill-side tail for PD (prefill only, exclusive with the CED
     # split): a TP1 x PP2 prefill runs every layer, the layers after the last
     # kv_source layer only over each request's bounded prompt tail, and DSpark on

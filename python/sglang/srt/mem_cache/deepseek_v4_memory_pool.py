@@ -89,6 +89,9 @@ def resolve_compress_state_ring_size(compress_ratio: int) -> int:
         if spec.speculative_algorithm is None
         else spec.speculative_num_draft_tokens or 0
     )
+    if num_draft_tokens == 0 and envs.SGLANG_OPT_DSV41_CED_SPLIT.get():
+        # Rings are addressed by position % ring_size on both PD workers.
+        num_draft_tokens = envs.SGLANG_DSV41_CED_DECODE_DRAFT_TOKENS.get()
     return get_compress_state_ring_size(compress_ratio, num_draft_tokens)
 
 

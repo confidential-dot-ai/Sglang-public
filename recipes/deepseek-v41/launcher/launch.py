@@ -791,6 +791,11 @@ def build_plan(args):
             env["SGLANG_OPT_DSV41_PREFILL_TAIL"] = "1"
         if args.ced_split:
             env["SGLANG_OPT_DSV41_CED_SPLIT"] = "1"
+            if role == "prefill":
+                # DSpark's verify window on decode (gamma + 1), for the ring sizes.
+                env["SGLANG_DSV41_CED_DECODE_DRAFT_TOKENS"] = str(
+                    args.dspark_block_size + 1
+                )
         if role == "prefill" and args.prefill_hicache_ratio is not None:
             # SWA-only evictions here are mostly superseded conversation tails; the
             # synchronous CC copy that demoted them took 8% of scheduler time for no
