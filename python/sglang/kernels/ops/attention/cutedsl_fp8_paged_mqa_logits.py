@@ -1639,10 +1639,11 @@ class FP8MQALogitsKernel:
                                     Float16(score_out), Float16(score_out)
                                 )
                                 fp16_bits = packed & 0xFFFF
+                                # Bound before the branch: the DSL keeps a value
+                                # assigned only inside a dynamic if local to it.
+                                ordered = fp16_bits | 0x8000
                                 if (fp16_bits & 0x8000) != 0:
                                     ordered = (~fp16_bits) & 0xFFFF
-                                else:
-                                    ordered = fp16_bits | 0x8000
                                 hist_bin = ordered >> 6
                                 peers = warp_match_any_i32(hist_bin)
                                 lanes_before = (
@@ -1907,10 +1908,11 @@ class FP8MQALogitsKernel:
                                     Float16(score_out), Float16(score_out)
                                 )
                                 fp16_bits = packed & 0xFFFF
+                                # Bound before the branch: the DSL keeps a value
+                                # assigned only inside a dynamic if local to it.
+                                ordered = fp16_bits | 0x8000
                                 if (fp16_bits & 0x8000) != 0:
                                     ordered = (~fp16_bits) & 0xFFFF
-                                else:
-                                    ordered = fp16_bits | 0x8000
                                 hist_bin = ordered >> 6
                                 peers = warp_match_any_i32(hist_bin)
                                 lanes_before = (
