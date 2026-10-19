@@ -706,6 +706,10 @@ class Envs:
     SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION = EnvInt(4096)
     SGLANG_MAX_NEW_TOKENS_LIMIT = EnvInt(None)
     SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR = EnvFloat(0.75)
+    # HRRN ranks a waiting request by tokens waited / uncached**exponent. 1.0 is
+    # classic HRRN; above 1 leans toward shortest-first (warm turns ahead of cold
+    # prompts) while still aging every request.
+    SGLANG_HRRN_SIZE_EXPONENT = EnvFloat(1.0)
     # Window for the token-weighted recent cache-hit rate used to estimate
     # waiting-queue prefill load.
     SGLANG_CACHE_HIT_RATE_WINDOW_SECONDS = EnvFloat(15.0)
