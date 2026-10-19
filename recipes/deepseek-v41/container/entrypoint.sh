@@ -9,7 +9,7 @@ READY_FILE="${ENGRAM_READY_FILE:-/run/dsv41/engram.ready}"
 case "${1:-pd}" in
 engram)
     shift
-    exec python benchmark/deepseek_v41_pd/hold_engram_cache.py \
+    exec python recipes/deepseek-v41/launcher/hold_engram_cache.py \
         --model "$MODEL" --ready-file "$READY_FILE" "$@"
     ;;
 pd)

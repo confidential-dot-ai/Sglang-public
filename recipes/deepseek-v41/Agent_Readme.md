@@ -31,7 +31,7 @@ Before this becomes a customer endpoint, every TBD row needs a real answer. See 
 | component | where | port | what it does |
 | --- | --- | --- | --- |
 | **dsv41-engram-cache.service** | node | — | runs the Engram holder container, which keeps the Engram pages locked in RAM for every worker. Must outlive any pair |
-| **dsv41-pd.service** | node | — | runs the pair container: `benchmark/deepseek_v41_pd/launch.py`, which supervises prefill, decode and router. Active only while the pair serves; relaunches the whole pair 240 s after a failure |
+| **dsv41-pd.service** | node | — | runs the pair container: `recipes/deepseek-v41/launcher/launch.py`, which supervises prefill, decode and router. Active only while the pair serves; relaunches the whole pair 240 s after a failure |
 | **router** (`smg`, PD mode) | node | 8030 | prefill → transfer → decode routing; `/readiness` requires both PD roles; Prometheus on `:29000` (all interfaces) |
 | **prefill worker** | node | 8031 | TP2+EP2 on GPUs 0–1, Mooncake bootstrap on 8998 |
 | **decode worker** | node | 8032 | TP2+EP2 on GPUs 2–3, DSpark speculation |
@@ -92,7 +92,7 @@ Model facts that people get wrong: 40 target layers. Engram layers are **1 and 1
 
 ## Configurations
 
-Recipes live next to this file and wrap `benchmark/deepseek_v41_pd/launch.py`. [README.md](README.md) covers usage and port overrides; the recipe table (topology, ports, transfer, speculation, status) is in [DEEPSEEK_V4.md](../../confai-docs/DEEPSEEK_V4.md#launcher-and-recipes). Operationally:
+Recipes live next to this file and wrap `recipes/deepseek-v41/launcher/launch.py`. [README.md](README.md) covers usage and port overrides; the recipe table (topology, ports, transfer, speculation, status) is in [DEEPSEEK_V4.md](../../confai-docs/DEEPSEEK_V4.md#launcher-and-recipes). Operationally:
 
 * `tp2-pd.sh` is the layout of the serving pair; the container runs it with the flags below.
 * `ced-pp2.sh` and `prefill-tail-pp2.sh` are PP2 experiments for GPUs 4–7. CED PP2 ran on the `pp-encoder` branch; prefill-tail PP2 has no recorded GPU run on any branch. Neither has run on a GPU since the merge with upstream, which rewrote the V4.1 decoder layer: the CED encoder/late graphs and the PP pre-mix hand-off were re-ported, and the prefill-side tail now uses upstream's bounded replay.
@@ -179,7 +179,7 @@ None of these exist for V4.1. Each needs an owner and a decision before customer
 ## Files
 
 * `recipes/deepseek-v41/`: launch recipes and their README.
-* `benchmark/deepseek_v41_pd/`:
+* `recipes/deepseek-v41/launcher/`:
   * `launch.py`: the supervisor;
   * `hold_engram_cache.py`: the Engram residency holder;
   * `probe_engram.py` / `probe_staged_engram.py` / `probe_custom_all_reduce.py`: preflight probes;
@@ -313,7 +313,7 @@ $PY -m pytest -q test/registered/unit/disaggregation/test_dsv41_ced_pp_transfer.
   test/registered/unit/disaggregation/test_ced_options.py \
   test/registered/unit/disaggregation/test_ced_tail_coalescing.py \
   test/registered/unit/disaggregation/test_mooncake_registration.py \
-  benchmark/deepseek_v41_pd/test_launch.py
+  recipes/deepseek-v41/launcher/test_launch.py
 ```
 
 ## Shell and tooling traps

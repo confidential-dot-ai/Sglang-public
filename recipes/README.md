@@ -9,7 +9,7 @@ file and systemd units for one PD pair.
 
 | Model | Folder | Launcher it wraps |
 | --- | --- | --- |
-| DeepSeek-V4.1 | [`deepseek-v41/`](deepseek-v41/README.md) | `benchmark/deepseek_v41_pd/launch.py` |
+| DeepSeek-V4.1 | [`deepseek-v41/`](deepseek-v41/README.md) | `recipes/deepseek-v41/launcher/launch.py` |
 
 Every recipe serves the checkout it lives in. Extra arguments and environment
 overrides pass through to the underlying launcher; see each folder's README.

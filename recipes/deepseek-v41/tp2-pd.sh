@@ -5,7 +5,7 @@
 #   decode   GPUs 6,7  TP2/EP2, split CUDA graphs, DSpark
 #   router 8040, prefill 8041, decode 8042, bootstrap 8999
 #
-# The matched control for the PP recipes (benchmark/deepseek_v41_pd/README.md,
+# The matched control for the PP recipes (recipes/deepseek-v41/launcher/README.md,
 # "Current serving configuration: split CUDA graphs").
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"

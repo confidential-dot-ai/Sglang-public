@@ -22,7 +22,7 @@ TBO were re-ported onto it.
 | Speculation | DSpark from the checkpoint, block size 5, 6-token verify |
 | Engram | Two FP8 tables in host RAM, one shared locked copy, gathered on the CPU |
 | Deployment | [`recipes/deepseek-v41/container/`](../recipes/deepseek-v41/container/README.md): image, compose file and systemd units |
-| Launcher | [`launch.py`](../benchmark/deepseek_v41_pd/launch.py), wrapped by the [recipes](../recipes/deepseek-v41/README.md) |
+| Launcher | [`launch.py`](../recipes/deepseek-v41/launcher/launch.py), wrapped by the [recipes](../recipes/deepseek-v41/README.md) |
 | Operator guide | [`Agent_Readme.md`](../recipes/deepseek-v41/Agent_Readme.md) |
 
 ## 1. The model as it matters for serving
@@ -130,7 +130,7 @@ inherited `SGLANG_*`, `SGL_*`, `MC_*`, `MOONCAKE_*` and `NCCL_*` tuning variable
 
 ### Launcher and recipes
 
-`benchmark/deepseek_v41_pd/launch.py` supports `--dry-run` and `--preflight-only`. Preflight
+`recipes/deepseek-v41/launcher/launch.py` supports `--dry-run` and `--preflight-only`. Preflight
 checks:
 
 - the checkpoint (V4.1 config, complete shards) and the Engram byte budget;
@@ -391,11 +391,11 @@ All of these are defined in `python/sglang/srt/environ.py` unless marked as a la
 | `SGLANG_OPT_FUSE_C4_FP4_STORE` | on | Fused C4 FP4 index-cache store |
 | `SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE` | off | MegaMoE; unqualified here |
 | `SGLANG_PP_LAYER_PARTITION` | unset | Set by `--prefill-pp-partition` |
-| Launcher: `--prefill-swa-prefix-tails`, `--decode-max-total-tokens`, `--num-prefill`, `--candidate-indexer`, `--transport`, `--devtools-mode` | | See the [launcher README](../benchmark/deepseek_v41_pd/README.md#launcher-arguments) and `launch.py --help` |
+| Launcher: `--prefill-swa-prefix-tails`, `--decode-max-total-tokens`, `--num-prefill`, `--candidate-indexer`, `--transport`, `--devtools-mode` | | See the [launcher README](../recipes/deepseek-v41/launcher/README.md#launcher-arguments) and `launch.py --help` |
 
 ## 6. Further reading
 
-- [benchmark/deepseek_v41_pd/README.md](../benchmark/deepseek_v41_pd/README.md): launcher usage,
+- [recipes/deepseek-v41/launcher/README.md](../recipes/deepseek-v41/launcher/README.md): launcher usage,
   arguments, preflight, Engram residency and N:1 prefill.
 - [recipes/deepseek-v41/README.md](../recipes/deepseek-v41/README.md): recipe usage, port and
   environment overrides.

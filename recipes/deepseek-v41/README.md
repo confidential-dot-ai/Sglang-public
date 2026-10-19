@@ -1,6 +1,6 @@
 # DeepSeek-V4.1 PD recipes
 
-Each recipe runs `benchmark/deepseek_v41_pd/launch.py` for one prefill/decode
+Each recipe runs `recipes/deepseek-v41/launcher/launch.py` for one prefill/decode
 pair on one node: prefill on the first two GPUs, decode on the last two.
 
 | Recipe | What it runs |

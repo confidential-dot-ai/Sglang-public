@@ -4,7 +4,7 @@
 
 RECIPE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$RECIPE_DIR/../.." && pwd)"
-LAUNCH="$REPO/benchmark/deepseek_v41_pd/launch.py"
+LAUNCH="$REPO/recipes/deepseek-v41/launcher/launch.py"
 
 PYTHON="${PYTHON:-python3}"
 MODEL="${MODEL:-/data/DeepSeek-V4.1-Flash}"

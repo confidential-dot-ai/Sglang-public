@@ -43,7 +43,6 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install setuptools-scm==10.3.4 wheel==0.48.0 \
     && SGLANG_BUILD_RUST_EXTS=none uv pip install --no-deps --no-build-isolation -e python
 
-COPY benchmark/deepseek_v41_pd benchmark/deepseek_v41_pd
 COPY recipes/deepseek-v41 recipes/deepseek-v41
 
 ARG SOURCE_RECORD
