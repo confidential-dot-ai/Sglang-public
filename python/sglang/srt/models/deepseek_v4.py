@@ -4035,6 +4035,7 @@ class DeepseekV4Model(nn.Module):
             )
         logger.info(msg)
 
+    @staticmethod
     def _check_ced_encoder_graph(
         encoder_outputs, encoder_check, expected, tail: LateLayerTail
     ) -> None:
