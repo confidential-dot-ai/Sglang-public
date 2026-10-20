@@ -22,12 +22,21 @@ request replays its encoder as before.
 
 from __future__ import annotations
 
+import logging
+import time
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import msgspec
 import torch
 
 from sglang.srt.environ import envs
+
+logger = logging.getLogger(__name__)
+
+# Tail batches that re-ran the encoder because a request had no handoff state.
+_fallback_batches = 0
+_fallback_reqs = 0
+_fallback_logged_at = 0.0
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -276,6 +285,24 @@ def take_ced_boundary_slot(
     )
 
 
+def _note_fallback(missing: int, total: int) -> None:
+    """Warn (at most every 30 s) that tails are re-running the encoder."""
+    global _fallback_batches, _fallback_reqs, _fallback_logged_at
+    _fallback_batches += 1
+    _fallback_reqs += missing
+    now = time.monotonic()
+    if now - _fallback_logged_at >= 30:
+        _fallback_logged_at = now
+        logger.warning(
+            "CED boundary handoff missing: this batch %d/%d requests lack state; "
+            "%d tail batches (%d requests) re-ran the encoder so far",
+            missing,
+            total,
+            _fallback_batches,
+            _fallback_reqs,
+        )
+
+
 class CedBoundaryInjection(msgspec.Struct, frozen=True):
     """A tail replay's handed-off state, in the late-layer tail's row order."""
 
@@ -293,10 +320,13 @@ def build_ced_boundary_injection(
     states = [req.ced_boundary_state for req in reqs]
     for req in reqs:
         req.ced_boundary_state = None
-    if not states or any(state is None for state in states):
+    missing = sum(state is None for state in states)
+    if not states or missing:
+        _note_fallback(missing, len(states))
         return None
     has_pre = [state.pre is not None for state in states]
     if any(has_pre) and not all(has_pre):
+        _note_fallback(0, len(states))
         return None
     residual = torch.cat([state.residual for state in states]).to(
         device, non_blocking=True
