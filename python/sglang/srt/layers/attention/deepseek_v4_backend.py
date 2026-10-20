@@ -313,6 +313,43 @@ def _bcg_low_ratio_source_projections(*args):
 _bcg_low_ratio_source_projections_fn = None
 
 
+def _low_ratio_index_topk_live(backend, layer, x, q_lora, req, pos, q, w):
+    from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+        get_tc_piecewise_forward_context,
+    )
+
+    forward_batch = get_tc_piecewise_forward_context().forward_batch
+    real = forward_batch.global_num_token_non_padded_cpu
+    if real is None:
+        real = x.shape[0]
+    if real == 0:
+        return
+    backend._low_ratio_index_topk(
+        layer,
+        x[:real],
+        q_lora[:real],
+        req[:real],
+        pos[:real],
+        forward_batch,
+        q=q[:real],
+        weights=w[:real],
+    )
+
+
+def _bcg_low_ratio_index_topk(*args):
+    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+        eager_on_graph,
+    )
+
+    global _bcg_low_ratio_index_topk_fn
+    if _bcg_low_ratio_index_topk_fn is None:
+        _bcg_low_ratio_index_topk_fn = eager_on_graph(True)(_low_ratio_index_topk_live)
+    return _bcg_low_ratio_index_topk_fn(*args)
+
+
+_bcg_low_ratio_index_topk_fn = None
+
+
 def _as_int_list(values) -> Optional[List[int]]:
     if values is None:
         return None
@@ -950,7 +987,7 @@ def _tail_rows(
     t: torch.Tensor, *, token_indices: torch.Tensor, contiguous_start: Optional[int]
 ) -> torch.Tensor:
     if contiguous_start is not None:
-        return t[contiguous_start:]
+        return t[contiguous_start : contiguous_start + token_indices.numel()]
     return t[token_indices]
 
 
@@ -1100,6 +1137,8 @@ class DSV4Metadata:
                 self.c128_compress_metadata,
                 src=static_metadata.c128_compress_metadata,
             )
+        # The eager index layers republish it every replay.
+        self.candidate_metadata = None
         self.sparse_prefill_cache = None
         self.prefill_shared_reads_snapshotted = False
 
@@ -1229,6 +1268,11 @@ class DeepseekV4AttnBackend(
         )
         self.has_c4: bool = 4 in self.present_ratios
         self.has_c128: bool = 128 in self.present_ratios
+        # The prefill graph's ratio-1/2 index layers run as eager breaks on the live
+        # rows instead of scoring a static context width.
+        self.prefill_graph_eager_indexer: bool = (
+            envs.SGLANG_OPT_DSV41_PREFILL_GRAPH_EAGER_INDEXER.get()
+        )
         cfg = model_runner.model_config.hf_text_config
         self.is_dsv41: bool = getattr(cfg, "model_type", None) == "deepseek_v41"
         self.prefill_candidates, self.decode_candidates = make_candidate_indexer(
@@ -1312,10 +1356,6 @@ class DeepseekV4AttnBackend(
         self.is_draft_runner = model_runner.is_draft_worker
         self._verify_mask = None
         self.cuda_graph_swa_out_cache_loc: Optional[torch.Tensor] = None
-
-    def _move_to_device(self, x: List[int]) -> torch.Tensor:
-        pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
-        return pin_tensor.to(self.device, non_blocking=True)
 
     def _resolve_verify_layout(
         self,
@@ -1580,7 +1620,12 @@ class DeepseekV4AttnBackend(
             ),
         )
         if use_prefill_cuda_graph and self.low_ratio_prefill_graph:
-            low = core_attn_metadata.low_ratios
+            # The eager break scores the live rows without paged indexer metadata.
+            low = (
+                ()
+                if self.prefill_graph_eager_indexer
+                else core_attn_metadata.low_ratios
+            )
             metadata.c1_indexer_metadata = (
                 self._low_ratio_prefill_indexer_metadata(core_attn_metadata, 1)
                 if 1 in low
@@ -1629,7 +1674,9 @@ class DeepseekV4AttnBackend(
     def low_ratio_prefill_graph(self) -> bool:
         """Whether ratio-1/2 sources use captured projections and indexer metadata."""
         return (
-            bool(self.low_ratios)
+            # The CED encoder graph runs ratio-1/2 sources at eager breaks.
+            not getattr(self, "ced_encoder_graph", False)
+            and bool(self.low_ratios)
             and has_dense_fp4_indexer()
             and is_sm100_or_newer()
             and get_parallel().attn_cp_size == 1
@@ -2127,7 +2174,15 @@ class DeepseekV4AttnBackend(
             seq_lens_cpu=seq_lens_cpu_list,
             extend_len=block_size,
         )
-        extend_seq_lens = self._move_to_device(lengths.extend_seq_lens_cpu)
+        # Every request extends by block_size, so fill on device: an upload from
+        # pinned memory blocks the host behind the stream under CC, where
+        # pinned memory is managed, and a pageable one is refused in capture.
+        extend_seq_lens = torch.full(
+            (len(lengths.extend_seq_lens_cpu),),
+            block_size,
+            dtype=torch.int32,
+            device=self.device,
+        )
         return self.init_forward_metadata_prefill(
             # DSpark draft blocks are SWA-only, like draft extend. Their full
             # context page table is unused; retain only its 2-D placeholder.
@@ -3209,6 +3264,9 @@ class DeepseekV4AttnBackend(
             pos = positions
         if (
             forward_batch.forward_mode.is_extend()
+            # TARGET_VERIFY also satisfies is_extend(), but runs in the decode
+            # graph runner without the prefill context the projection break needs.
+            and not forward_batch.forward_mode.is_target_verify()
             and self._low_ratio_in_prefill_graph()
         ):
             bufs = self._source_projection_buffers(x.shape[0], layer.compress_ratio)
@@ -3220,7 +3278,12 @@ class DeepseekV4AttnBackend(
                     layer, x, req, pos, projected=(bufs["kv"], bufs.get("score"))
                 )
             if run_indexer and layer.indexer is not None:
-                self._low_ratio_index_topk_captured(layer, bufs["q"], bufs["w"])
+                if self.prefill_graph_eager_indexer:
+                    _bcg_low_ratio_index_topk(
+                        self, layer, x, q_lora, req, pos, bufs["q"], bufs["w"]
+                    )
+                else:
+                    self._low_ratio_index_topk_captured(layer, bufs["q"], bufs["w"])
             return
         if run_compressor and layer.compressor is not None:
             self._low_ratio_compress(layer, x, req, pos, forward_batch)
@@ -3605,6 +3668,8 @@ class DeepseekV4AttnBackend(
         forward_batch,
         *,
         rows_per_request=None,  # NOTE: only used in CP
+        q=None,  # NOTE: prefill only, with weights
+        weights=None,
     ) -> None:
         is_source = layer.indexer.is_candidate_source
         is_consumer = layer.indexer.uses_candidates
@@ -3634,7 +3699,15 @@ class DeepseekV4AttnBackend(
                 self.full_topk_indexer.topk_decode(inputs)
         else:
             inputs = self._make_low_ratio_prefill_indexer_inputs(
-                layer, x, q_lora, req, pos, forward_batch, rows_per_request
+                layer,
+                x,
+                q_lora,
+                req,
+                pos,
+                forward_batch,
+                rows_per_request,
+                q=q,
+                weights=weights,
             )
             if is_source:
                 published = self.prefill_candidates.publish_prefill(inputs)
@@ -3704,6 +3777,9 @@ class DeepseekV4AttnBackend(
         pos,
         forward_batch,
         rows_per_request,
+        *,
+        q=None,
+        weights=None,
     ) -> PrefillInputs:
         core = self.forward_metadata.core_metadata
         tail = self.forward_metadata.late_layer_tail
@@ -3731,6 +3807,8 @@ class DeepseekV4AttnBackend(
             seq_lens_cpu=_as_int_list(forward_batch.seq_lens_cpu),
             rows_per_request=rows_per_request,
             rows_per_request_device=rows_per_request_device,
+            q=q,
+            weights=weights,
             out_raw_indices=core.sparse_raw_indices(layer.compress_ratio),
             out_page_indices=(
                 core.sparse_page_indices(layer.compress_ratio)

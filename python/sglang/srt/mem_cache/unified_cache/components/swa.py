@@ -786,6 +786,7 @@ class SWAComponent(TreeComponent):
             self.tree_core.enable_hicache
             and self.tree_core.is_write_back
             and self.tree_core.has_swa_host_pool
+            and envs.SGLANG_ENABLE_HICACHE_SWA_TOMBSTONE_BACKUP.get()
             and cd.host_value is None
             and not x.backuped
             and x.component_data[BASE_COMPONENT_TYPE].value is not None

@@ -409,6 +409,10 @@ def handle_cuda_graph_config(server_args: Any):
 
 def validate_cuda_graph_config(server_args: Any):
     cfg = resolving_view(server_args)
+    if cfg.cuda_graph_host_staging_pool_depth <= 0:
+        raise ValueError("--cuda-graph-host-staging-pool-depth must be positive")
+    if cfg.cuda_graph_host_staging_growth_tokens <= 0:
+        raise ValueError("--cuda-graph-host-staging-growth-tokens must be positive")
     if cfg.cuda_graph_config is None:
         return
     for phase in Phase.ALL:

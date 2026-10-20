@@ -564,6 +564,32 @@ class ExecGraph(msgspec.Struct):
             type_parser=parse_cuda_graph_config_arg,
         ),
     ] = None
+    cuda_graph_host_memory_backend: A[
+        str,
+        Arg(
+            help=(
+                "Host allocator for small CUDA-graph staging inputs. "
+                "'default' uses PyTorch pinned memory, falling back to pageable "
+                "when pinning is ineffective; 'pageable' forces unpinned "
+                "staging. Host transfers remain outside graph capture."
+            ),
+            choices=["default", "pageable"],
+        ),
+    ] = "default"
+
+    cuda_graph_host_staging_pool_depth: A[
+        int,
+        "Number of event-gated pinned host staging slots per device and dtype.",
+    ] = 64
+
+    cuda_graph_host_staging_growth_tokens: A[
+        int,
+        (
+            "Capacity growth quantum for each pinned host staging slot, in "
+            "elements (tokens for the input-ID pool)."
+        ),
+    ] = 256
+
     cuda_graph_backend_decode: A[
         Optional[Literal["full", "breakable", "disabled"]],
         Arg(

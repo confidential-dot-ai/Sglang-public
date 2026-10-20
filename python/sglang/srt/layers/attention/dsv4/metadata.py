@@ -411,7 +411,10 @@ def expand_index_page_table(
     if blocks_per_page == 1:
         return page_table
     bs, n = page_table.shape
-    base = page_table.to(torch.int64) * blocks_per_page
-    offsets = torch.arange(blocks_per_page, device=page_table.device, dtype=torch.int64)
-    expanded = base.unsqueeze(-1) + offsets  # [bs, n, blocks_per_page]
-    return expanded.reshape(bs, n * blocks_per_page).to(torch.int32)
+    # Written in place as int32: the kernel reads int32, and an int64 detour (same
+    # low 32 bits) quadruples the peak, ~2 GiB per eager layer at 1M context.
+    expanded = page_table.new_empty((bs, n, blocks_per_page), dtype=torch.int32)
+    torch.mul(page_table, blocks_per_page, out=expanded[..., 0])
+    for block in range(1, blocks_per_page):
+        torch.add(expanded[..., 0], block, out=expanded[..., block])
+    return expanded.view(bs, n * blocks_per_page)

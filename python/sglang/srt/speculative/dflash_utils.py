@@ -1217,9 +1217,28 @@ def build_speculative_verify_target_probs(
     return target_probs.view(bs, draft_token_num, -1).contiguous()
 
 
-def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
+def validate_dflash_request(
+    req: Req, enable_overlap: bool, grammar_backend: Optional[str] = None
+) -> Optional[str]:
+    if req.return_logprob:
+        return "DFLASH speculative decoding does not support return_logprob yet."
+
     if enable_overlap and req.return_hidden_states:
         return "DFLASH speculative decoding does not support return_hidden_states yet."
+
+    has_grammar_params = (
+        req.sampling_params.json_schema is not None
+        or req.sampling_params.regex is not None
+        or req.sampling_params.ebnf is not None
+        or req.sampling_params.structural_tag is not None
+    )
+    if has_grammar_params:
+        # The verify step has no grammar masking, so a host grammar would be
+        # silently ignored; reject the request instead.
+        return (
+            "DFLASH speculative decoding does not support grammar-constrained "
+            "decoding."
+        )
 
     return None
 

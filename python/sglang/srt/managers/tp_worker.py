@@ -679,6 +679,7 @@ class TpModelWorker(BaseTpWorker):
                 expert_distribution_metrics=out.expert_distribution_metrics,
                 routed_experts_output=out.routed_experts_output,
                 indexer_topk_output=out.indexer_topk_output,
+                ced_boundary=forward_batch.ced_boundary,
                 kv_loc_plan=(
                     None
                     if not return_kv_loc_plan

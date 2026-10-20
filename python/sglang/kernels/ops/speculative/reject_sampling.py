@@ -172,6 +172,14 @@ def speculative_sampling_classic_kernel(
     # dereferences this pointer; on rejection cur_prob_row <= num_steps - 1.
     dp_base_ptr_safe = DraftProbs + (pid * stride_dp_b) + (cur_prob_row * stride_dp_s)
 
+    # Pass 1 also tracks a deterministic fallback. Pass 1 and the CDF pass
+    # use different reduction trees, so a final uniform sample near 1 can
+    # expose a rounding gap where the CDF never becomes strictly greater than
+    # target_u. Returning the last vocabulary id in that case is arbitrary and
+    # can select a zero-probability token; the largest residual is a safe,
+    # deterministic fallback.
+    best_idx = VOCAB_SIZE - 1
+    best_val = -1.0
     # Reuse the selected prefix mass as the correction normalizer.
     if norm_sum < 0.0:
         norm_sum = 0.0
@@ -196,13 +204,16 @@ def speculative_sampling_classic_kernel(
                 val = tl.where(diff > 0.0, diff, 0.0)
 
             norm_sum += tl.sum(val)
+            block_max = tl.max(val, axis=0)
+            if block_max > best_val:
+                best_val = block_max
+                best_idx = v_start + tl.argmax(val, axis=0)
 
-    # Pass 2: CDF. Degenerate residual (norm_sum == 0, i.e. p == q everywhere on
-    # rejection) leaves the cumsum at 0 <= target_u, so final_token falls back to
-    # VOCAB_SIZE - 1; acceptable since this case is numerically near-impossible.
+    # Pass 2: CDF. Use pass 1's argmax if independent floating-point reductions
+    # leave the CDF just below target_u, or if the residual is degenerate.
     target_u = coin_final * norm_sum
     cum_sum = 0.0
-    final_token = VOCAB_SIZE - 1
+    final_token = best_idx
     found = 0
 
     for v_start in range(0, VOCAB_SIZE, BLOCK_V):

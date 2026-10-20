@@ -89,7 +89,22 @@ def resolve_compress_state_ring_size(compress_ratio: int) -> int:
         if spec.speculative_algorithm is None
         else spec.speculative_num_draft_tokens or 0
     )
+    if num_draft_tokens == 0 and envs.SGLANG_OPT_DSV41_CED_SPLIT.get():
+        # Rings are addressed by position % ring_size on both PD workers.
+        num_draft_tokens = envs.SGLANG_DSV41_CED_DECODE_DRAFT_TOKENS.get()
     return get_compress_state_ring_size(compress_ratio, num_draft_tokens)
+
+
+def _layer_ids_per_buffer(layer_ids: List[int], num_buffers: int) -> List[int]:
+    """Layer ids for buffers grouped by kind, each group in layer order (e.g. the
+    FP4 indexer's payloads, then its scales)."""
+    if not layer_ids:
+        assert num_buffers == 0, f"{num_buffers} buffers for no layers"
+        return []
+    assert num_buffers % len(layer_ids) == 0, (
+        f"{num_buffers} buffers do not split evenly over {len(layer_ids)} layers"
+    )
+    return layer_ids * (num_buffers // len(layer_ids))
 
 
 def collect_sources_by_ratio(
@@ -1481,6 +1496,54 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         assert self._unified_kv, "unified_rope_region_buffers requires unified_kv"
         assert ratio in (4, 128), f"unsupported compression ratio: {ratio}"
         return self._unified_page_views(self.unified_kv_pool.kv_buffer_rope, ratio)
+
+    def get_kv_layer_ids(self) -> List[int]:
+        """Global layer id of every get_contiguous_buf_infos entry, in its order.
+
+        A pipeline-parallel prefill stage registers only its own layers, so PD
+        peers pair transfer entries by layer id instead of by position.
+        """
+        ids: List[int] = []
+        for ratio, kv_pool in self.kv_pools.items():
+            sources = self.sources_by_ratio.get(ratio, [])
+            if self._unified_kv:
+                # One unified buffer per stage layer of this ratio: its sources.
+                ids.extend(sources)
+            elif kv_pool is not None:
+                ids.extend(_layer_ids_per_buffer(sources, len(kv_pool.kv_buffer)))
+            indexer_pool = self.index_pools.get(ratio)
+            if indexer_pool is not None:
+                ids.extend(
+                    _layer_ids_per_buffer(
+                        sources, len(indexer_pool.contiguous_page_row_buffers())
+                    )
+                )
+        return ids
+
+    def get_state_layer_ids(self) -> List[int]:
+        """Global layer id of every get_state_buf_infos entry, in its order."""
+        ids: List[int] = []
+        if self.swa_kv_pool is not None:
+            stage = list(range(self._stage_start, self._stage_end))
+            assert len(self.swa_kv_pool.kv_buffer) == len(stage), (
+                "SWA state must hold one buffer per stage layer"
+            )
+            ids.extend(stage)
+        for pools in (self.compress_state_pools, self.indexer_compress_state_pools):
+            ids.extend(
+                i
+                for i, pool in enumerate(pools)
+                if pool is not None and not pool.request_scoped
+            )
+        return ids
+
+    def get_request_state_layer_ids(self) -> List[int]:
+        """Global layer id of every get_request_state_buf_infos entry."""
+        return [
+            i
+            for i, pool in enumerate(self.compress_state_pools)
+            if pool is not None and pool.request_scoped
+        ]
 
     def get_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         data_ptrs: List[int] = []

@@ -71,7 +71,9 @@ class DFlashVerifyInput(SpecInput):
         """Prepare a DFLASH verify forward batch for overlap scheduling.
 
         The caller computes and stores `batch.out_cache_loc` before this
-        method is called. GPU keeps the original pre-planning path. NPU leaves
+        method is called. On GPU, this helper packages the verify forward and
+        pre-initializes CUDA-graph replay or eager attention metadata so the
+        actual forward can run with `skip_attn_backend_init=True`. NPU leaves
         attention/graph metadata initialization to ModelRunner because DP/EP
         padding can still change the compressor's runtime shapes.
         """
@@ -101,20 +103,28 @@ class DFlashVerifyInput(SpecInput):
             # before init_new snapshots them into the verify ForwardBatch.
             # Same hook eagle/ngram/dspark run before TARGET_VERIFY.
             prepare_mamba_track_for_verify(batch)
-        verify_forward_batch = ForwardBatch.init_new(
-            batch,
-            target_worker.model_runner,
-            capture_hidden_mode=self.capture_hidden_mode,
-            return_hidden_states_before_norm=False,
-            kv_loc_plan=self.kv_loc_plan,
-            write_cols=self.kv_loc_cols,
-        )
+        if batch.spec_algorithm.is_dspark():
+            verify_forward_batch = ForwardBatch.init_dspark_target_verify(
+                batch,
+                target_worker.model_runner,
+                capture_hidden_mode=self.capture_hidden_mode,
+                return_hidden_states_before_norm=False,
+                kv_loc_plan=self.kv_loc_plan,
+                write_cols=self.kv_loc_cols,
+            )
+        else:
+            verify_forward_batch = ForwardBatch.init_new(
+                batch,
+                target_worker.model_runner,
+                capture_hidden_mode=self.capture_hidden_mode,
+                return_hidden_states_before_norm=False,
+                kv_loc_plan=self.kv_loc_plan,
+                write_cols=self.kv_loc_cols,
+            )
+        runner = target_worker.model_runner.decode_cuda_graph_runner
 
         can_run_cuda_graph = bool(
-            target_worker.model_runner.decode_cuda_graph_runner
-            and target_worker.model_runner.decode_cuda_graph_runner.can_run_graph(
-                verify_forward_batch
-            )
+            runner and runner.can_run_graph(verify_forward_batch)
         )
         if _is_npu:
             # Do not pre-plan target verify on NPU. DP/EP padding can change
@@ -122,10 +132,9 @@ class DFlashVerifyInput(SpecInput):
             # stale-plan shape fields. Let ModelRunner select graph/eager and
             # initialize metadata after final batch preparation.
             return verify_forward_batch, can_run_cuda_graph
-        elif can_run_cuda_graph:
-            target_worker.model_runner.decode_cuda_graph_runner.load_batch(
-                verify_forward_batch
-            )
+
+        if can_run_cuda_graph:
+            runner.stage_batch(verify_forward_batch)
         elif not batch.forward_mode.is_idle():
             target_worker.model_runner.attn_backend.init_forward_metadata(
                 verify_forward_batch

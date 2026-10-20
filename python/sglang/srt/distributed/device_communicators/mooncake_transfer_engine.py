@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 from sglang.srt.environ import envs
@@ -177,7 +178,13 @@ class MooncakeTransferEngine:
                 )
 
         if ret_value != 0:
-            logger.debug("Mooncake batch memory registration failed.")
+            # Both KV/state and staging registration callers rely on exceptions;
+            # returning an ignored status admits requests with unusable buffers.
+            raise RuntimeError(
+                "Mooncake failed to register transfer memory "
+                f"(status={ret_value}, regions={len(ptrs)}, bytes={sum(lengths)}). "
+                "Check transport and memory-registration support before serving PD requests."
+            )
         return ret_value
 
     def batch_deregister(self, ptrs: List[int]) -> int:
@@ -222,14 +229,26 @@ class MooncakeTransferEngine:
             logger.error("Mooncake Transfer Engine initialization failed.")
             raise RuntimeError("Mooncake Transfer Engine initialization failed.")
 
+    def _transfer_device_context(self):
+        # CUDA's current device is thread-local. PD dispatches transfers from
+        # executor threads, which otherwise default to device 0 even on TP1.
+        # Mooncake's intra-node transport imports IPC handles and submits CUDA
+        # copies in the calling thread, so select the owning rank's device.
+        if os.environ.get("MC_INTRANODE_NVLINK", "").lower() in ("1", "true"):
+            import torch
+
+            return torch.cuda.device(self.gpu_id)
+        return nullcontext()
+
     def transfer_sync(
         self, session_id: str, buffer: int, peer_buffer_address: int, length: int
     ) -> int:
         """Synchronously transfer data to the specified address."""
         try:
-            ret = self.engine.transfer_sync_write(
-                session_id, buffer, peer_buffer_address, length
-            )
+            with self._transfer_device_context():
+                ret = self.engine.transfer_sync_write(
+                    session_id, buffer, peer_buffer_address, length
+                )
         except Exception:
             ret = -1
 
@@ -252,9 +271,10 @@ class MooncakeTransferEngine:
     ) -> int:
         """Synchronously transfer data to the specified addresses in batches."""
         try:
-            ret = self.engine.batch_transfer_sync_write(
-                session_id, buffers, peer_buffer_addresses, lengths
-            )
+            with self._transfer_device_context():
+                ret = self.engine.batch_transfer_sync_write(
+                    session_id, buffers, peer_buffer_addresses, lengths
+                )
         except Exception:
             ret = -1
             if not hasattr(self.engine, "batch_transfer_sync_write"):
@@ -346,7 +366,8 @@ def maybe_init_shared_mooncake_transfer_engine(*, gpu_id: int) -> None:
 
     if use_mooncake_te:
         init_mooncake_transfer_engine(
-            hostname=get_local_ip_auto(),
+            hostname=envs.SGLANG_MOONCAKE_HOSTNAME_OVERRIDE.get()
+            or get_local_ip_auto(),
             gpu_id=gpu_id,
             ib_device=(
                 get_disagg().disaggregation_ib_device

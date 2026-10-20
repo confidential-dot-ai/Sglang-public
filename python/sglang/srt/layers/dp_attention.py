@@ -857,6 +857,16 @@ def _dp_gather_via_all_gatherv_fp8(
     )
 
 
+def is_dp_gatherv_configured() -> bool:
+    """Raw SGLANG_DP_USE_GATHERV flag, independent of per-forward applicability
+    (contrast is_dp_gatherv_active(), which also checks the current forward's
+    layout/padding-mode). Used by callers that need to reject a config at
+    construction time rather than per-forward -- e.g. a capture path whose
+    graph-replay-safety assumption (offsets read from a GPU tensor, not a
+    Python-side size list) only holds under the non-gatherv gather/scatter."""
+    return _USE_DP_GATHERV
+
+
 def is_dp_gatherv_active() -> bool:
     """Variable-length DP-MoE gather/scatter (all_gatherv + reduce_scatterv) is
     enabled and applicable to the CURRENT forward. Requires:

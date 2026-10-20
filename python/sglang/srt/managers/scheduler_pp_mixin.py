@@ -4,7 +4,7 @@ import logging
 from collections import defaultdict, deque
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed
@@ -89,6 +89,9 @@ class PPBatchMetadata:
     # composition that actually ran the forward.
     fwd_batch: Optional[ScheduleBatch] = None
     verify_out_cache_loc: Optional[torch.Tensor] = None
+    # CED boundary capture of the stage that ran the boundary layer; the rebuilt
+    # result must carry it or prefill never writes the handoff slot.
+    ced_boundary: Optional[Any] = None
 
 
 class SchedulerPPMixin:
@@ -1048,6 +1051,7 @@ class SchedulerPPMixin:
                 extend_input_len_per_req=extend_input_len_per_req,
                 extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
                 can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
+                ced_boundary=mb_metadata.ced_boundary,
             )
             return output_result
 
@@ -1125,6 +1129,7 @@ class SchedulerPPMixin:
                         else next_draft_input.hidden_states
                     ),
                 ),
+                future_indices_cpu=batch.req_pool_indices_cpu,
             )
         batch.input_ids = None
         output_result = GenerationBatchResult(
@@ -1135,6 +1140,7 @@ class SchedulerPPMixin:
             extend_input_len_per_req=extend_input_len_per_req,
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
+            ced_boundary=mb_metadata.ced_boundary,
         )
         output_result.copy_auxiliary_output_to_cpu()
         return output_result
@@ -1655,6 +1661,7 @@ class SchedulerPPMixin:
                     can_run_cuda_graph=result.can_run_cuda_graph,
                     fwd_batch=_pp_snapshot_forward_batch(cur_batch),
                     verify_out_cache_loc=result.spec_verify_out_cache_loc,
+                    ced_boundary=result.ced_boundary,
                 )
                 event = self.device_module.Event()
                 event.record(self.device_module.current_stream())

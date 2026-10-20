@@ -319,5 +319,34 @@ class TestDSV4PoolAssembly(CustomTestCase):
         self.assertIs(built_controller, controller)
 
 
+
+class TestDSV4HostPageSizing(CustomTestCase):
+    def _sizes(self, **memory):
+        kvcache = SimpleNamespace(
+            size=4096,
+            swa_size=1024,
+            get_contiguous_buf_infos=lambda: ([0, 0], [6_000_000, 2_000_000], [1, 1]),
+            get_state_buf_infos=lambda: ([0], [2_000_000], [1]),
+        )
+        params = SimpleNamespace(
+            token_to_kv_pool_allocator=SimpleNamespace(size_full=4096)
+        )
+        settings = SimpleNamespace(hicache_size=0, hicache_ratio=None)
+        for key, value in memory.items():
+            setattr(settings, key, value)
+        with patch.object(assembler, "get_memory", return_value=settings):
+            return assembler._deepseek_v4_num_host_pages(
+                params=params, kvcache=kvcache, page_size=256, swa_page_size=128
+            )
+
+    def test_ratio_scales_every_pool(self):
+        self.assertEqual(self._sizes(hicache_ratio=2.0), (32, 16, 32))
+
+    def test_size_budget_becomes_the_shared_ratio(self):
+        # 0.005 GB over 10 MB of device KV is a ratio of 0.5: host pools half the
+        # device pools, a tier smaller than the device pool.
+        self.assertEqual(self._sizes(hicache_size=0.005), (8, 4, 8))
+
+
 if __name__ == "__main__":
     unittest.main()

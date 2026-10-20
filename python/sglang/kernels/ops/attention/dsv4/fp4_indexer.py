@@ -240,6 +240,52 @@ def _fp4_e2m1_code_rne(x):
 
 
 @triton.jit
+def _fp32x2_to_e2m1x2(x_lo, x_hi):
+    # PTX places its first source in the high nibble and its second source in
+    # the low nibble, so the operands are intentionally high then low.
+    return tl.inline_asm_elementwise(
+        """
+        {
+        .reg .b8 packed;
+        cvt.rn.satfinite.e2m1x2.f32 packed, $1, $2;
+        cvt.u32.u8 $0, packed;
+        }
+        """,
+        constraints="=r,f,f",
+        args=[x_hi, x_lo],
+        dtype=tl.uint32,
+        is_pure=True,
+        pack=1,
+    ).to(tl.uint8)
+
+
+def _has_native_e2m1x2(device: torch.device) -> bool:
+    if device.type != "cuda" or torch.version.hip is not None:
+        return False
+    if torch.version.cuda is None:
+        return False
+    cuda_version = tuple(int(part) for part in torch.version.cuda.split(".")[:2])
+    if cuda_version < (12, 8):
+        return False
+    major, minor = torch.cuda.get_device_capability(device)
+    # SM121 (GB10) is not instruction-compatible with the SM120 FP4 convert.
+    return major in (10, 11) or (major, minor) == (12, 0)
+
+
+@triton.jit
+def _pack_e2m1x2(x_lo, x_hi, RNE: tl.constexpr, USE_NATIVE_E2M1X2: tl.constexpr):
+    if RNE and USE_NATIVE_E2M1X2:
+        return _fp32x2_to_e2m1x2(x_lo, x_hi)
+    if RNE:
+        code_lo = _fp4_e2m1_code_rne(x_lo)
+        code_hi = _fp4_e2m1_code_rne(x_hi)
+    else:
+        code_lo = _fp4_e2m1_code(x_lo)
+        code_hi = _fp4_e2m1_code(x_hi)
+    return (code_lo & 0x0F) | ((code_hi & 0x0F) << 4)
+
+
+@triton.jit
 def quantize_fp4_indexer_row(
     values,
     v0,
@@ -247,6 +293,7 @@ def quantize_fp4_indexer_row(
     BLOCK_N: tl.constexpr,
     GROUP_N: tl.constexpr,
     RNE: tl.constexpr,
+    USE_NATIVE_E2M1X2: tl.constexpr = False,
 ):
     """One row of quantize_fp4_indexer_tensor: values is the fp32 [BLOCK_N] row,
     v0 / v1 its even / odd elements as fp32 [BLOCK_N // 2]. Returns
@@ -290,13 +337,7 @@ def quantize_fp4_indexer_row(
 
     v0 = v0 / scale0
     v1 = v1 / scale1
-    if RNE:
-        code0 = _fp4_e2m1_code_rne(v0)
-        code1 = _fp4_e2m1_code_rne(v1)
-    else:
-        code0 = _fp4_e2m1_code(v0)
-        code1 = _fp4_e2m1_code(v1)
-    packed = (code0 & 0x0F) | ((code1 & 0x0F) << 4)
+    packed = _pack_e2m1x2(v0, v1, RNE, USE_NATIVE_E2M1X2)
     return packed, packed_sf
 
 
@@ -308,6 +349,7 @@ def _quantize_fp4_indexer_kernel(
     BLOCK_N: tl.constexpr,
     GROUP_N: tl.constexpr,
     RNE: tl.constexpr,
+    USE_NATIVE_E2M1X2: tl.constexpr = False,
 ):
     token_id = tl.program_id(0)
     offs = tl.arange(0, BLOCK_N)
@@ -317,7 +359,13 @@ def _quantize_fp4_indexer_kernel(
     v0 = tl.load(row + pair_offsets * 2).to(tl.float32)
     v1 = tl.load(row + pair_offsets * 2 + 1).to(tl.float32)
     packed, packed_sf = quantize_fp4_indexer_row(
-        values, v0, v1, BLOCK_N=BLOCK_N, GROUP_N=GROUP_N, RNE=RNE
+        values,
+        v0,
+        v1,
+        BLOCK_N=BLOCK_N,
+        GROUP_N=GROUP_N,
+        RNE=RNE,
+        USE_NATIVE_E2M1X2=USE_NATIVE_E2M1X2,
     )
     tl.store(x_sf + token_id, packed_sf)
     tl.store(x_fp4 + token_id * (BLOCK_N // 2) + pair_offsets, packed)
@@ -401,11 +449,70 @@ def _store_fp4_index_k_cache_kernel(
     )
 
 
+@triton.jit
+def _quantize_store_fp4_index_k_cache_kernel(
+    x,
+    cache,
+    loc,
+    page_size: tl.constexpr,
+    cache_stride: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    GROUP_N: tl.constexpr,
+    RNE: tl.constexpr,
+    USE_NATIVE_E2M1X2: tl.constexpr,
+):
+    """Quantize one index row and scatter it directly into the paged cache."""
+    token_id = tl.program_id(0)
+    pair_offsets = tl.arange(0, BLOCK_N // 2)
+    offs0 = pair_offsets * 2
+    offs1 = offs0 + 1
+    raw0 = tl.load(x + token_id * BLOCK_N + offs0).to(tl.float32)
+    raw1 = tl.load(x + token_id * BLOCK_N + offs1).to(tl.float32)
+
+    # Each adjacent FP4 pair lies wholly inside one 32-value scale group. Reduce
+    # the pair maxima to derive the same four scales, then reuse raw0/raw1 for
+    # packing instead of loading the entire row a second time.
+    pair_group = pair_offsets // (GROUP_N // 2)
+    pair_abs_max = tl.maximum(tl.abs(raw0), tl.abs(raw1))
+    amax0 = tl.max(tl.where(pair_group == 0, pair_abs_max, 0.0), axis=0)
+    amax1 = tl.max(tl.where(pair_group == 1, pair_abs_max, 0.0), axis=0)
+    amax2 = tl.max(tl.where(pair_group == 2, pair_abs_max, 0.0), axis=0)
+    amax3 = tl.max(tl.where(pair_group == 3, pair_abs_max, 0.0), axis=0)
+
+    exp0 = _ceil_ue8m0_exp(tl.maximum(amax0 / 6.0, 1.0e-4))
+    exp1 = _ceil_ue8m0_exp(tl.maximum(amax1 / 6.0, 1.0e-4))
+    exp2 = _ceil_ue8m0_exp(tl.maximum(amax2 / 6.0, 1.0e-4))
+    exp3 = _ceil_ue8m0_exp(tl.maximum(amax3 / 6.0, 1.0e-4))
+
+    scale_exp = _select_group_value(pair_group, exp0, exp1, exp2, exp3)
+    scale = (scale_exp << 23).to(tl.float32, bitcast=True)
+    v0 = raw0 / scale
+    v1 = raw1 / scale
+    packed = _pack_e2m1x2(v0, v1, RNE, USE_NATIVE_E2M1X2)
+
+    cache_loc = tl.load(loc + token_id)
+    page = cache_loc // page_size
+    page_offset = cache_loc - page * page_size
+    page_base = cache + page * cache_stride
+    tl.store(page_base + page_offset * (BLOCK_N // 2) + pair_offsets, packed)
+
+    packed_sf = exp0 | (exp1 << 8) | (exp2 << 16) | (exp3 << 24)
+    sf_offsets = tl.arange(0, 4)
+    sf_bytes = (packed_sf >> (sf_offsets * 8)) & 0xFF
+    tl.store(
+        page_base
+        + page_size * (BLOCK_N // 2)
+        + page_offset * 4
+        + sf_offsets,
+        sf_bytes,
+    )
+
+
 def quantize_fp4_indexer_tensor(
-    x: torch.Tensor, rne: bool = False
+    x: torch.Tensor, rne: bool = True
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-32 ue8m0 fp4 quantize. rne=True uses round-to-nearest-even (the dsv41
-    reference rounding); the default keeps ``_fp4_e2m1_code``'s thresholds."""
+    reference rounding); rne=False keeps the legacy thresholds."""
     assert x.shape[-1] == 128
     x = x.contiguous().view(-1, x.shape[-1])
     x_fp4 = torch.empty((x.shape[0], 64), device=x.device, dtype=torch.int8)
@@ -431,6 +538,7 @@ def quantize_fp4_indexer_tensor(
             BLOCK_N=128,
             GROUP_N=32,
             RNE=rne,
+            USE_NATIVE_E2M1X2=_has_native_e2m1x2(x.device),
         )
     return x_fp4, x_sf
 
@@ -441,15 +549,41 @@ def store_fp4_index_k_cache(
     loc: torch.Tensor,
     *,
     page_size: int,
-    rne: bool = False,
+    rne: bool = True,
 ) -> None:
+    assert input.shape[-1] == 128
+    input = input.contiguous()
+    n_tokens = input.numel() // input.shape[-1]
+    assert cache.shape[1] == page_size * INDEX_K_SLOT_BYTES
+
+    if n_tokens == 0:
+        return
+    _quantize_store_fp4_index_k_cache_kernel[(n_tokens,)](
+        input,
+        cache,
+        loc,
+        page_size,
+        cache.stride(0),
+        BLOCK_N=128,
+        GROUP_N=32,
+        RNE=rne,
+        USE_NATIVE_E2M1X2=_has_native_e2m1x2(input.device),
+    )
+
+
+def _store_fp4_index_k_cache_unfused(
+    input: torch.Tensor,
+    cache: torch.Tensor,
+    loc: torch.Tensor,
+    *,
+    page_size: int,
+    rne: bool = True,
+) -> None:
+    """Measured control for the fused writer; not used by serving."""
     assert input.shape[-1] == 128
     k_fp4, k_sf = quantize_fp4_indexer_tensor(input.contiguous(), rne=rne)
     n_tokens = input.numel() // input.shape[-1]
-    assert k_fp4.shape == (n_tokens, 64)
-    assert k_sf.shape == (n_tokens,)
-    assert cache.shape[1] == page_size * INDEX_K_SLOT_BYTES
-
+    assert cache.shape[1] == page_size * (64 + 4)
     if n_tokens == 0:
         return
     _store_fp4_index_k_cache_kernel[(n_tokens,)](

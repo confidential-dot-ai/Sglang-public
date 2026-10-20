@@ -14,6 +14,7 @@ from sglang.kernels.ops.speculative.dspark.markov_sample import MarkovSampleStep
 from sglang.srt.environ import envs
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.overlap_utils import consume_deferred_seq_lens_cpu
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -518,6 +519,10 @@ class DraftBlockProposer:
             noise_embedding = embed_module(draft_block_ids)
             draft_input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
+        # First exact consumer of the tick: the draft's attention plan
+        # derives its K coverage from the mirror, so the deferred blocking
+        # resolve (if armed) must land here, not earlier.
+        consume_deferred_seq_lens_cpu(batch)
         if batch.seq_lens_cpu is not None:
             draft_seq_lens_cpu = batch.seq_lens_cpu + query_token_num
             draft_seq_lens_sum = int(draft_seq_lens_cpu.sum())

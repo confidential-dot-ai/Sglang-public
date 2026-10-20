@@ -371,6 +371,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
 
     def test_pp_proxy_output_is_trimmed_to_raw_prefill_tokens(self):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner.bounded_replay = False
         runner.raw_num_tokens = 3
         output = PPProxyTensors(
             {
@@ -387,6 +388,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
 
     def test_static_batch_preserves_consumed_multimodal_embeddings(self):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner.bounded_replay = False
         runner.capture_num_tokens = [4]
         runner.max_context_size = None
         runner.max_seq_len = None
@@ -534,6 +536,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
     def test_buffers_are_shared_across_token_buckets(self):
         backend = _FakeAttentionBackend()
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner.bounded_replay = False
         runner._capture_req_slots = 3
         runner._prefix_chunk_len = 2
         runner._prefix_chunk_capacity = 6
@@ -700,6 +703,8 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
 
     def test_prefix_gate_only_applies_to_chunked_prefix_variant(self):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner.bounded_replay = False
+        runner.model_runner = SimpleNamespace(attn_backend=SimpleNamespace())
         runner._capture_req_slots = 4
         runner.enable_lora = False
         runner.capture_hidden_mode = CaptureHiddenMode.NULL

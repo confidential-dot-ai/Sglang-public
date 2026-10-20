@@ -5,6 +5,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.mem_cache.page_interleave import (
     compute_page_shard_scratch_bytes,
@@ -1148,6 +1149,114 @@ class TestDSAIndexerAllocationPolicy(CustomTestCase):
         self.assertEqual(cfg._cell_size, 576 * num_layers + 132 * producer_layers)
 
 
+FAKE_BF16 = "fake_bf16"
+FAKE_FP8 = "fake_fp8"
+FAKE_FP4 = "fake_fp4"
+# Bytes per element: fp4 is the packed float4_e2m1fn_x2 storage byte; the
+# //2 packing + block-scale terms are applied separately by the configurator.
+FAKE_ELEMENT_SIZES = {FAKE_BF16: 2, FAKE_FP8: 1, FAKE_FP4: 1, torch.bfloat16: 2}
+
+
+@contextlib.contextmanager
+def mock_dtype_env(tp_size=1):
+    """Like mock_cpu_env, but with per-dtype element sizes and a CPU-safe
+    is_float4_e2m1fn_x2 (the real one requires CUDA)."""
+    with (
+        patch("torch._utils._element_size", side_effect=FAKE_ELEMENT_SIZES.__getitem__),
+        patch(
+            "sglang.srt.model_executor.pool_configurator.is_float4_e2m1fn_x2",
+            side_effect=lambda dtype: dtype == FAKE_FP4,
+        ),
+        get_parallel().override(attn_tp_size=tp_size),
+    ):
+        yield
+
+
+class TestDflashFp4DraftCell(CustomTestCase):
+    """DFLASH-family + FP4 target: the draft pool uses compute-dtype bytes."""
+
+    def _make_dflash_runner(self, *, kv_cache_dtype, draft_num_layers=4):
+        mr = _make_model_runner(self, num_layers=32)
+        mr.kv_cache_dtype = kv_cache_dtype
+        mr.model_dtype = FAKE_BF16
+        mr.spec_algorithm.is_dflash_family.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.dflash_draft_num_layers = draft_num_layers
+        mr.spec_aux_config.dflash_draft_cell_size_per_token = (
+            4 * 128 * 2 * draft_num_layers
+        )
+        mr.kv_cache_dtype_str = "nvfp4" if kv_cache_dtype == FAKE_FP4 else "bfloat16"
+        mr.device = "cpu"
+        _publish_config(self, attention_backend="trtllm_mha")
+        mr.server_args = get_server_args()
+        return mr
+
+    def _cell_size(self, mr):
+        with mock_dtype_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            return create_memory_pool_configurator(mr)._cell_size
+
+    def test_resolved_chunk_size_reserves_target_hidden_transient(self):
+        """An unset CLI chunk still resolves to a nonzero hidden-state peak."""
+        from sglang.srt.model_executor.pool_configurator import (
+            create_memory_pool_configurator,
+        )
+
+        mr = self._make_dflash_runner(kv_cache_dtype=FAKE_BF16)
+        mr.model_config.hidden_size = 128
+        self.assertIsNone(mr.server_args.chunked_prefill_size)
+        with mock_dtype_env(), get_schedule().override(chunked_prefill_size=256):
+            planner = create_memory_pool_configurator(mr)
+            budget = 4 * 1024 * 1024
+            sizes = planner.calculate_pool_sizes(budget, page_size=1)
+        hidden_bytes = 256 * 128 * 4 * 2
+        self.assertLessEqual(
+            sizes.max_total_num_tokens * planner._cell_size + hidden_bytes, budget
+        )
+
+    def test_fp4_target_sums_bf16_draft_cell(self):
+        mr = self._make_dflash_runner(kv_cache_dtype=FAKE_FP4)
+        # fp4 target = 9216; bf16 draft = 4096.
+        self.assertEqual(self._cell_size(mr), 9216 + 4096)
+
+    def test_bf16_target_keeps_layer_ratio_scaling(self):
+        mr = self._make_dflash_runner(kv_cache_dtype=FAKE_BF16)
+        self.assertEqual(self._cell_size(mr), 36864)
+
+    def _with_draft_geometry(self, mr, *, kv_heads, head_dim, v_head_dim):
+        mr.spec_aux_config.dflash_draft_total_num_kv_heads = kv_heads
+        mr.spec_aux_config.dflash_draft_head_dim = head_dim
+        mr.spec_aux_config.dflash_draft_v_head_dim = v_head_dim
+        mr.spec_aux_config.dflash_draft_cell_size_per_token = (
+            kv_heads
+            * (head_dim + v_head_dim)
+            * 2
+            * mr.spec_aux_config.dflash_draft_num_layers
+        )
+        return mr
+
+    def test_draft_geometry_overrides_target_geometry(self):
+        mr = self._with_draft_geometry(
+            self._make_dflash_runner(kv_cache_dtype=FAKE_FP4),
+            kv_heads=8,
+            head_dim=64,
+            v_head_dim=64,
+        )
+        self.assertEqual(self._cell_size(mr), 9216 + 8192)
+
+    def test_draft_geometry_used_for_bf16_target_too(self):
+        mr = self._with_draft_geometry(
+            self._make_dflash_runner(kv_cache_dtype=FAKE_BF16),
+            kv_heads=8,
+            head_dim=64,
+            v_head_dim=64,
+        )
+        self.assertEqual(self._cell_size(mr), 32768 + 8192)
+
+
 class TestFactory(CustomTestCase):
     def test_default_for_non_swa(self):
         mr = _make_model_runner(self, is_hybrid_swa=False)
@@ -1215,7 +1324,6 @@ class TestDflashDraftKvBudget(CustomTestCase):
 
     def test_bytes_per_token_from_draft_geometry(self):
         import torch
-
         from sglang.srt.speculative.dflash_utils import (
             dflash_draft_cell_size_per_token,
         )

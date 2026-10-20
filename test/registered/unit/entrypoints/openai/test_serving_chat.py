@@ -4964,6 +4964,172 @@ class ServingChatTestCase(CustomTestCase):
         self.assertIsNone(result)
 
 
+def _call(call_id, name="get_weather", args='{"location":"Beijing"}'):
+    return {
+        "id": call_id,
+        "type": "function",
+        "function": {"name": name, "arguments": args},
+    }
+
+
+class TestToolCallIdValidation(CustomTestCase):
+    """Tool replies must line up with the calls that were made.
+
+    Both shapes below were previously served as if valid: a reply attributed
+    to no call, and an assistant turn continued from a state that never
+    existed because only some of its calls were answered.
+    """
+
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        self.chat = OpenAIServingChat(_MockTokenizerManager(), _MockTemplateManager())
+
+    def _req(self, messages):
+        return ChatCompletionRequest(model="test-model", messages=messages)
+
+    def test_clean_conversation_passes(self):
+        self.assertIsNone(
+            self.chat._validate_tool_call_ids(
+                self._req([{"role": "user", "content": "hi"}])
+            )
+        )
+
+    def test_outstanding_calls_are_valid_mid_flight(self):
+        # The caller is about to run the tools. This must stay valid.
+        req = self._req(
+            [
+                {"role": "user", "content": "x"},
+                {"role": "assistant", "content": None, "tool_calls": [_call("c1")]},
+            ]
+        )
+        self.assertIsNone(self.chat._validate_tool_call_ids(req))
+
+    def test_orphan_tool_call_id_rejected(self):
+        req = self._req(
+            [
+                {"role": "user", "content": "x"},
+                {"role": "assistant", "content": None, "tool_calls": [_call("c1")]},
+                {"role": "tool", "tool_call_id": "nope", "content": "sunny"},
+            ]
+        )
+        err = self.chat._validate_tool_call_ids(req)
+        self.assertIsNotNone(err)
+        self.assertIn("nope", err)
+
+    def test_partially_answered_turn_rejected(self):
+        req = self._req(
+            [
+                {"role": "user", "content": "x"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [_call("c1"), _call("c2")],
+                },
+                {"role": "tool", "tool_call_id": "c1", "content": "sunny"},
+            ]
+        )
+        err = self.chat._validate_tool_call_ids(req)
+        self.assertIsNotNone(err)
+        self.assertIn("c2", err)
+
+    def test_fully_answered_turn_passes(self):
+        req = self._req(
+            [
+                {"role": "user", "content": "x"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [_call("c1"), _call("c2")],
+                },
+                {"role": "tool", "tool_call_id": "c1", "content": "sunny"},
+                {"role": "tool", "tool_call_id": "c2", "content": "rainy"},
+            ]
+        )
+        self.assertIsNone(self.chat._validate_tool_call_ids(req))
+
+
+class TestModelNameValidation(CustomTestCase):
+    """An unserved model name used to be answered normally and echoed back, so
+    a client that typo'd a name or failed over to the wrong deployment got
+    plausible output from the wrong model with no signal.
+    """
+
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        tm = _MockTokenizerManager()
+        # A bare Mock() makes enable_lora truthy, which sends the check down
+        # the adapter-registry path; pin it so the base-name rule is exercised.
+        tm.server_args.enable_lora = False
+        self.chat = OpenAIServingChat(tm, _MockTemplateManager())
+
+    def test_served_name_accepted(self):
+        self.assertIsNone(self.chat._validate_model_name("test-model"))
+
+    def test_model_path_accepted(self):
+        self.assertIsNone(
+            self.chat._validate_model_name("deepseek-ai/DeepSeek-V4-Flash")
+        )
+
+    def test_unknown_name_rejected(self):
+        err = self.chat._validate_model_name("nonexistent-model-xyz")
+        self.assertIsNotNone(err)
+        self.assertIn("nonexistent-model-xyz", err)
+
+    def test_adapter_suffix_validates_base_name(self):
+        # `base:adapter` syntax -- the base half is what must be served.
+        self.assertIsNone(self.chat._validate_model_name("test-model:some-adapter"))
+        self.assertIsNotNone(self.chat._validate_model_name("wrong-base:some-adapter"))
+
+    def test_absent_model_is_not_rejected(self):
+        # `model` has always been optional here; tightening that is a separate
+        # decision from rejecting a name that is simply wrong.
+        self.assertIsNone(self.chat._validate_model_name(None))
+        self.assertIsNone(self.chat._validate_model_name("   "))
+
+
+class TestToolParserEngagement(CustomTestCase):
+    """A conversation can establish its tool vocabulary through history alone.
+    Gating the parser on declared `tools` meant the model's tool-call markup
+    was passed through as visible content with finish_reason "stop".
+    """
+
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        self.chat = OpenAIServingChat(_MockTokenizerManager(), _MockTemplateManager())
+
+    def test_parsing_active_without_tools_or_history(self):
+        # The provider API contract requires tool calls to be parsed "even when
+        # no tools are defined". Gating on declared tools, or on tool calls in
+        # the history, leaks raw <tool_call> markup as visible content on a
+        # first turn that declares neither.
+        req = ChatCompletionRequest(
+            model="test-model", messages=[{"role": "user", "content": "hi"}]
+        )
+        self.assertTrue(self.chat._tool_call_parsing_active(req))
+
+    def test_parsing_inactive_when_caller_opts_out(self):
+        # tool_choice="none" is only an opt-out next to declared tools; with
+        # no tools the validator injects it, so it says nothing about intent.
+        req = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {"name": "get_weather", "parameters": {}},
+                }
+            ],
+            tool_choice="none",
+        )
+        self.assertFalse(self.chat._tool_call_parsing_active(req))
+
+
 class TestProcessToolCallsWithRequiredToolChoice(unittest.TestCase):
     """Test _process_tool_calls with tool_choice='required' uses model-specific parser."""
 

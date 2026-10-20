@@ -2,6 +2,7 @@ import unittest
 from array import array
 from unittest.mock import patch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import CacheAwarePolicy, SchedulePolicy
 from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -123,6 +124,39 @@ class TestSchedulePolicyHRRN(CustomTestCase):
         self.assertEqual(waiting_queue[0].rid, "a")
         self.assertEqual(waiting_queue[1].rid, "b")
         self.assertEqual(waiting_queue[2].rid, "c")
+
+    def _long_aged_and_short_fresh(self):
+        # long: 100 uncached, waited 1000 tokens; short: 4 uncached, waited 30.
+        r_long = _make_req("long", "x" * 100, list(range(100)))
+        r_short = _make_req("short", "x" * 4, list(range(4)))
+        r_long.arrival_processed_tokens = 0
+        r_short.arrival_processed_tokens = 970
+        return [r_long, r_short]
+
+    def test_hrrn_size_exponent_default_is_classic_ratio(self):
+        """Exponent 1: long 1000/100 = 10 beats short 30/4 = 7.5."""
+        waiting_queue = self._long_aged_and_short_fresh()
+        SchedulePolicy._sort_by_hrrn(waiting_queue, set(), processed_tokens=1000)
+        self.assertEqual([r.rid for r in waiting_queue], ["long", "short"])
+
+    def test_hrrn_size_exponent_favors_short_prefills(self):
+        """Exponent 2: long 1000/100**2 = 0.1 loses to short 30/4**2 = 1.875."""
+        waiting_queue = self._long_aged_and_short_fresh()
+        with envs.SGLANG_HRRN_SIZE_EXPONENT.override(2.0):
+            SchedulePolicy._sort_by_hrrn(waiting_queue, set(), processed_tokens=1000)
+        self.assertEqual([r.rid for r in waiting_queue], ["short", "long"])
+
+    def test_hrrn_size_exponent_still_ages_long_prefills(self):
+        """Exponent 2 still lets a long request overtake once it has waited:
+        long 100000/100**2 = 10 beats a just-arrived short (0)."""
+        r_long, r_short = self._long_aged_and_short_fresh()
+        r_short.arrival_processed_tokens = 100000
+        waiting_queue = [r_short, r_long]
+        with envs.SGLANG_HRRN_SIZE_EXPONENT.override(2.0):
+            SchedulePolicy._sort_by_hrrn(
+                waiting_queue, set(), processed_tokens=100000
+            )
+        self.assertEqual([r.rid for r in waiting_queue], ["long", "short"])
 
 
 class TestShortestPrefillFirst(CustomTestCase):

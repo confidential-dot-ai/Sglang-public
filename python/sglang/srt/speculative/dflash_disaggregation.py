@@ -24,9 +24,14 @@ def build_dflash_disagg_draft_input(
     )
     if batch.enable_overlap:
         spec_info.future_indices = batch.req_pool_indices
-        future_map.publish(spec_info.future_indices, batch.seq_lens)
+        future_map.publish(
+            spec_info.future_indices,
+            batch.seq_lens,
+            future_indices_cpu=batch.req_pool_indices_cpu,
+        )
         future_map.stash(
             spec_info.future_indices,
             RelayPayload(bonus_tokens=last_tokens_tensor),
+            future_indices_cpu=batch.req_pool_indices_cpu,
         )
     return spec_info

@@ -229,10 +229,15 @@ class DynamicChunkSizer:
             try:
                 # Resolve deferred H2D: prepare_for_extend now leaves input_ids=None
                 if batch.input_ids is None and batch.prefill_input_ids_cpu is not None:
-                    batch.input_ids = batch.prefill_input_ids_cpu.to(
-                        self.device, non_blocking=True
-                    )
+                    lease = batch.prefill_input_ids_staging_lease
+                    if lease is None:
+                        batch.input_ids = batch.prefill_input_ids_cpu.to(
+                            self.device, non_blocking=True
+                        )
+                    else:
+                        batch.input_ids = lease.copy_to_device(device=self.device)
                     batch.prefill_input_ids_cpu = None
+                    batch.prefill_input_ids_staging_lease = None
 
                 forward_batch = ForwardBatch.init_new(
                     batch,

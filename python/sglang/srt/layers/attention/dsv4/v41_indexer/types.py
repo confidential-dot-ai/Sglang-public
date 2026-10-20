@@ -33,7 +33,8 @@ class CandidateMetadata:
 
 
 class PrefillInputs(msgspec.Struct, frozen=True, kw_only=True):
-    """An eager extend: the backend projects the queries and gathers the index K."""
+    """An eager extend: the backend gathers the index K and, unless ``q`` and
+    ``weights`` are given, projects the queries."""
 
     indexer: DeepseekV41Indexer
     layer_id: int
@@ -61,6 +62,11 @@ class PrefillInputs(msgspec.Struct, frozen=True, kw_only=True):
     # None when this forward's attention reads only the positions (sparse prefill).
     out_raw_indices: torch.Tensor
     out_page_indices: Optional[torch.Tensor]
+
+    # The prefill graph's projection break already computed these for the live
+    # rows; None projects them from x / q_lora.
+    q: Optional[torch.Tensor] = None  # [rows, heads, 128] bf16, roped
+    weights: Optional[torch.Tensor] = None  # [rows, heads] bf16 head weights
 
     def reset_outputs(self) -> None:
         self.out_raw_indices.fill_(-1)

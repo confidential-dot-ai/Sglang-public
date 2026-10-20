@@ -1,0 +1,10 @@
+# Allowlist: only what the Dockerfile copies.
+*
+!python
+!recipes/deepseek-v41
+!sgl-model-gateway
+sgl-model-gateway/target
+sgl-model-gateway/bindings/python/dist
+**/__pycache__
+**/*.pyc
+python/sglang/_version.py

@@ -179,8 +179,14 @@ from sglang.srt.multimodal.deepseek_v41_image_processing import (
     image_token_types,
     materialize_image_gpu,
 )
+from sglang.srt.disaggregation.ced_boundary import (
+    CedBoundaryInjection,
+    ced_boundary_enabled,
+    fill_ced_boundary_for_forward,
+)
 from sglang.srt.runtime_context import (
     get_device,
+    get_disagg,
     get_exec,
     get_forward,
     get_parallel,
@@ -832,6 +838,17 @@ def deepseek_v4_engram_hash_ids(hasher, input_ids: torch.Tensor) -> torch.Tensor
 bcg_deepseek_v4_engram_hash_ids = eager_on_graph(True)(deepseek_v4_engram_hash_ids)
 
 
+def _is_breakable_prefill(forward_batch: ForwardBatch) -> bool:
+    # TARGET_VERIFY also satisfies is_extend(), but runs in the decode graph
+    # runner without the prefill context these eager helpers require.
+    mode = forward_batch.forward_mode
+    return (
+        mode.is_extend()
+        and not mode.is_target_verify()
+        and is_in_breakable_cuda_graph()
+    )
+
+
 def deepseek_v4_enter_late_layer_tail(sentinel: torch.Tensor) -> torch.Tensor:
     # Decoder SWA bounded replay under the prefill CUDA graph: swap the attention
     # backend onto the tail metadata of the *live* batch (the captured args hold
@@ -845,6 +862,22 @@ def deepseek_v4_exit_late_layer_tail(sentinel: torch.Tensor) -> torch.Tensor:
     forward_batch = get_tc_piecewise_forward_context().forward_batch
     get_attn_backend().prefill_graph_exit_late_layer_tail(forward_batch)
     return sentinel
+
+
+def deepseek_v4_ced_capture_boundary(
+    sentinel: torch.Tensor, residual: torch.Tensor, pre: Optional[torch.Tensor]
+) -> torch.Tensor:
+    # CED boundary handoff under the prefill CUDA graph: gather the live batch's
+    # last-window rows (the captured args hold the graph's static buffers).
+    fill_ced_boundary_for_forward(
+        get_tc_piecewise_forward_context().forward_batch, residual, pre
+    )
+    return sentinel
+
+
+bcg_deepseek_v4_ced_capture_boundary = eager_on_graph(True)(
+    deepseek_v4_ced_capture_boundary
+)
 
 
 bcg_deepseek_v4_enter_late_layer_tail = eager_on_graph(True)(
@@ -1428,7 +1461,7 @@ class MQALayer(MqaAttentionBase):
             return q.new_zeros(q.shape[0], self.n_local_groups, self.o_lora_rank)
         if not self.mega_wq_b_permuted:
             q = pack_query(q, kernel_num_heads)
-        if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
+        if _is_breakable_prefill(forward_batch):
             o = q.new_empty((q.shape[0], self.n_local_groups, self.o_lora_rank))
             bcg_deepseek_v4_mega_attention_with_output(self, q, o, attn_sink)
             return o
@@ -2321,10 +2354,8 @@ class MQALayer(MqaAttentionBase):
         if self.compress_ratio in (1, 2) and (
             self.compressor is not None or self.indexer is not None
         ):
-            if (
-                forward_batch.forward_mode.is_extend()
-                and is_in_breakable_cuda_graph()
-                and not getattr(attn_backend, "low_ratio_prefill_graph", False)
+            if _is_breakable_prefill(forward_batch) and not getattr(
+                attn_backend, "low_ratio_prefill_graph", False
             ):
                 bcg_deepseek_v4_low_ratio_sources(self, x, q_lora, positions)
             else:
@@ -2403,7 +2434,12 @@ class MQALayer(MqaAttentionBase):
             and self.alt_streams is not None
             and get_is_capture_mode()
             and (
-                is_in_breakable_cuda_graph()
+                (
+                    is_in_breakable_cuda_graph()
+                    # The CED encoder graph replays live attention metadata at
+                    # its eager breaks; side streams would fork across them.
+                    and not getattr(attn_backend, "ced_encoder_graph", False)
+                )
                 or x.shape[0] <= self._multi_stream_bs_limit
             )
             and not is_cp_active(forward_batch)
@@ -2663,7 +2699,7 @@ class MQALayer(MqaAttentionBase):
         else:
             attn_q = q_padded if q_padded is not None else q
             save_kv_cache = False
-            if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
+            if _is_breakable_prefill(forward_batch):
                 o = attn_q.new_empty(
                     (*attn_q.shape[:-1], self.attn_mqa.v_head_dim),
                     # TRT-LLM returns BF16 even with FP8 queries.
@@ -3335,6 +3371,17 @@ def _scatter_tail_rows(
     return full
 
 
+def _num_built_layers(config: DeepSeekV4Config) -> int:
+    # A CED-split PD prefill runs only the encoder: every layer through the last
+    # kv_source layer. Decode replays the prompt tail through the rest.
+    if (
+        envs.SGLANG_OPT_DSV41_CED_SPLIT.get()
+        and get_disagg().disaggregation_mode == "prefill"
+    ):
+        return max(config.kv_source_layer_ids) + 1
+    return config.num_hidden_layers
+
+
 class DeepseekV4CudaDecoderLayer(DeepseekV4DecoderLayerBase):
     """CUDA execution with declared residual reads and writes."""
 
@@ -3532,6 +3579,8 @@ DeepseekV4DecoderLayer = (
 
 class DeepseekV4Model(nn.Module):
     fall_back_to_pt_during_load = False
+    # The layer whose input state a CED boundary handoff captures (prefill only).
+    ced_boundary_capture_layer: Optional[int] = None
 
     def __init__(
         self,
@@ -3597,8 +3646,9 @@ class DeepseekV4Model(nn.Module):
             else None
         )
         self.engram_layout = EngramLayout.from_config(config)
+        self.num_built_layers = _num_built_layers(config)
         self.layers, self.start_layer, self.end_layer = make_pp_layers(
-            config.num_hidden_layers,
+            self.num_built_layers,
             lambda idx, prefix: DeepseekV4DecoderLayer(
                 config=config,
                 layer_id=idx,
@@ -3614,6 +3664,11 @@ class DeepseekV4Model(nn.Module):
             stage_facts=functools.partial(hc_boundary.stages, config)
             if _is_cuda
             else None,
+        )
+        # Layers a CED-split prefill does not build keep their ids addressable.
+        self.layers.extend(
+            PPMissingLayer()
+            for _ in range(self.num_built_layers, config.num_hidden_layers)
         )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -3643,6 +3698,19 @@ class DeepseekV4Model(nn.Module):
                     else None
                 ),
             )
+        self.engram_prefetcher = None
+        staged_tables = {
+            layer.engram.layer_hash_index: layer.engram.embed.staged_table
+            for layer in self.layers[self.start_layer : self.end_layer]
+            if layer.engram is not None and layer.engram.embed.staged_table is not None
+        }
+        if staged_tables and envs.SGLANG_OPT_DSV41_ENGRAM_STAGING_PREFETCH.get():
+            from sglang.srt.layers.engram_staging import StagedEngramPrefetcher
+
+            self.engram_prefetcher = StagedEngramPrefetcher(
+                tables=staged_tables,
+                gather_threads=envs.SGLANG_DSV41_ENGRAM_GATHER_THREADS.get(),
+            )
 
         if not _is_cuda:
             self.use_fused_mhc_post_pre = (
@@ -3670,7 +3738,10 @@ class DeepseekV4Model(nn.Module):
             self.late_layer_start = (
                 last_source if self.tail_writes_source_kv else last_source + 1
             )
-            if self.tail_writes_source_kv:
+            if (
+                self.tail_writes_source_kv
+                and self.start_layer <= last_source < self.end_layer
+            ):
                 assert self.layers[last_source].engram is None, (
                     "the last kv_source layer must not carry an Engram"
                 )
@@ -3692,6 +3763,16 @@ class DeepseekV4Model(nn.Module):
             assert getattr(config, "num_hash_layers", 0) <= self.late_layer_start, (
                 "decoder SWA bounded replay needs hash routing before the late layers"
             )
+        # CED boundary handoff: the prefill stage running the last kv_source layer
+        # captures that layer's input state for each prompt's last window.
+        self.ced_boundary_capture_layer: Optional[int] = None
+        if (
+            ced_boundary_enabled()
+            and get_disagg().disaggregation_mode == "prefill"
+            and config.kv_source_layer_ids
+            and self.start_layer <= max(config.kv_source_layer_ids) < self.end_layer
+        ):
+            self.ced_boundary_capture_layer = max(config.kv_source_layer_ids)
         # Only vision routing reads token IDs in the late layers.
         self.late_layer_vl_routing = (
             config.model_type == "deepseek_v41"
@@ -3764,6 +3845,211 @@ class DeepseekV4Model(nn.Module):
                 "decoder SWA bounded replay tail misses prompt-logprob rows"
             )
 
+    def _ced_tail_graph_allowed(
+        self, forward_batch: ForwardBatch, tail: LateLayerTail, cp_extend: bool
+    ) -> bool:
+        """Whether a CED-split decode tail replay may use the opt-in CED graphs."""
+        return (
+            _is_cuda
+            and envs.SGLANG_OPT_DSV41_CED_SPLIT.get()
+            and get_disagg().disaggregation_mode == "decode"
+            and self.pp_group.world_size == 1
+            and not is_dp_attention_enabled()
+            and not cp_extend
+            and tail.scatter_indices is None
+            and not is_in_breakable_cuda_graph()
+            and get_attn_backend().token_to_kv_pool.request_window is None
+        )
+
+    def _run_hc_layer_span(
+        self,
+        start: int,
+        end: int,
+        positions: torch.Tensor,
+        residual: torch.Tensor,
+        pre: Optional[torch.Tensor],
+        input_ids: torch.Tensor,
+        input_ids_global: torch.Tensor,
+        hash_ids: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+        capture_dspark: bool,
+        dspark_aux_hidden_states: List[torch.Tensor],
+        *,
+        next_layer: Optional[nn.Module] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Run CUDA layers [start, end) between two materialized mHC states.
+
+        The CED encoder and late graphs capture spans of the ordinary layer
+        loop through this. No late-layer tail transition happens inside a span.
+        ``next_layer`` materializes the output for that layer's read, as the
+        ordinary loop does at the tail transition; otherwise the span ends with
+        the loop's final read.
+        """
+        assert _is_cuda
+        state = mhc.HcState(residual, pre)
+        residual_batch.start(forward_batch)
+        hidden_states = residual_batch.set_written(state, forward_batch)
+        for i in range(start, end):
+            layer = self.layers[i]
+            capture = capture_dspark and i in self.dspark_layers_to_capture
+            if layer.engram is not None or capture:
+                call = hc_boundary.LayerCall(input_ids, input_ids_global)
+                next_boundary = (
+                    hc_boundary.HcRead(layer, True)
+                    .bind(forward_batch, call)
+                    .next_boundary
+                )
+                hidden_states = state = hc_boundary.materialize(
+                    hidden_states, forward_batch, next=next_boundary
+                )
+            if layer.engram is not None:
+                before_engram = state.residual
+                hidden_states = layer.engram(
+                    state.residual,
+                    hash_ids[:, layer.engram.layer_hash_index],
+                    forward_batch,
+                )
+                if (
+                    self.config.model_type == "deepseek_v41"
+                    and self.config.vision_n_layers > 0
+                ):
+                    hidden_states = torch.where(
+                        (input_ids == self.config.image_token_id)[:, None, None],
+                        before_engram,
+                        hidden_states,
+                    )
+                state = state.with_residual(hidden_states)
+                hidden_states = residual_batch.set_written(state, forward_batch)
+            if capture:
+                dspark_aux_hidden_states.append(state.residual.mean(dim=1))
+            hidden_states = layer(
+                positions=positions,
+                hidden_states=hidden_states,
+                input_ids=input_ids,
+                forward_batch=forward_batch,
+                input_ids_global=input_ids_global,
+            )
+        if next_layer is not None:
+            call = hc_boundary.LayerCall(input_ids, input_ids_global)
+            next_boundary = (
+                hc_boundary.HcRead(next_layer, True)
+                .bind(forward_batch, call)
+                .next_boundary
+            )
+            state = hc_boundary.materialize(
+                hidden_states, forward_batch, next=next_boundary
+            )
+            residual_batch.clear(forward_batch)
+        else:
+            state = residual_batch.read_output(
+                hidden_states, forward_batch, hc_boundary.FinalRead(), None
+            )
+        state = state.materialized(self.layers[end - 1].hc_cfg)
+        return state.residual, state.pre
+
+    def _ced_boundary_state(
+        self,
+        state: mhc.HcState,
+        tail: LateLayerTail,
+        injection: CedBoundaryInjection,
+    ) -> mhc.HcState:
+        """The extend's state with prefill's boundary rows at the tail rows; the
+        other rows are dropped by the tail narrowing before anything reads them."""
+        rows = tail.token_indices
+        assert tail.scatter_indices is None and not tail.pad_rows, (
+            "the CED boundary handoff runs an eager late-layer tail"
+        )
+        assert rows.numel() == injection.residual.shape[0], (
+            rows.numel(),
+            injection.residual.shape[0],
+        )
+        residual = state.residual.new_zeros(state.residual.shape)
+        residual.index_copy_(0, rows, injection.residual.to(residual.dtype))
+        pre = None
+        if injection.pre is not None:
+            pre = injection.pre.new_zeros((residual.shape[0], injection.pre.shape[1]))
+            pre.index_copy_(0, rows, injection.pre)
+        return mhc.HcState(residual, pre)
+
+    def _capture_ced_boundary(
+        self,
+        state: mhc.HcState,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        if is_in_breakable_cuda_graph():
+            # The break is captured unconditionally; it reads the live batch's
+            # capture spec at replay, and a batch with none is a no-op.
+            bcg_deepseek_v4_ced_capture_boundary(
+                positions.new_zeros((1,)), state.residual, state.pre
+            )
+        else:
+            fill_ced_boundary_for_forward(forward_batch, state.residual, state.pre)
+
+    def _check_ced_boundary(
+        self,
+        state: mhc.HcState,
+        tail: LateLayerTail,
+        injection: CedBoundaryInjection,
+    ) -> None:
+        """Log how far the recomputed boundary rows are from the handed-off ones."""
+        got = tail.rows(state.residual).float()
+        want = injection.residual.float()
+        diff = (got - want).abs()
+        scale = want.abs().max().clamp_min(1e-12)
+        cos = torch.nn.functional.cosine_similarity(
+            got.flatten(1), want.flatten(1), dim=1
+        )
+        msg = (
+            f"CED boundary check: rows={got.shape[0]} "
+            f"residual max_abs={diff.max().item():.4g} "
+            f"mean_abs={diff.mean().item():.4g} rel={(diff.max() / scale).item():.4g} "
+            f"cos_min={cos.min().item():.6f}"
+        )
+        if injection.pre is not None and state.pre is not None:
+            pre_diff = (tail.rows(state.pre).float() - injection.pre.float()).abs()
+            msg += f" pre max_abs={pre_diff.max().item():.4g}"
+        else:
+            msg += (
+                f" pre handed={injection.pre is not None} "
+                f"recomputed={state.pre is not None}"
+            )
+        logger.info(msg)
+
+    @staticmethod
+    def _check_ced_encoder_graph(
+        encoder_outputs, encoder_check, expected, tail: LateLayerTail
+    ) -> None:
+        """Compare an unchecked CED encoder graph with the ordinary loop."""
+        from sglang.srt.model_executor.runner.ced_graph_check import bitwise_equal
+
+        actual = (
+            *encoder_outputs[:2],
+            *(tail.rows(x) for x in encoder_outputs[2:]),
+        )
+        assert len(actual) == len(expected), "CED encoder output count differs"
+        for index, (a, b) in enumerate(zip(actual, expected)):
+            if a is None and b is None:
+                continue
+            if a is None or b is None or a.shape != b.shape:
+                raise RuntimeError(f"CED encoder graph output {index} layout differs")
+            if not bitwise_equal(a, b):
+                delta = (a.float() - b.float()).abs().max().item()
+                logger.error(
+                    "CED encoder graph exact check FAILED: output=%d rows=%d "
+                    "max_abs=%s; disabling shape",
+                    index,
+                    expected[0].shape[0],
+                    delta,
+                )
+                encoder_check.invalid = True
+        if not encoder_check.invalid:
+            logger.info(
+                "CED encoder graph exact hidden check passed: rows=%d",
+                expected[0].shape[0],
+            )
+        encoder_check.checked = True
+
     def _forward_layers_hc_pre_from_prev(
         self,
         positions: torch.Tensor,
@@ -3773,13 +4059,20 @@ class DeepseekV4Model(nn.Module):
         input_ids_global: torch.Tensor,
         capture_dspark: bool,
         dspark_aux_hidden_states: List[torch.Tensor],
+        prev_pre_in: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[LateLayerTail]]:
-        assert self.pp_group.world_size == 1, "pre-mix hand-off across PP is not wired"
+        # prev_pre_in: the previous pipeline stage's pre-mix for this stage's
+        # first layer. Without it the first combine would read stream 0 alone.
         hash_ids = None
         cp_extend = (
             is_cp_active(forward_batch) and forward_batch.forward_mode.is_extend()
         )
-        if self.engram_hasher is not None:
+        # CED boundary handoff: a tail replay starts at the last kv_source layer
+        # from prefill's state, so the encoder (and its Engram) does not run.
+        boundary = forward_batch.ced_boundary if ced_boundary_enabled() else None
+        injection = boundary if isinstance(boundary, CedBoundaryInjection) else None
+        replay_from_boundary = injection is not None and not injection.check
+        if self.engram_hasher is not None and not replay_from_boundary:
             if cp_extend:
                 # n-gram hashing needs each token's predecessors: hash the whole prompt
                 total = int(forward_batch.attn_cp_metadata.total_seq_lens)
@@ -3793,19 +4086,30 @@ class DeepseekV4Model(nn.Module):
                     hash_ids = torch.cat(
                         [hash_ids, hash_ids.new_zeros(pad_rows, *hash_ids.shape[1:])]
                     )
-            elif (
-                forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph()
-            ):
+            elif _is_breakable_prefill(forward_batch):
                 hash_ids = bcg_deepseek_v4_engram_hash_ids(
                     self.engram_hasher, input_ids
                 )
+                prefetcher = getattr(self, "engram_prefetcher", None)
+                if prefetcher is not None:
+                    prefetcher.start(hash_ids)
             else:
                 hash_ids = self.engram_hasher(input_ids, forward_batch)
+                prefetcher = getattr(self, "engram_prefetcher", None)
+                if prefetcher is not None:
+                    prefetcher.start(hash_ids)
         tail = None
         if (
             self.late_layer_start is not None
+            # An earlier pipeline stage runs every row; the tail starts in a
+            # later stage's layer range.
+            and self.end_layer > self.late_layer_start
             and forward_batch.forward_mode.is_extend_without_speculative()
         ):
+            if self.start_layer > self.late_layer_start:
+                raise NotImplementedError(
+                    "the late-layer tail must start in this pipeline stage"
+                )
             attn_backend = get_attn_backend()
             tail = attn_backend.tail_forward_metadata.late_layer_tail
             self._check_late_layer_tail_readers(forward_batch, tail)
@@ -3837,15 +4141,64 @@ class DeepseekV4Model(nn.Module):
         # its producer update explicitly before these readers below.
         # mHC assumes full token rows per rank; LayerNorm SP needs its own path.
         assert not get_forward().sp_active
-        state = mhc.HcState(hidden_states)
+        state = mhc.HcState(hidden_states, prev_pre_in)
         if _is_cuda:
             residual_batch.start(forward_batch)
             hidden_states = residual_batch.set_written(state, forward_batch)
-        for i in range(self.start_layer, self.end_layer):
+        ced_graphs = tail is not None and self._ced_tail_graph_allowed(
+            forward_batch, tail, cp_extend
+        )
+        layer_start = self.start_layer
+        encoder_outputs = None
+        encoder_check = None
+        if replay_from_boundary:
+            assert tail is not None and self.tail_writes_source_kv and _is_cuda, (
+                "the CED boundary handoff replays a CUDA late-layer tail"
+            )
+            state = self._ced_boundary_state(state, tail, injection)
+            hidden_states = residual_batch.set_written(state, forward_batch)
+            layer_start = self.late_layer_start
+        elif (
+            ced_graphs
+            and envs.SGLANG_DSV41_CED_TAIL_ENCODER_GRAPH.get()
+            # The encoder graph fails its exact check (2026-10-20, max_abs 6.6);
+            # replay it only where that check runs and can disable the shape.
+            and envs.SGLANG_DSV41_CED_TAIL_GRAPH_CHECK.get()
+        ):
+            from sglang.srt.model_executor.runner.ced_encoder_graph import (
+                run_ced_encoder_graph,
+            )
+
+            result = run_ced_encoder_graph(
+                self,
+                attn_backend,
+                forward_batch,
+                (
+                    positions,
+                    state.residual,
+                    input_ids,
+                    input_ids_global,
+                    state.pre,
+                    hash_ids,
+                ),
+                capture_dspark,
+            )
+            if result is not None:
+                encoder_outputs, encoder_check = result
+                if encoder_check is None:
+                    state = mhc.HcState(*encoder_outputs[:2])
+                    hidden_states = residual_batch.set_written(state, forward_batch)
+                    # The ordinary loop keeps only the tail rows of encoder aux.
+                    dspark_aux_hidden_states.extend(
+                        tail.rows(aux) for aux in encoder_outputs[2:]
+                    )
+                    layer_start = self.late_layer_start
+        for i in range(layer_start, self.end_layer):
             if _is_cuda:
                 layer = self.layers[i]
                 if (
                     (tail is not None and i == self.late_layer_start)
+                    or i == self.ced_boundary_capture_layer
                     or layer.engram is not None
                     or (capture_dspark and i in self.dspark_layers_to_capture)
                 ):
@@ -3861,8 +4214,23 @@ class DeepseekV4Model(nn.Module):
                     hidden_states = state = hc_boundary.materialize(
                         hidden_states, forward_batch, next=next_boundary
                     )
+                if (
+                    i == self.ced_boundary_capture_layer
+                    and forward_batch.forward_mode.is_extend()
+                ):
+                    self._capture_ced_boundary(state, positions, forward_batch)
             if tail is not None and i == self.late_layer_start:
-                if self.tail_writes_source_kv:
+                if injection is not None and injection.check:
+                    self._check_ced_boundary(state, tail, injection)
+                if encoder_check is not None:
+                    self._check_ced_encoder_graph(
+                        encoder_outputs,
+                        encoder_check,
+                        (state.residual, state.pre, *dspark_aux_hidden_states),
+                        tail,
+                    )
+                # Under the boundary handoff prefill wrote these rows' source KV.
+                if self.tail_writes_source_kv and not replay_from_boundary:
                     source = self.layers[i]
                     attn_backend.write_tail_source_kv(
                         layer=source.self_attn,
@@ -3890,6 +4258,29 @@ class DeepseekV4Model(nn.Module):
                 positions = tail.positions
                 if hash_ids is not None:
                     hash_ids = tail.rows(hash_ids)
+                if ced_graphs and envs.SGLANG_DSV41_CED_TAIL_LATE_GRAPH.get():
+                    from sglang.srt.model_executor.runner.ced_tail_graph import (
+                        run_ced_late_graph,
+                    )
+
+                    outputs = run_ced_late_graph(
+                        self,
+                        attn_backend,
+                        forward_batch,
+                        (
+                            positions,
+                            state.residual,
+                            input_ids,
+                            input_ids_global,
+                            state.pre,
+                        ),
+                        capture_dspark,
+                    )
+                    if outputs is not None:
+                        state = mhc.HcState(*outputs[:2])
+                        hidden_states = residual_batch.set_written(state, forward_batch)
+                        dspark_aux_hidden_states.extend(outputs[2:])
+                        break
             if late_dp_counts is not None and i == self.late_layer_start:
                 saved_dp = enter_late_layer_dp(forward_batch, late_dp_counts)
                 if get_moe_a2a_backend().is_none():
@@ -4126,6 +4517,7 @@ class DeepseekV4Model(nn.Module):
         input_embeds: Optional[torch.Tensor],
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        prev_pre_in = None
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -4142,6 +4534,7 @@ class DeepseekV4Model(nn.Module):
                 hidden_states = hidden_states.view(
                     hidden_states.shape[0], self.hc_mult, self.hidden_size
                 )
+            prev_pre_in = pp_proxy_tensors.tensors.get("prev_pre")
 
         if get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none():
             input_ids_global = torch.empty(
@@ -4204,6 +4597,7 @@ class DeepseekV4Model(nn.Module):
                 input_ids_global,
                 capture_dspark,
                 dspark_aux_hidden_states,
+                prev_pre_in=prev_pre_in,
             )
         elif run_tbo:
             # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
@@ -4270,7 +4664,13 @@ class DeepseekV4Model(nn.Module):
 
         if not self.pp_group.is_last_rank:
             # Flatten 3D mHC tensor for PP IPC.
-            return PPProxyTensors({"hidden_states": hidden_states.flatten(1)})
+            proxy_tensors = {"hidden_states": hidden_states.flatten(1)}
+            if last_pre is not None:
+                # The cross-layer pre-mix is the next stage's first-layer input
+                # too (deepseek_v2.py's topk_indices hand-off is the precedent);
+                # last_pre is only set under hc_pre_from_prev_sublayer.
+                proxy_tensors["prev_pre"] = last_pre
+            return PPProxyTensors(proxy_tensors)
 
         pre_hc_head = hidden_states.flatten(1)
 
@@ -4360,21 +4760,20 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.wo_a_fp8 = wo_a_fp8_gemm_enabled(quant_config)
         self.determine_num_fused_shared_experts()
         self.vision = None
-        if (
+        self.has_vision_tokens = (
             config.model_type == "deepseek_v41"
             and config.vision_n_layers > 0
             and not getattr(config, "language_model_only", False)
-        ):
-            if (
-                get_parallel().attn_cp_size != 1
-                or get_parallel().pp_group.world_size != 1
-                or not (
-                    get_moe_a2a_backend().is_none()
-                    or (_is_cuda and get_moe_a2a_backend().is_megamoe())
-                )
+        )
+        # Images enter at the embedding, so only the first pipeline stage owns
+        # the vision tower; every stage still remaps image ids for Engram.
+        if self.has_vision_tokens and get_parallel().pp_group.is_first_rank:
+            if get_parallel().attn_cp_size != 1 or not (
+                get_moe_a2a_backend().is_none()
+                or (_is_cuda and get_moe_a2a_backend().is_megamoe())
             ):
                 raise ValueError(
-                    "V4.1 vision supports TP/EP/DP without CP or PP; "
+                    "V4.1 vision supports TP/EP/DP/PP without CP; "
                     "MoE A2A requires CUDA MegaMoE"
                 )
 
@@ -4476,6 +4875,75 @@ class DeepseekV4ForCausalLM(nn.Module):
         if seen:
             logger.info(
                 "FlashInfer prefill autotune: %d MXFP8 weight layouts at M=%d.",
+                len(seen),
+                num_tokens,
+            )
+        # The caller skips the generic extend-shaped autotune forward once this
+        # returns nonzero, so the routed MoE must be tuned here as well.
+        return len(seen) + self._autotune_prefill_routed_moe(num_tokens, dtype=dtype)
+
+    def _autotune_prefill_routed_moe(
+        self, num_tokens: int, *, dtype: torch.dtype
+    ) -> int:
+        """Tune the TRT-LLM MxFP4 routed MoE for every token bucket up to
+        ``num_tokens``. Calls the quant method directly: no dispatch, combine or
+        TP collective runs, so every rank tunes the same shapes independently."""
+        from sglang.srt.layers.moe.token_dispatcher.standard import (
+            StandardDispatchOutput,
+        )
+        from sglang.srt.layers.moe.topk import StandardTopKOutput
+        from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
+            Mxfp4FlashinferTrtllmMoEMethod,
+        )
+
+        seen = set()
+        for layer in self.model.layers[self.model.start_layer : self.model.end_layer]:
+            if not isinstance(getattr(layer, "mlp", None), deepseek_v2.DeepseekV2MoE):
+                continue
+            experts = layer.mlp.experts
+            method = experts.quant_method
+            if not isinstance(method, Mxfp4FlashinferTrtllmMoEMethod):
+                continue
+            key = (
+                experts.w13_weight.shape,
+                experts.w2_weight.shape,
+                experts.num_experts,
+                experts.top_k,
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            device = experts.w13_weight.device
+            # Seeded, so every rank profiles identical inputs; uniform routing
+            # with distinct experts per token, like a balanced router.
+            generator = torch.Generator(device=device).manual_seed(0)
+            scores = torch.rand(
+                (num_tokens, experts.num_experts), device=device, generator=generator
+            )
+            topk_ids = scores.topk(experts.top_k, dim=-1).indices.to(torch.int32)
+            del scores
+            topk_weights = torch.full(
+                topk_ids.shape, 1.0 / experts.top_k, dtype=torch.float32, device=device
+            )
+            hidden_states = torch.zeros(
+                (num_tokens, experts.hidden_size), dtype=dtype, device=device
+            )
+            method.apply(
+                experts,
+                StandardDispatchOutput(
+                    hidden_states=hidden_states,
+                    hidden_states_scale=None,
+                    topk_output=StandardTopKOutput(
+                        topk_weights=topk_weights,
+                        topk_ids=topk_ids,
+                        router_logits=topk_weights.new_empty((num_tokens, 0)),
+                    ),
+                ),
+            )
+            del hidden_states, topk_ids, topk_weights
+        if seen:
+            logger.info(
+                "FlashInfer prefill autotune: %d routed MoE layouts at M=%d.",
                 len(seen),
                 num_tokens,
             )
@@ -4601,7 +5069,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             if input_embeds is not None:
                 raise ValueError("Cannot combine input_embeds and image inputs")
             input_embeds = self._prepare_mm_embeddings(input_ids, forward_batch)
-        if getattr(self, "vision", None) is not None and not (
+        if getattr(self, "has_vision_tokens", False) and not (
             forward_batch.forward_mode.is_decode_or_idle()
             or forward_batch.forward_mode.is_target_verify()
         ):
@@ -5033,7 +5501,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                         ("vision.", "aligner.", "image_")
                     ):
                         skip_group = "vision"
-                    elif self.vision is None and name.endswith(
+                    elif not self.has_vision_tokens and name.endswith(
                         ".gate.e_score_correction_bias_vl"
                     ):
                         skip_group = "gate.bias_vl"

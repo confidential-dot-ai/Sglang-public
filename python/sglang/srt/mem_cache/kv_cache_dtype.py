@@ -20,13 +20,42 @@ TORCH_DTYPE_TO_KV_CACHE_STR = {
 }
 
 
+def dflash_draft_kv_cache_dtype(
+    *,
+    kv_cache_dtype: torch.dtype,
+    model_dtype: torch.dtype,
+    speculative_draft_attention_backend: Optional[str],
+    kv_cache_is_fp4: Optional[bool] = None,
+) -> torch.dtype:
+    """The KV dtype a DFLASH-family draft pool actually uses.
+
+    Single source of truth for the draft-dtype override, shared between
+    configure_kv_cache_dtype (pool allocation on the draft worker) and
+    DefaultPoolConfigurator (target-side sizing that budgets for the draft
+    pool): fa4 draft attention needs K.dtype == Q.dtype, and FP4 target KV was
+    never validated for any draft backend, so both force the draft pool back
+    to the compute dtype.
+    """
+    if kv_cache_is_fp4 is None:
+        kv_cache_is_fp4 = (
+            hasattr(torch, "float4_e2m1fn_x2")
+            and kv_cache_dtype == torch.float4_e2m1fn_x2
+        )
+    needs_draft_dtype_override = (
+        speculative_draft_attention_backend == "fa4" or kv_cache_is_fp4
+    )
+    if needs_draft_dtype_override and kv_cache_dtype != model_dtype:
+        return model_dtype
+    return kv_cache_dtype
+
+
 def configure_kv_cache_dtype(
     *,
     server_args_kv_cache_dtype: str,
     model: nn.Module | None,
     model_dtype: torch.dtype,
     is_draft_worker: bool,
-    is_dflash: bool,
+    is_dflash_family: bool,
     speculative_draft_attention_backend: str,
     speculative_draft_kv_cache_dtype: Optional[str] = None,
 ) -> tuple[Optional[str], torch.dtype]:
@@ -79,21 +108,28 @@ def configure_kv_cache_dtype(
         raise ValueError(f"Unsupported kv_cache_dtype: {server_args_kv_cache_dtype}.")
 
     # DFLASH: fa4 draft attention can't read the target's fp8 KV (needs K.dtype == Q.dtype),
-    # so give the fa4 draft its own compute-dtype KV. fp8-capable backends keep the target dtype.
-    if (
-        is_draft_worker
-        and is_dflash
-        and speculative_draft_attention_backend == "fa4"
-        and kv_cache_dtype != model_dtype
-    ):
-        logger.info(
-            "DFLASH fa4 draft: overriding KV cache dtype %s -> %s "
-            "(fa4 needs K.dtype == Q.dtype; cannot read the target's quantized KV).",
-            kv_cache_dtype,
-            model_dtype,
+    # so give the fa4 draft its own compute-dtype KV. fp8-capable backends keep the target
+    # dtype. FP4 (fp4_e2m1) draft KV was never validated for ANY draft backend -- FlashInfer's
+    # own paged-prefill wrapper enforces k.dtype == kv_data_type at plan/run time, and the
+    # draft model's own K/V arrive in model_dtype (bf16, not FP4), so every draft backend
+    # needs its own compute-dtype KV when the target's KV cache is FP4, not just fa4.
+    # Policy lives in dflash_draft_kv_cache_dtype (shared with pool sizing).
+    if is_draft_worker and is_dflash_family:
+        draft_kv_dtype = dflash_draft_kv_cache_dtype(
+            kv_cache_dtype=kv_cache_dtype,
+            model_dtype=model_dtype,
+            speculative_draft_attention_backend=speculative_draft_attention_backend,
         )
-        kv_cache_dtype = model_dtype
-        # "auto" is the tag for an unquantized pool; backends gate descale on it.
-        resolved_kv_cache_dtype = "auto"
+        if draft_kv_dtype != kv_cache_dtype:
+            logger.info(
+                "DFLASH-family %s draft: overriding KV cache dtype %s -> %s "
+                "(draft attention backend cannot read the target's quantized KV).",
+                speculative_draft_attention_backend,
+                kv_cache_dtype,
+                draft_kv_dtype,
+            )
+            kv_cache_dtype = draft_kv_dtype
+            # "auto" is the tag for an unquantized pool; backends gate descale on it.
+            resolved_kv_cache_dtype = "auto"
 
     return resolved_kv_cache_dtype, kv_cache_dtype

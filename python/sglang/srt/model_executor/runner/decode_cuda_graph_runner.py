@@ -216,6 +216,18 @@ def build_replay_fb_view(
     )
 
 
+def _is_cuda_oom(err: BaseException) -> bool:
+    """True for an out-of-memory failure, which capture degrades on rather than dies.
+
+    torch.OutOfMemoryError does not cover every path: FlashInfer workspace and
+    driver-level graph allocations surface as a plain RuntimeError whose text
+    carries the CUDA message, so match that too.
+    """
+    return isinstance(err, getattr(torch, "OutOfMemoryError", ())) or (
+        "out of memory" in str(err).lower()
+    )
+
+
 class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     """Decode-phase CUDA graph runner.
 
@@ -224,6 +236,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     pluggable self.backend that handles the actual capture/replay.
     """
 
+    # Class-level so the capture-degradation state is always readable: the
+    # draft/extend subclasses reuse capture() without running this __init__.
+    # Both defaults mean "nothing degraded", i.e. pre-existing behavior.
+    # frozenset (rebound, never mutated) keeps the default from being shared.
+    _cuda_graph_state_ready: bool = True
+    _skipped_bs: frozenset = frozenset()
     dllm_input_preparation = None
     dllm_attention = None
 
@@ -370,7 +388,30 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if self.capture_num_tokens is not None
             else self.max_bs * self.captured_req_width
         )
-        self.attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
+        # This one allocation is sized by context length, not by the tier
+        # ladder: flashinfer's cuda_graph_kv_indices is
+        # max_num_tokens * max_context_len * 4B with no page_size divisor, then
+        # cloned per wrapper -- 1 GiB per wrapper at 256K and 4 GiB at 1M, which
+        # is what OOM-killed the 1M boot on 2026-09-04. It runs once, before the
+        # tier loop, so the per-shape skip below cannot catch it. Losing it
+        # costs graphs, not correctness: no shape key is ever registered, so
+        # can_run_graph refuses every batch and decode runs eager.
+        self._cuda_graph_state_ready = True
+        try:
+            self.attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
+        except Exception as err:
+            if not _is_cuda_oom(err):
+                raise
+            self._cuda_graph_state_ready = False
+            logger.warning(
+                "CUDA graph state allocation OOM'd at max_bs=%s "
+                "max_num_token=%s (%r) -- DISABLING CUDA graphs; decode will "
+                "run eager. To recover them, lower CONTEXT_LENGTH or "
+                "CUDA_GRAPH_MAX_BS so the graph KV-index buffer fits.",
+                self.max_bs,
+                self.max_num_token,
+                err,
+            )
 
         # Init PDMux if needed
         self.maybe_init_pdmux()
@@ -502,13 +543,25 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.backend = resolve_decode_backend(self)
 
         # --- capture --------------------------------------------------
-        try:
-            with model_capture_mode():
-                self.capture()
-        except RuntimeError as e:
-            raise Exception(
-                f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
+        self._skipped_capture_shapes: list = []
+        # Padded batch sizes whose capture OOM'd and so have no graph;
+        # consulted by can_run_graph so such a bucket is never admitted to
+        # replay.
+        self._skipped_bs = frozenset()
+        if not self._cuda_graph_state_ready:
+            logger.warning(
+                "Skipping CUDA graph capture entirely: graph state is "
+                "unavailable (see the OOM above). Decode runs eager."
             )
+        else:
+            try:
+                with model_capture_mode():
+                    self.capture()
+            except RuntimeError as e:
+                raise Exception(
+                    f"Capture cuda graph failed: {e}\n"
+                    f"{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
+                )
 
     def _next_token_logits_buffer_capacity_rows(self, max_num_tokens: int) -> int:
         """Rows reserved for the largest shared logits output."""
@@ -581,7 +634,25 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if self.enable_pdmux:
             self.stream_groups = get_stream_groups()
             for attn_backend in self.model_runner.decode_attn_backend_group:
-                attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
+                # Same context-sized allocation as the primary backend above,
+                # once per stream group; degrade to eager rather than die.
+                try:
+                    attn_backend.init_cuda_graph_state(
+                        self.max_bs, self.max_num_token
+                    )
+                except Exception as err:
+                    if not _is_cuda_oom(err):
+                        raise
+                    self._cuda_graph_state_ready = False
+                    logger.warning(
+                        "CUDA graph state allocation OOM'd for a PDMux stream "
+                        "group at max_bs=%s max_num_token=%s (%r) -- DISABLING "
+                        "CUDA graphs; decode will run eager.",
+                        self.max_bs,
+                        self.max_num_token,
+                        err,
+                    )
+                    return
 
     def _cache_loc_dtype(self):
         return torch.int64
@@ -705,6 +776,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return max(request_counts)
 
     def can_run_graph(self, forward_batch: ForwardBatch):
+        # No graph state means no shape was ever captured. Must be refused
+        # here rather than left to backend.can_run: with padding enabled the
+        # is_bs_supported branch below never consults the backend, so a "yes"
+        # reaches replay's bare self._graphs[shape_key] as a KeyError.
+        if not self._cuda_graph_state_ready:
+            return False
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
             return False
@@ -751,6 +828,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if self.disable_padding
             else cuda_graph_bs <= self.max_bs
         )
+
+        # A shape skipped for OOM stays in capture_bs, so with padding enabled
+        # the branch above still pads onto it and replay indexes a graph that
+        # was never captured. Empty on a healthy boot, so this changes nothing
+        # there; on a degraded one, answering "eager" is always safe.
+        if is_bs_supported and self._skipped_bs:
+            padded_bs = self._pad_to_bucket(cuda_graph_bs, self.capture_bs)
+            if padded_bs in self._skipped_bs:
+                return False
 
         if self.require_mlp_sync:
             is_bs_supported = (
@@ -1171,6 +1257,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self._post_process_after_profile(prof)
         self._profiler = None
 
+        skipped = getattr(self, "_skipped_capture_shapes", [])
+        if skipped:
+            logger.warning(
+                "CUDA graph capture finished with %d shape(s) SKIPPED due to "
+                "OOM; those batch shapes will replay eager: bs %s. To recover "
+                "them, lower MAX_TOTAL_TOKENS or the CUDA graph max batch size.",
+                len(skipped),
+                sorted({_bs for _bs, _nt in skipped}),
+            )
+
     def _capture_one_stream(self, stream_idx: Optional[int] = None) -> None:
         avail_mem = get_available_gpu_memory(
             self.model_runner.device,
@@ -1203,6 +1299,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
                 )
 
+            capture_num_tokens = bs * self.captured_req_width
             for variant_label, _variant_has_lora in lora_variants:
                 _set_capture_lora_variant(variant_label)
                 for attention_variant in attention_variants:
@@ -1213,17 +1310,92 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     with torch_compile_decoration.patch_model(
                         self.model_runner.model,
                         bs in self.compile_bs,
-                        num_tokens=bs * self.captured_req_width,
+                        num_tokens=capture_num_tokens,
                         tp_group=get_parallel().tp_group,
                     ) as forward:
-                        self.capture_one_shape(
-                            bs,
-                            forward,
-                            stream_idx,
-                            variant_label,
-                            attention_variant,
-                        )
+                        # Guards the whole shape, not just
+                        # backend.capture_one: capture_prepare, the
+                        # out-graph metadata init and the autotune
+                        # warmup all allocate, and any of them can be
+                        # the one that OOMs.
+                        # Subclass capture_one_shape overrides inherit
+                        # the guard by sitting under this call.
+                        try:
+                            self.capture_one_shape(
+                                bs,
+                                forward,
+                                stream_idx,
+                                variant_label,
+                                attention_variant,
+                            )
+                        except Exception as err:
+                            self._skip_capture_shape_or_raise(
+                                err, bs, capture_num_tokens
+                            )
         _set_capture_attention_variant(None)
+
+    def _skip_capture_shape_or_raise(
+        self,
+        err: Exception,
+        bs: int,
+        num_tokens: int,
+    ) -> None:
+        """Record an OOM'd capture shape as eager-only, or re-raise a real bug.
+
+        The shape key is only registered in the backend after a successful
+        capture, so a skipped shape is simply absent from backend.can_run() and
+        those batches replay eager -- slower for them, but the server boots and
+        every request stays servable. Anything that is NOT an OOM is a real bug
+        and still dies here.
+        """
+        is_oom = _is_cuda_oom(err)
+        mem = ""
+        try:
+            free_b, total_b = torch.cuda.mem_get_info()
+            alloc_b = torch.cuda.memory_allocated()
+            resv_b = torch.cuda.memory_reserved()
+            mem = (
+                " | driver free %.2f/%.2f GB, torch allocated "
+                "%.2f GB, torch reserved %.2f GB "
+                "(reserved-allocated %.2f GB is "
+                "fragmentation/graph-pool)"
+                % (
+                    free_b / 1e9,
+                    total_b / 1e9,
+                    alloc_b / 1e9,
+                    resv_b / 1e9,
+                    (resv_b - alloc_b) / 1e9,
+                )
+            )
+        except Exception:
+            mem = " | (memory introspection failed)"
+        if not is_oom:
+            logger.error(
+                "CUDA graph capture failed at bs=%s num_tokens=%s: %r%s",
+                bs,
+                num_tokens,
+                err,
+                mem,
+            )
+            raise err
+        logger.warning(
+            "CUDA graph capture OOM at bs=%s num_tokens=%s -- SKIPPING this "
+            "shape; these batches will run eager.%s",
+            bs,
+            num_tokens,
+            mem,
+        )
+        self._skipped_capture_shapes.append((bs, num_tokens))
+        # capture_bs is never pruned, so this bucket stays a padding target;
+        # can_run_graph reads this to keep it out of replay.
+        self._skipped_bs = self._skipped_bs | {bs}
+        # Give the next shape the best chance: drop whatever the failed
+        # capture reserved before moving on.
+        try:
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
 
     def capture_one_shape(
         self,
@@ -1339,12 +1511,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     post_warmup_hook=post_warmup_hook,
                     run_lm_head=True,
                 )
-                self.backend.capture_one(
-                    shape_key,
-                    run_once,
-                    capture_inputs=None,
-                    post_warmup_hook=post_warmup_hook,
-                )
+                try:
+                    self.backend.capture_one(
+                        shape_key,
+                        run_once,
+                        capture_inputs=None,
+                        post_warmup_hook=post_warmup_hook,
+                    )
+                except Exception as err:
+                    self._skip_capture_shape_or_raise(err, bs, num_tokens)
 
     def _set_dp_real_num_tokens(self, raw_num_token: int) -> None:
         # An idle DP rank replays a fabricated batch whose count may not reach
@@ -1409,6 +1584,23 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self._set_dp_real_num_tokens(self.raw_num_token)
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
+            # seq_lens must be refreshed for graphs whose captured body READS
+            # it (sparse target-verify backends build prefix_lens from
+            # forward_batch.seq_lens in-graph). Without this, every replay ran
+            # the sparse indexer with the capture-time fill value (1), so
+            # top-k selected only KV block 0 regardless of the real sequence
+            # -- the root cause of the DSpark graph-only output corruption.
+            # Same fill-then-copy contract as eagle_draft_cuda_graph_runner /
+            # multi_layer_eagle_draft_extend_cuda_graph_runner (padding slots
+            # must hold the fill value, not a previous tick's stale lengths).
+            raw_bs_now = forward_batch.seq_lens.shape[0]
+            self.buffers.seq_lens.fill_(self.seq_len_fill_value)
+            self.buffers.seq_lens[:raw_bs_now].copy_(forward_batch.seq_lens)
+            if forward_batch.seq_lens_cpu is not None:
+                self.buffers.seq_lens_cpu.fill_(self.seq_len_fill_value)
+                self.buffers.seq_lens_cpu[:raw_bs_now].copy_(
+                    forward_batch.seq_lens_cpu
+                )
             if (
                 pp_proxy_tensors is not None
                 and self.buffers.pp_proxy_tensors is not None
@@ -1576,6 +1768,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self._replay_graph_key = self._make_graph_key(
             graph_size_key, stream_idx, variant_label, attention_variant
         )
+
+    def stage_batch(self, forward_batch: ForwardBatch) -> None:
+        """Pre-plan one DSPARK verify batch for graph replay."""
+        self.load_batch(forward_batch)
 
     def _ragged_graph_num_tokens(self, total_verify_tokens: int) -> int:
         from sglang.srt.speculative.ragged_verify import round_up_grid

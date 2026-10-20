@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, Optional
 import torch
 import triton
 import triton.language as tl
-
 from sglang.kernels.ops.memory.common import (
     get_last_loc_triton,
     get_last_loc_triton_safe,
@@ -358,6 +357,29 @@ def _alloc_page_size(batch: ScheduleBatch) -> int:
     if (_is_hip or _is_cuda or _is_xpu) and get_parallel().dcp_enabled:
         return batch.tree_cache.token_to_kv_pool_allocator.page_size
     return batch.tree_cache.page_size
+
+
+def preallocated_extend_locs(
+    batch: ScheduleBatch,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``alloc_for_extend`` for requests whose extend slots already sit in
+    req_to_token (a PD decode replaying a transferred prompt tail)."""
+    req_pool_indices = [r.kv.req_pool_idx for r in batch.reqs]
+    req_to_token = batch.req_to_token_pool.req_to_token
+    out_cache_loc = torch.cat(
+        [
+            req_to_token[idx, prefix_len : prefix_len + extend_len]
+            for idx, prefix_len, extend_len in zip(
+                req_pool_indices, batch.prefix_lens, batch.extend_lens
+            )
+        ]
+    ).to(torch.int64)
+    req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
+    return (
+        out_cache_loc,
+        req_pool_indices_cpu.to(batch.device, non_blocking=True),
+        req_pool_indices_cpu,
+    )
 
 
 def _prefix_kv_indices(batch: ScheduleBatch, req: Req) -> torch.Tensor:

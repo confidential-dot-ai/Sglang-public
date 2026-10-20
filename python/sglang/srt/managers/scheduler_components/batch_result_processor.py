@@ -114,6 +114,21 @@ class SchedulerBatchResultProcessor:
     beam_coordinator: BeamCoordinator
     abort_request: Callable
 
+    @staticmethod
+    def _wait_result_copy(result: Union[GenerationBatchResult, EmbeddingBatchResult]):
+        """Block until the result's D2H readback is complete.
+
+        Under confidential computing the copy was offloaded to the async copy
+        worker thread (``copy_ready_cpu`` set); wait on that. Otherwise wait on
+        the inline CUDA event (``copy_done``).
+        """
+        copy_ready_cpu = getattr(result, "copy_ready_cpu", None)
+        copy_done = getattr(result, "copy_done", None)
+        if copy_ready_cpu is not None:
+            copy_ready_cpu.wait()
+        elif copy_done is not None:
+            copy_done.synchronize()
+
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
         use_free_group = get_disagg().disaggregation_decode_enable_radix_cache
@@ -264,8 +279,7 @@ class SchedulerBatchResultProcessor:
         self.token_to_kv_pool_allocator.free_group_begin()
 
         if self.is_generation:
-            if result.copy_done is not None:
-                result.copy_done.synchronize()
+            self._wait_result_copy(result)
             auxiliary_output_starts = self.snapshot_auxiliary_output_starts(
                 batch, result
             )
@@ -452,8 +466,7 @@ class SchedulerBatchResultProcessor:
                 )
 
         else:  # embedding or reward model
-            if result.copy_done is not None:
-                result.copy_done.synchronize()
+            self._wait_result_copy(result)
 
             embeddings = self._convert_embeddings(result=result)
             phs = result.pooled_hidden_states
@@ -889,8 +902,7 @@ class SchedulerBatchResultProcessor:
         is_decode = batch.forward_mode.is_decode()
         if not (is_decode or batch.forward_mode.is_extend()):
             return
-        if result.copy_done is not None:
-            result.copy_done.synchronize()
+        self._wait_result_copy(result)
         next_token_ids = result.next_token_ids.tolist()
 
         if not is_decode:
@@ -932,8 +944,7 @@ class SchedulerBatchResultProcessor:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
-        if result.copy_done is not None:
-            result.copy_done.synchronize()
+        self._wait_result_copy(result)
 
         self.output_streamer._stream_output_generation(
             batch.reqs, batch.return_logprob, is_idle_batch=True
@@ -944,8 +955,7 @@ class SchedulerBatchResultProcessor:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
-        if result.copy_done is not None:
-            result.copy_done.synchronize()
+        self._wait_result_copy(result)
         auxiliary_output_starts = self.snapshot_auxiliary_output_starts(batch, result)
         auxiliary_output = result.auxiliary_host_output
         if result.routed_experts_output is not None:

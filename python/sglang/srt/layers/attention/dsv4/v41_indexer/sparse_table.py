@@ -434,6 +434,8 @@ def publish_prefill_table(
             out_offsets=zero_offsets[: logits.shape[0]],
             out_indices=blocks[tile],
         )
+        # Free this tile's logits before the generator scores the next one.
+        del logits, keys
     return _build_prefill_table(
         blocks=blocks,
         compress_lens=data.compress_lens,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import (
@@ -26,6 +27,8 @@ from sglang.srt.managers.io_struct import (
     MMInputsProcessError,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    msgpack_decode_list,
+    msgpack_encode_list,
     sock_recv,
 )
 from sglang.srt.managers.mm_utils import (
@@ -63,6 +66,7 @@ class SchedulerRequestReceiver:
     recv_skipper: Any
     input_blocker: Any
     mm_receiver: Any
+    tp_metadata_nccl_group: Any = None
     server_args: ServerArgs
     model_config: ModelConfig
     max_recv_per_poll: int
@@ -168,6 +172,18 @@ class SchedulerRequestReceiver:
         rank 0 and would overwrite every DP group's aborts but the first.
         """
         local_reqs = local_reqs or []
+        # recv_reqs only ever holds BaseReq/BaseBatchReq msgspec Structs (see
+        # io_struct.py) -- the same objects sock_send/sock_recv already
+        # round-trip through msgpack_encode/msgpack_decode when
+        # SGLANG_USE_PICKLE_IPC is off. Reuse that codec for this hop too,
+        # since pickle.loads (not the collective itself) is the dominant
+        # per-tick cost on every non-src TP rank.
+        codec_kwargs = (
+            {}
+            if envs.SGLANG_USE_PICKLE_IPC.get()
+            else {"encode_fn": msgpack_encode_list, "decode_fn": msgpack_decode_list}
+        )
+
         if get_parallel().attn_dp_enabled:
             if get_parallel().attn_tp_rank == 0 and get_parallel().attn_cp_rank == 0:
                 work_reqs, control_reqs = self._split_work_and_control_reqs(recv_reqs)
@@ -196,6 +212,7 @@ class SchedulerRequestReceiver:
                     tp_group.rank,
                     tp_group.cpu_group,
                     src=tp_group.ranks[0],
+                    **codec_kwargs,
                 )
             recv_reqs = work_reqs + control_reqs
         else:
@@ -203,12 +220,28 @@ class SchedulerRequestReceiver:
                 recv_reqs = [*recv_reqs, *local_reqs]
             if get_parallel().tp_size != 1:
                 tp_group = get_parallel().tp_group
-                recv_reqs = broadcast_pyobj(
-                    recv_reqs,
-                    tp_group.rank,
-                    tp_group.cpu_group,
-                    src=tp_group.ranks[0],
-                )
+                # NCCL measured ~9x lower per-call latency than gloo at these
+                # message sizes. Falls back to the gloo group if the dedicated
+                # NCCL group wasn't created (e.g. world_size==1 at init).
+                # SGLANG_FORCE_GLOO_METADATA_BROADCAST forces gloo for A/B runs.
+                force_gloo = os.environ.get("SGLANG_FORCE_GLOO_METADATA_BROADCAST")
+                if self.tp_metadata_nccl_group is not None and not force_gloo:
+                    recv_reqs = broadcast_pyobj(
+                        recv_reqs,
+                        tp_group.rank,
+                        self.tp_metadata_nccl_group,
+                        src=tp_group.ranks[0],
+                        force_cpu_device=False,
+                        **codec_kwargs,
+                    )
+                else:
+                    recv_reqs = broadcast_pyobj(
+                        recv_reqs,
+                        tp_group.rank,
+                        tp_group.cpu_group,
+                        src=tp_group.ranks[0],
+                        **codec_kwargs,
+                    )
         return recv_reqs
 
     def unwrap_pickle_wrapper(self, recv_reqs: Optional[List]) -> None:

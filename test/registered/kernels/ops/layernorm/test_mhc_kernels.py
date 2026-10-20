@@ -209,6 +209,59 @@ def _check_glm_boundary(x, residual, post, comb, fn, scale, base, *, use_norm):
     )
 
 
+# DeepSeek-V4.1 HC=4 coefficients: 24 mixes over hc_mult * hidden_size inputs.
+_MIX_K, _MIX_N, _SINKHORN_ITERS, _HC_EPS = 20480, 24, 20, 1e-6
+
+
+def _hc_mix_inputs(m):
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    x = torch.randn(m, _MIX_K, device="cuda", generator=gen).bfloat16()
+    fn = torch.randn(_MIX_N, _MIX_K, device="cuda", generator=gen) * 0.01
+    scale = torch.rand(3, device="cuda", generator=gen)
+    base = torch.randn(_MIX_N, device="cuda", generator=gen) * 0.1
+    return x, fn, scale, base
+
+
+def _hc_mix_reference(x, fn, scale, base):
+    x, fn, scale, base = (t.double() for t in (x, fn, scale, base))
+    mix = x @ fn.T * torch.rsqrt(x.square().mean(-1, keepdim=True) + _HC_EPS)
+    pre = torch.sigmoid(mix[:, :4] * scale[0] + base[:4]) + _HC_EPS
+    post = 2 * torch.sigmoid(mix[:, 4:8] * scale[1] + base[4:8])
+    comb = (mix[:, 8:] * scale[2] + base[8:]).view(-1, 4, 4)
+    comb = torch.softmax(comb, -1) + _HC_EPS
+    comb = comb / (comb.sum(-2, keepdim=True) + _HC_EPS)
+    for _ in range(_SINKHORN_ITERS - 1):
+        comb = comb / (comb.sum(-1, keepdim=True) + _HC_EPS)
+        comb = comb / (comb.sum(-2, keepdim=True) + _HC_EPS)
+    return pre, post, comb
+
+
+def _hc_mix_run(x, fn, scale, base):
+    return mhc.hc_mix_stats_sinkhorn(
+        x, fn, scale, base, 4, _SINKHORN_ITERS, _HC_EPS, _HC_EPS
+    )
+
+
+@pytest.mark.parametrize("m", [1, 7, 84, 127])
+def test_hc_mix_stats_sinkhorn_matches_float64_reference(m):
+    inputs = _hc_mix_inputs(m)
+    for got, want in zip(_hc_mix_run(*inputs), _hc_mix_reference(*inputs)):
+        torch.testing.assert_close(got.double(), want, rtol=0, atol=2e-6)
+
+
+def test_hc_mix_stats_sinkhorn_rows_are_batch_invariant():
+    # Decode/verify batches of any size must give each row the same bits.
+    x, fn, scale, base = _hc_mix_inputs(127)
+    full = _hc_mix_run(x, fn, scale, base)
+    for m in (1, 8, 84):
+        for got, want in zip(_hc_mix_run(x[:m].contiguous(), fn, scale, base), full):
+            assert torch.equal(got, want[:m])
+    for row in (0, 63, 126):
+        alone = _hc_mix_run(x[row : row + 1].contiguous(), fn, scale, base)
+        for got, want in zip(alone, full):
+            assert torch.equal(got, want[row : row + 1])
+
+
 def _hopper_mhc_layer(norm, w, scale, base):
     from sglang.srt.models import deepseek_v4_mhc as model_mhc
     from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer

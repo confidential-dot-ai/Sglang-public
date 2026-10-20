@@ -1,4 +1,4 @@
-use std::{borrow::Cow, sync::Arc, time::Instant};
+use std::{borrow::Cow, future::Future, pin::Pin, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use axum::{
@@ -49,6 +49,17 @@ use crate::{
         RouterTrait,
     },
 };
+
+/// Prefill's verdict for a stream that relays decode before prefill's
+/// response has finished: `Ok` once its body is drained, else the failure.
+type PrefillCompletion = Pin<Box<dyn Future<Output = Result<(), PrefillStreamFailure>> + Send>>;
+
+struct PrefillStreamFailure {
+    status: StatusCode,
+    message: String,
+    /// Breaker verdict for prefill: a 4xx is the client's fault, not the worker's.
+    worker_ok: bool,
+}
 
 #[derive(Debug)]
 pub struct PDRouter {
@@ -575,6 +586,7 @@ impl PDRouter {
                 Some(response_headers),
                 prefill,
                 decode,
+                None,
             )
         } else {
             // Handle non-streaming error response
@@ -707,27 +719,84 @@ impl PDRouter {
         }
         .emit();
 
-        let prefill_fut = prefill_request.send();
-        let decode_fut = decode_request.send();
-        tokio::pin!(prefill_fut);
-        tokio::pin!(decode_fut);
+        // Boxed so the early relay below can hand a still-pending prefill to
+        // the stream task.
+        let mut prefill_fut = Box::pin(prefill_request.send());
+        let mut decode_fut = Box::pin(decode_request.send());
 
-        // Poll both until prefill resolves; decode normally resolves later, but
-        // may resolve first if it rejects the request outright.
-        let prefill_result;
+        let mut prefill_result: Option<Result<reqwest::Response, reqwest::Error>> = None;
         let mut decode_early: Option<Result<reqwest::Response, reqwest::Error>> = None;
-        loop {
+
+        // A streaming request without logprobs needs nothing from prefill's
+        // body, and decode sends its headers only with its first token, i.e.
+        // once prefill's KV has arrived. So relay decode as soon as its 2xx
+        // headers do, instead of after prefill's response, which trails the
+        // KV transfer by a prefill scheduler iteration. Prefill keeps being
+        // driven by the stream task; its failure ends the client stream.
+        if context.is_stream && !context.return_logprob {
+            loop {
+                tokio::select! {
+                    biased;
+                    pr = &mut prefill_fut, if prefill_result.is_none() => {
+                        let ok = matches!(&pr, Ok(r) if r.status().is_success());
+                        prefill_result = Some(pr);
+                        if !ok {
+                            break;
+                        }
+                    }
+                    dr = &mut decode_fut => {
+                        match dr {
+                            Ok(res) if res.status().is_success() => {
+                                events::RequestReceivedEvent {}.emit();
+                                let status = StatusCode::from_u16(res.status().as_u16())
+                                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                                let response_headers =
+                                    header_utils::preserve_response_headers(res.headers());
+                                let completion = Self::prefill_completion(
+                                    prefill_result,
+                                    prefill_fut,
+                                    prefill.url().to_string(),
+                                );
+                                let mut response = self.create_streaming_response(
+                                    res.bytes_stream(),
+                                    status,
+                                    None,
+                                    false,
+                                    Some(response_headers),
+                                    prefill,
+                                    decode,
+                                    Some(completion),
+                                );
+                                // The stream task records prefill's outcome.
+                                response.extensions_mut().insert(BreakerOutcomesRecorded);
+                                return response;
+                            }
+                            other => {
+                                decode_early = Some(other);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Otherwise poll both until prefill resolves; decode normally resolves
+        // later, but may resolve first if it rejects the request outright.
+        while prefill_result.is_none() {
             tokio::select! {
                 biased;
                 pr = &mut prefill_fut => {
-                    prefill_result = pr;
-                    break;
+                    prefill_result = Some(pr);
                 }
                 dr = &mut decode_fut, if decode_early.is_none() => {
                     decode_early = Some(dr);
                 }
             }
         }
+        let Some(prefill_result) = prefill_result else {
+            unreachable!("the loop above exits only once prefill has resolved");
+        };
 
         // Decode can't generate without prefill's KV, so any prefill failure
         // (non-2xx / transport error) dooms the paired decode request, which would
@@ -874,6 +943,7 @@ impl PDRouter {
                         Some(response_headers),
                         prefill,
                         decode,
+                        None,
                     )
                 } else {
                     // Non-streaming response
@@ -1114,6 +1184,7 @@ impl PDRouter {
         headers: Option<HeaderMap>,
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
+        prefill_completion: Option<PrefillCompletion>,
     ) -> Response {
         use crate::core::AttachedBody;
 
@@ -1140,10 +1211,33 @@ impl PDRouter {
             tracked.mark_errored();
         }
         let decode_for_log = decode.clone();
+        let prefill_for_outcome = prefill.clone();
+        // Set only when decode is relayed before prefill finished; `pending()`
+        // keeps the select arm below inert otherwise.
+        let mut prefill_pending = prefill_completion.is_some();
+        let mut prefill_wait: PrefillCompletion = prefill_completion
+            .unwrap_or_else(|| -> PrefillCompletion { Box::pin(std::future::pending()) });
         tokio::spawn(async move {
+            let mut client_gone = false;
             loop {
                 tokio::select! {
                     biased;
+                    outcome = &mut prefill_wait, if prefill_pending => {
+                        prefill_pending = false;
+                        if let Err(failure) = outcome {
+                            prefill_for_outcome.record_outcome(failure.worker_ok);
+                            // Decode can't finish without prefill; dropping its
+                            // stream below closes the connection and aborts it.
+                            let payload = json!({
+                                "message": failure.message,
+                                "status": failure.status.as_u16(),
+                            });
+                            let sse_data = format!("data: {}\n\n", json!({ "error": payload }));
+                            let _ = tx.send(Ok(bytes::Bytes::from(sse_data)));
+                            break;
+                        }
+                        prefill_for_outcome.record_outcome(true);
+                    }
                     chunk_result = tracked.next() => {
                         match chunk_result {
                             Some(Ok(chunk)) => {
@@ -1171,6 +1265,7 @@ impl PDRouter {
                                         "Receiver dropped (likely client disconnect), \
                                         cancelling upstream PD stream"
                                     );
+                                    client_gone = true;
                                     break;
                                 }
 
@@ -1193,9 +1288,21 @@ impl PDRouter {
                             "Client disconnected, cancelling upstream PD stream from {}",
                             decode_for_log.url()
                         );
+                        client_gone = true;
                         break;
                     }
                 }
+            }
+            // Decode ended first: let prefill's response finish (it's bounded by
+            // the stream deadline) so its connection closes cleanly and its
+            // outcome is recorded. A client disconnect drops it instead, which
+            // cancels prefill along with decode.
+            if prefill_pending && !client_gone {
+                let worker_ok = match prefill_wait.await {
+                    Ok(()) => true,
+                    Err(failure) => failure.worker_ok,
+                };
+                prefill_for_outcome.record_outcome(worker_ok);
             }
         });
 
@@ -1215,6 +1322,62 @@ impl PDRouter {
         *response.headers_mut() = response_headers;
 
         AttachedBody::wrap_response(response, guards)
+    }
+
+    /// Prefill's completion for an early-relayed decode stream: wait for its
+    /// headers unless they already arrived, then drain its body.
+    fn prefill_completion(
+        resolved: Option<Result<reqwest::Response, reqwest::Error>>,
+        pending: Pin<
+            Box<impl Future<Output = Result<reqwest::Response, reqwest::Error>> + Send + 'static>,
+        >,
+        prefill_url: String,
+    ) -> PrefillCompletion {
+        Box::pin(async move {
+            let result = match resolved {
+                Some(result) => result,
+                None => pending.await,
+            };
+            let response = result.map_err(|e| {
+                error!(
+                    "Prefill server failed prefill_url={} error={} after decode started streaming",
+                    prefill_url, e
+                );
+                PrefillStreamFailure {
+                    status: StatusCode::BAD_GATEWAY,
+                    message: format!("Prefill server error: {}", e),
+                    worker_ok: false,
+                }
+            })?;
+            let status = StatusCode::from_u16(response.status().as_u16())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            if !status.is_success() {
+                let body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "Unknown prefill error".to_string());
+                error!(
+                    "Prefill server returned error status prefill_url={} status={} body={}",
+                    prefill_url, status, body
+                );
+                return Err(PrefillStreamFailure {
+                    status,
+                    message: format!("Prefill server error ({}): {}", status, body),
+                    worker_ok: status.is_client_error(),
+                });
+            }
+            response.bytes().await.map(|_| ()).map_err(|e| {
+                warn!(
+                    "Error consuming prefill response prefill_url={} error={}",
+                    prefill_url, e
+                );
+                PrefillStreamFailure {
+                    status: StatusCode::BAD_GATEWAY,
+                    message: format!("Prefill response failed: {}", e),
+                    worker_ok: false,
+                }
+            })
+        })
     }
 
     // Helper to process non-streaming decode response with logprob merging
@@ -2046,6 +2209,7 @@ mod tests {
                 None,
                 prefill_ref.clone(),
                 decode_ref.clone(),
+                None,
             );
 
             // Guards are now attached to response body, so load should be 1
