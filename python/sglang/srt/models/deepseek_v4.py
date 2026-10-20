@@ -4176,7 +4176,13 @@ class DeepseekV4Model(nn.Module):
             state = self._ced_boundary_state(state, tail, injection)
             hidden_states = residual_batch.set_written(state, forward_batch)
             layer_start = self.late_layer_start
-        elif ced_graphs and envs.SGLANG_DSV41_CED_TAIL_ENCODER_GRAPH.get():
+        elif (
+            ced_graphs
+            and envs.SGLANG_DSV41_CED_TAIL_ENCODER_GRAPH.get()
+            # The encoder graph fails its exact check (2026-10-20, max_abs 6.6);
+            # replay it only where that check runs and can disable the shape.
+            and envs.SGLANG_DSV41_CED_TAIL_GRAPH_CHECK.get()
+        ):
             from sglang.srt.model_executor.runner.ced_encoder_graph import (
                 run_ced_encoder_graph,
             )
