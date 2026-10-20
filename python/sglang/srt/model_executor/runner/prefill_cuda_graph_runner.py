@@ -2022,6 +2022,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         static_forward_batch.encoder_swa_compress_rows = (
             forward_batch.encoder_swa_compress_rows
         )
+        # The CED boundary break fills the live batch's capture at replay; the
+        # padding rows sit after every real row, so its row indices still hold.
+        static_forward_batch.ced_boundary = forward_batch.ced_boundary
         static_forward_batch = self.model_runner.prepare_dummy_forward_batch(
             static_forward_batch
         )
