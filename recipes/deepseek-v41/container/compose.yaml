@@ -1,0 +1,86 @@
+# DeepSeek-V4.1 on one node: the Engram holder and one PD pair (tp2-pd.sh).
+#   docker compose -f recipes/deepseek-v41/container/compose.yaml \
+#       --env-file recipes/deepseek-v41/container/dsv41.env up -d --wait
+# At boot, dsv41-engram-cache.service and dsv41-pd.service run these two
+# services. See README.md in this directory.
+name: dsv41
+
+services:
+  engram-cache:
+    image: ${DSV41_IMAGE:-dsv41-pd:latest}
+    command: [engram]
+    environment:
+      MODEL: ${DSV41_MODEL:-/data/DeepSeek-V4.1-Flash}
+    volumes:
+      # Same path in both containers; workers read this mount's locked page cache.
+      - ${DSV41_MODEL:-/data/DeepSeek-V4.1-Flash}:${DSV41_MODEL:-/data/DeepSeek-V4.1-Flash}:ro
+      - run:/run/dsv41
+    # launch.py reads the holder's /proc/PID/smaps by host PID.
+    pid: host
+    network_mode: none
+    cap_add: [IPC_LOCK]
+    ulimits:
+      memlock: -1
+    # dsv41-engram-cache.service supervises it; it must outlive every pair.
+    restart: "no"
+    healthcheck:
+      test: [CMD, test, -s, /run/dsv41/engram.ready]
+      interval: 10s
+      # Locking ~189 GiB from a cold page cache takes several minutes.
+      start_period: 30m
+      start_interval: 10s
+
+  pd:
+    image: ${DSV41_IMAGE:-dsv41-pd:latest}
+    command: pd ${DSV41_LAUNCH_ARGS:-} ${DSV41_EXTRA_ARGS:-}
+    depends_on:
+      engram-cache:
+        condition: service_healthy
+    environment:
+      MODEL: ${DSV41_MODEL:-/data/DeepSeek-V4.1-Flash}
+      GPUS: ${GPUS:-4,5,6,7}
+      PORT: ${PORT:-8040}
+      BOOTSTRAP_PORT: ${BOOTSTRAP_PORT:-8999}
+      NCCL_PORT: ${NCCL_PORT:-29600}
+      ROUTER_METRICS_PORT: ${ROUTER_METRICS_PORT:-29001}
+      OUTPUT_ROOT: ${DSV41_DATA:-/data/dsv41-bringup}/recipes
+    volumes:
+      - ${DSV41_MODEL:-/data/DeepSeek-V4.1-Flash}:${DSV41_MODEL:-/data/DeepSeek-V4.1-Flash}:ro
+      - ${DSV41_DATA:-/data/dsv41-bringup}:${DSV41_DATA:-/data/dsv41-bringup}
+      - run:/run/dsv41
+      # SGLang JIT kernels (~/.cache/sglang/jit) and torch extensions; minutes per boot if lost.
+      - ${DSV41_DATA:-/data/dsv41-bringup}/container-cache/root-cache:/root/.cache
+    # Host PIDs: launch.py tells its own GPU processes apart from others by PID.
+    pid: host
+    # Loopback ports, NCCL and Mooncake bootstrap, as on the host.
+    network_mode: host
+    ipc: host
+    # Writes /proc/sys/vm (host-memory compaction before each CC cuInit).
+    privileged: true
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    deploy:
+      resources:
+        reservations:
+          devices:
+            # All GPUs, so launch.py's --gpus indices are the host's.
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # The pair lives and dies together; dsv41-pd.service relaunches it whole.
+    restart: "no"
+    stop_grace_period: 3m
+    healthcheck:
+      # The launcher writes smoke.json after a real routed completion succeeds.
+      test: [CMD-SHELL, 'test -s "$$(cat /tmp/output-dir)/smoke.json" && curl -sf -o /dev/null http://127.0.0.1:$$PORT/readiness']
+      interval: 30s
+      start_period: 60m
+      start_interval: 15s
+
+volumes:
+  # The holder's ready file (its PID); tmpfs, so it never survives the holder's node.
+  run:
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
