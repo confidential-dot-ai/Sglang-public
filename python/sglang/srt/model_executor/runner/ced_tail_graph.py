@@ -49,6 +49,7 @@ class CedLateGraph:
         capture_dspark,
         layer_range=None,
         break_sources=False,
+        pool=None,
     ):
         start, end = layer_range or (model.late_layer_start, model.end_layer)
         self.break_sources = break_sources
@@ -124,7 +125,7 @@ class CedLateGraph:
             capture = (
                 BreakableCUDAGraphCapture(
                     self.graph,
-                    pool=torch.cuda.graph_pool_handle(),
+                    pool=pool if pool is not None else torch.cuda.graph_pool_handle(),
                     stream=stream,
                     capture_error_mode="thread_local",
                 )
@@ -224,35 +225,16 @@ class CedLateGraph:
                 written_kv = [
                     pool.get_swa_raw_buffer(i)[pages] for i in range(*self.layer_range)
                 ]
-                # Check the ordinary eager path, including live metadata and
-                # batch fields. Checking the captured copies can hide stale
-                # request state even when graph and copy-based eager agree.
-                expected = self.forward(inputs, batch)
-                for layer_id, actual in zip(range(*self.layer_range), written_kv):
-                    reference = pool.get_swa_raw_buffer(layer_id)[pages]
-                    if not torch.equal(actual, reference):
-                        logger.error(
-                            "CED late graph KV check FAILED: layer=%d bytes=%d; disabling shape",
-                            layer_id,
-                            (actual != reference).sum().item(),
-                        )
-                        self.invalid = True
-                for index, (actual, reference) in enumerate(
-                    zip(self.outputs, expected)
-                ):
-                    from sglang.srt.model_executor.runner.ced_graph_check import (
-                        bitwise_equal,
+                if getattr(self, "break_sources", False):
+                    expected = self._check_against_eager_noise(
+                        backend, pool, pages, written_kv, inputs, batch
                     )
-
-                    if not bitwise_equal(actual, reference):
-                        delta = (actual.float() - reference.float()).abs().max().item()
-                        logger.error(
-                            "CED late graph exact check FAILED: output=%d rows=%d max_abs=%s; disabling shape",
-                            index,
-                            inputs[1].shape[0],
-                            delta,
-                        )
-                        self.invalid = True
+                else:
+                    # Check the ordinary eager path, including live metadata and
+                    # batch fields. Checking the captured copies can hide stale
+                    # request state even when graph and copy-based eager agree.
+                    expected = self.forward(inputs, batch)
+                    self._check_exact(pool, pages, written_kv, expected, inputs)
                 from sglang.srt.model_executor.runner.ced_graph_check import (
                     agree_check_failure,
                 )
@@ -261,7 +243,7 @@ class CedLateGraph:
                 if self.invalid:
                     return expected
                 logger.info(
-                    "CED late graph exact hidden check passed: rows=%d layers=%s outputs=%d KV=exact",
+                    "CED late graph check passed: rows=%d layers=%s outputs=%d",
                     inputs[1].shape[0],
                     self.layer_range,
                     len(self.outputs),
@@ -272,6 +254,96 @@ class CedLateGraph:
                 backend.forward_metadata = saved
         return self.outputs
 
+
+    def _check_exact(self, pool, pages, written_kv, expected, inputs):
+        from sglang.srt.model_executor.runner.ced_graph_check import bitwise_equal
+
+        for layer_id, actual in zip(range(*self.layer_range), written_kv):
+            reference = pool.get_swa_raw_buffer(layer_id)[pages]
+            if not torch.equal(actual, reference):
+                logger.error(
+                    "CED late graph KV check FAILED: layer=%d bytes=%d; disabling shape",
+                    layer_id,
+                    (actual != reference).sum().item(),
+                )
+                self.invalid = True
+        for index, (actual, reference) in enumerate(zip(self.outputs, expected)):
+            if not bitwise_equal(actual, reference):
+                delta = (actual.float() - reference.float()).abs().max().item()
+                logger.error(
+                    "CED late graph exact check FAILED: output=%d rows=%d max_abs=%s; disabling shape",
+                    index,
+                    inputs[1].shape[0],
+                    delta,
+                )
+                self.invalid = True
+
+    def _check_against_eager_noise(
+        self, backend, pool, pages, written_kv, inputs, batch
+    ):
+        """Index-source layers pick a bf16 top-k whose ties break differently run
+        to run, so eager does not reproduce itself bitwise. Run eager twice from
+        the same layer-20 seed and accept the graph while its distance to the
+        first eager run stays within a margin of the second eager run's."""
+        live = backend.forward_metadata.core_attn_metadata
+        seed = {
+            name: getattr(live, name).clone()
+            for name in _CORE_INPUTS
+            if getattr(live, name) is not None
+        }
+
+        def eager():
+            for name, value in seed.items():
+                getattr(live, name).copy_(value)
+            outputs = self.forward(inputs, batch)
+            kv = [pool.get_swa_raw_buffer(i)[pages] for i in range(*self.layer_range)]
+            return outputs, kv
+
+        first, first_kv = eager()
+        second, second_kv = eager()
+        graph_kv = sum((a != b).sum().item() for a, b in zip(written_kv, first_kv))
+        eager_kv = sum((a != b).sum().item() for a, b in zip(second_kv, first_kv))
+        # Margins from 86 replays under c24 (2026-10-20): graph/eager ratios had
+        # median ~1.0, KV max 1.02x and outputs max 8.4x (a one-sample spread is
+        # heavy-tailed); stale graph state measured 100-1000x.
+        if graph_kv > 1.5 * eager_kv:
+            logger.error(
+                "CED late graph KV noise check FAILED: rows=%d graph-vs-eager bytes=%d "
+                "eager-vs-eager bytes=%d; disabling shape",
+                inputs[1].shape[0],
+                graph_kv,
+                eager_kv,
+            )
+            self.invalid = True
+        ratios = []
+        for index, (graph_out, a, b) in enumerate(zip(self.outputs, first, second)):
+            graph_err = (graph_out.float() - a.float()).abs().mean().item()
+            eager_err = (b.float() - a.float()).abs().mean().item()
+            ratios.append(graph_err / eager_err if eager_err else float(graph_err > 0))
+            if graph_err > 10 * eager_err:
+                logger.error(
+                    "CED late graph noise check FAILED: output=%d rows=%d mean_abs "
+                    "graph-vs-eager=%.4g eager-vs-eager=%.4g; disabling shape",
+                    index,
+                    inputs[1].shape[0],
+                    graph_err,
+                    eager_err,
+                )
+                self.invalid = True
+        if not self.invalid:
+            logger.info(
+                "CED late graph noise check passed: rows=%d KV bytes graph=%d eager=%d",
+                inputs[1].shape[0],
+                graph_kv,
+                eager_kv,
+            )
+        logger.info(
+            "CED late graph noise ratios: rows=%d kv=%.3f outputs=%s",
+            inputs[1].shape[0],
+            graph_kv / eager_kv if eager_kv else float(graph_kv > 0),
+            " ".join("%.3f" % r for r in ratios),
+        )
+        return second
 
 def _late_spans(model):
     """Index-source layers refresh top-k using live variable-length metadata.
@@ -342,6 +414,11 @@ def run_ced_late_graph(model, backend, batch, inputs, capture_dspark):
                     # The eager prefix already ran: finish eagerly.
                     return _finish_eagerly(model, batch, inputs, capture_dspark, aux)
                 return None
+            # Full late graphs replay one at a time on one stream and keep
+            # their outputs allocated, so every shape shares one pool.
+            pool = getattr(model, "_ced_full_late_pool", None)
+            if pool is None:
+                pool = model._ced_full_late_pool = torch.cuda.graph_pool_handle()
             cache[key] = CedLateGraph(
                 model,
                 backend,
@@ -350,6 +427,7 @@ def run_ced_late_graph(model, backend, batch, inputs, capture_dspark):
                 capture_dspark,
                 (graph_start, model.end_layer),
                 break_sources=True,
+                pool=pool,
             )
         if cache[key].invalid:
             if graph_start > model.late_layer_start:
