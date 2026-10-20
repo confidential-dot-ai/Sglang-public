@@ -3965,7 +3965,6 @@ class DeepseekV4Model(nn.Module):
         state = state.materialized(self.layers[end - 1].hc_cfg)
         return state.residual, state.pre
 
-    @staticmethod
     def _ced_boundary_state(
         self,
         state: mhc.HcState,
