@@ -46,3 +46,22 @@ def test_capture_floor_follows_the_free_memory_setting(monkeypatch):
     assert not cache_module.capture_has_room()
     with envs.SGLANG_DSV41_CED_GRAPH_MIN_FREE_GB.override(8.0):
         assert cache_module.capture_has_room()
+
+
+def test_frozen_captures_refuse_without_probing_the_device(monkeypatch):
+    """After the startup pre-capture no tail size may capture while serving (a
+    capture under load faulted a CC B300 GSP), even with ample free memory."""
+    monkeypatch.setattr(cache_module, "_released_load_buffers", True)
+    monkeypatch.setattr(
+        cache_module.torch.cuda, "mem_get_info", lambda: (200 * 1024**3, 280 * 1024**3)
+    )
+    assert cache_module.capture_has_room()
+    # Restored to unfrozen at teardown.
+    monkeypatch.setattr(cache_module, "_frozen", False)
+    cache_module.freeze_captures()
+    monkeypatch.setattr(
+        cache_module.torch.cuda,
+        "mem_get_info",
+        Mock(side_effect=AssertionError("probed the device after the freeze")),
+    )
+    assert not cache_module.capture_has_room()

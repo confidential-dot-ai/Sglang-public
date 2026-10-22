@@ -1777,6 +1777,10 @@ class Envs:
     # A lazy CED graph capture needs this much free HBM on every TP rank; below
     # it the tail stays eager.
     SGLANG_DSV41_CED_GRAPH_MIN_FREE_GB = EnvFloat(20.0)
+    # Decode tail sizes (requests per tail) whose late-layer graphs are captured
+    # at startup. When set, no CED graph is captured once serving starts; other
+    # sizes run eagerly. A capture under load can fault the GSP on CC B300.
+    SGLANG_DSV41_CED_TAIL_GRAPH_PRECAPTURE_REQS = EnvTuple(())
     # 1 preserves immediate dispatch. Larger values coalesce ready CED tails into
     # one replay, waiting at most MAX_WAIT_MS for the batch to fill.
     SGLANG_DSV41_CED_TAIL_BATCH_SIZE = EnvInt(1)
