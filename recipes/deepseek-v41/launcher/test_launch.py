@@ -837,6 +837,38 @@ class TestLaunch(unittest.TestCase):
             with self.assertRaises(ValueError):
                 launch.build_plan(self.args(*bad))
 
+    def test_graph_bs_replace_default_tiers(self):
+        plan = launch.build_plan(
+            self.args(
+                "--cpu-engram-staging",
+                "--split-cuda-graphs",
+                "--chunk-size",
+                "12288",
+                "--prefill-graph-bs",
+                "1024,4096,65536",
+                "--decode-requests",
+                "64",
+                "--decode-graph-bs",
+                "1,4,16,128",
+            )
+        )
+        prefill, decode = plan["workers"]
+
+        def graphs(worker):
+            command = worker["command"]
+            return json.loads(command[command.index("--cuda-graph-config") + 1])
+
+        self.assertEqual(graphs(prefill)["prefill"]["bs"], [1024, 4096, 12288])
+        self.assertEqual(graphs(decode)["decode"]["bs"], [1, 4, 16, 64])
+        for bad in (
+            ("--split-cuda-graphs", "--decode-graph-bs", "0"),
+            ("--split-cuda-graphs", "--prefill-graph-bs", ","),
+            ("--decode-graph-bs", "4"),  # needs split graphs
+            ("--prefill-graph-bs", "4096"),  # needs split graphs
+        ):
+            with self.assertRaises(ValueError):
+                launch.build_plan(self.args(*bad))
+
     def test_tokenizer_workers_apply_to_both_roles(self):
         flag = "--tokenizer-worker-num"
         for worker in launch.build_plan(self.args())["workers"]:
