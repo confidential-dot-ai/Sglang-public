@@ -58,6 +58,7 @@ class TpDriftDetector:
     def __init__(
         self,
         group_key: str,
+        worker_id: int,
         tp_rank: int,
         tp_size: int,
         on_drift: Optional[Callable[[], None]] = None,
@@ -70,7 +71,9 @@ class TpDriftDetector:
         self.exit_after = envs.SGLANG_TP_DRIFT_EXIT_AFTER.get()
         self.enabled = self.interval > 0 and tp_size > 1
 
-        digest = hashlib.sha1(group_key.encode()).hexdigest()[:16]
+        # The group key ("tp:0") repeats in every worker, and workers launched
+        # together share /tmp; without the worker id they read each other's counters.
+        digest = hashlib.sha1(f"{group_key}@{worker_id}".encode()).hexdigest()[:16]
         self._dir = Path(tempfile.gettempdir()) / f"sglang-tp-drift-{digest}"
         if self.enabled:
             self._dir.mkdir(parents=True, exist_ok=True)

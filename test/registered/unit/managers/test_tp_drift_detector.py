@@ -126,6 +126,28 @@ def test_a_peer_one_check_behind_is_not_drift(tmp_path):
     assert tp1._gather(679) == [678, 679], "same-check disagreement is still seen"
 
 
+def test_workers_sharing_tmp_do_not_read_each_others_counters(tmp_path):
+    """Two TP2 workers in one container share /tmp and the same group name. Each
+    rank compared itself with the other worker's counters and a healthy decode
+    worker took itself down mid-load."""
+    with patch("tempfile.gettempdir", return_value=str(tmp_path)):
+        decode0, decode1 = (
+            [
+                TpDriftDetector(
+                    group_key="tp:0", worker_id=port, tp_rank=rank, tp_size=2
+                )
+                for rank in (0, 1)
+            ]
+            for port in (29602, 29603)
+        )
+    for detector in decode0 + decode1:
+        detector._calls = 1
+    decode0[0]._gather(1855)
+    decode1[0]._gather(125)
+    decode1[1]._gather(125)
+    assert decode0[1]._gather(1855) == [1855, 1855]
+
+
 def test_disabled_detector_never_gathers():
     detector, calls = make_detector([[100, 100, 100, 101]], exit_after=1)
     detector.enabled = False
