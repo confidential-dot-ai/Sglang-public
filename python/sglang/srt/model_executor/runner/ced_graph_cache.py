@@ -10,6 +10,14 @@ from sglang.srt.environ import envs
 logger = logging.getLogger(__name__)
 _released_load_buffers = False
 _logged_no_room = False
+_frozen = False
+_logged_frozen = False
+
+
+def freeze_captures():
+    """Refuse every later CED capture; set identically on all TP ranks."""
+    global _frozen
+    _frozen = True
 
 
 def release_retired(model):
@@ -25,6 +33,15 @@ def release_retired(model):
 def capture_has_room():
     from sglang.srt.model_executor.runner.ced_graph_check import agree_check_failure
 
+    global _logged_frozen, _logged_no_room
+    if _frozen:
+        if not _logged_frozen:
+            logger.info(
+                "CED graph capture refused while serving: a tail size not "
+                "captured at startup runs eagerly"
+            )
+            _logged_frozen = True
+        return False
     # Release loader scratch before the first CED capture. Once graph pools
     # exist, keep their allocator storage untouched throughout serving.
     global _released_load_buffers
@@ -41,7 +58,6 @@ def capture_has_room():
         torch.cuda.empty_cache()
         free, _ = torch.cuda.mem_get_info()
     if agree_check_failure(free < min_free):
-        global _logged_no_room
         if not _logged_no_room:
             logger.warning(
                 "CED graph capture skipped: %.1f GiB free on this rank, a rank is "

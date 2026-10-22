@@ -10,6 +10,7 @@ storage, refreshed before replay; no allocator/KV ownership changes happen here.
 
 import copy
 import logging
+import time
 from contextlib import contextmanager
 
 import msgspec
@@ -25,6 +26,10 @@ from sglang.srt.runtime_context import get_flags
 
 logger = logging.getLogger(__name__)
 _LOADED_REVISION = envs.SGLANG_DSV41_CED_TAIL_GRAPH_REVISION.get()
+# Synthetic tails sit this deep in the prompt so every compressed level's top-k
+# window is full, as in long-prompt serving: the captured FlashMLA schedule
+# follows those lengths. Arbitrary beyond that.
+_PRECAPTURE_PREFIX_TOKENS = 8192
 
 # These are the paged-attention inputs consumed by source-free late layers.
 _CORE_INPUTS = (
@@ -500,3 +505,102 @@ def _finish_eagerly(model, batch, inputs, capture_dspark, aux):
         aux,
     )
     return hidden, prev, *aux
+
+
+def precapture_ced_late_graphs(*, model_runner, eager_runner) -> None:
+    """Capture the late-layer graphs for the configured decode tail sizes at
+    startup, then refuse every capture while serving."""
+    from sglang.srt.disaggregation.ced_boundary import (
+        CedBoundaryInjection,
+        ced_boundary_enabled,
+    )
+    from sglang.srt.disaggregation.utils import ced_tail_start
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.runner.ced_graph_cache import freeze_captures
+    from sglang.srt.runtime_context import get_disagg
+
+    sizes = sorted(
+        {int(n) for n in envs.SGLANG_DSV41_CED_TAIL_GRAPH_PRECAPTURE_REQS.get()}
+    )
+    if (
+        not sizes
+        or not envs.SGLANG_DSV41_CED_TAIL_LATE_GRAPH.get()
+        or get_disagg().disaggregation_mode != "decode"
+        or not ced_boundary_enabled()
+    ):
+        return
+    config = model_runner.model_config.hf_text_config
+    window = model_runner.sliding_window_size
+    seq_len = _PRECAPTURE_PREFIX_TOKENS + window
+    prefix_len = ced_tail_start(seq_len, window, model_runner.page_size)
+    extend_len = seq_len - prefix_len
+    buffers = eager_runner._alloc_dummy_decode_buffers(
+        max(sizes), num_tokens_per_req=extend_len, allocate_logits_buffer=False
+    )
+    device = model_runner.device
+    start = time.perf_counter()
+    for num_reqs in sizes:
+        # Boundary state as prefill hands it over: the tail goes straight to the
+        # late layers. Values only feed the capture; writes land in slot 0.
+        rows = num_reqs * window
+
+        def attach_boundary(forward_batch, rows=rows):
+            forward_batch.ced_boundary = CedBoundaryInjection(
+                residual=0.02
+                * torch.randn(
+                    (rows, config.hc_mult, config.hidden_size),
+                    dtype=torch.bfloat16,
+                    device=device,
+                ),
+                pre=torch.full(
+                    (rows, config.hc_mult),
+                    1.0 / config.hc_mult,
+                    dtype=torch.float32,
+                    device=device,
+                ),
+            )
+
+        try:
+            eager_runner._dummy_run(
+                num_reqs,
+                forward_mode_override=ForwardMode.EXTEND,
+                buffers=buffers,
+                extend_num_tokens_per_req=extend_len,
+                extend_prefix_len=prefix_len,
+                prepare_forward_batch=attach_boundary,
+            )
+        except Exception:
+            # Deterministic on every TP rank. Serving stays correct without the
+            # remaining graphs: those tails run eagerly.
+            logger.exception("CED pre-capture failed at %d requests", num_reqs)
+            break
+    torch.cuda.synchronize()
+    freeze_captures()
+    model = model_runner.model.model
+    span_graphs = getattr(model, "_ced_late_graphs", None) or {}
+    num_spans = sum(capturable for _, _, capturable in _late_spans(model))
+    for key in [k for k, graphs in span_graphs.items() if len(graphs) < num_spans]:
+        # Span graphs are built lazily on replay: a size that failed part-way
+        # would capture its missing spans while serving.
+        del span_graphs[key]
+    captured = sorted(
+        key[0][1][0][0]
+        for cache in (
+            getattr(model, "_ced_late_graphs", None) or {},
+            getattr(model, "_ced_full_late_graphs", None) or {},
+        )
+        for key in cache
+    )
+    logger.info(
+        "Pre-captured CED late-layer graphs for tail rows %s in %.1fs; "
+        "no CED capture after startup",
+        captured,
+        time.perf_counter() - start,
+    )
+    if len(captured) < len(sizes):
+        logger.warning(
+            "CED pre-capture covered %d of %d tail sizes %s; the rest run eagerly",
+            len(captured),
+            len(sizes),
+            sizes,
+        )
