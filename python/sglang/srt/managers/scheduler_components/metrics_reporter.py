@@ -910,6 +910,7 @@ class SchedulerMetricsReporter:
             group = get_parallel().tp_group
             self._tp_drift_detector = TpDriftDetector(
                 group_key=group.unique_name,
+                worker_id=self.scheduler.nccl_port,
                 tp_rank=group.rank_in_group,
                 tp_size=group.world_size,
             )
