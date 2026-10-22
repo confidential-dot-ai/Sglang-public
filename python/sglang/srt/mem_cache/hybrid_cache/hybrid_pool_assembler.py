@@ -655,7 +655,9 @@ def _deepseek_v4_num_host_pages(
         # --hicache-size budget (GB per rank, as for the other pools) becomes that
         # ratio. A ratio below 1 keeps a host tier smaller than the device pool.
         device_bytes = _dsv4_device_kv_bytes(kvcache)
-        ratio = memory.hicache_size * 1e9 / device_bytes
+        ratio = _min_across_pp(
+            memory.hicache_size * 1e9 / device_bytes, params=params
+        )
         logger.info(
             "DeepSeek V4 HiCache: --hicache-size %s GB over %.2f GB of device KV "
             "is a host ratio of %.4f",
@@ -676,6 +678,21 @@ def _deepseek_v4_num_host_pages(
     if c128_attn_allocator is not None:
         c128_host_pages = int(c128_attn_allocator.num_pages * ratio)
     return full_host_pages, swa_host_pages, c128_host_pages
+
+
+def _min_across_pp(ratio: float, *, params: CacheInitParams) -> float:
+    """PP1+ mirror PP0's tree and pop PP0's ack counts, so every stage needs the
+    same host page count; stages hold different layer counts, so a byte budget
+    alone gives each a different ratio. MIN keeps every stage within budget."""
+    if params.pp_size <= 1 or params.pp_cache_group is None:
+        return ratio
+    import torch
+
+    t = torch.tensor([ratio], dtype=torch.float64)
+    torch.distributed.all_reduce(
+        t, op=torch.distributed.ReduceOp.MIN, group=params.pp_cache_group
+    )
+    return float(t.item())
 
 
 
