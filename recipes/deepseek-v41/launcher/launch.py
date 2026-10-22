@@ -119,6 +119,22 @@ def parser():
         "batches do not pad up to the next power",
     )
     p.add_argument(
+        "--decode-graph-bs",
+        type=lambda text: [int(x) for x in text.split(",") if x],
+        default=None,
+        metavar="BS[,BS...]",
+        help="Decode graph batch sizes replacing the powers of two; "
+        "--decode-requests is always added. Fewer sizes mean fewer startup captures",
+    )
+    p.add_argument(
+        "--prefill-graph-bs",
+        type=lambda text: [int(x) for x in text.split(",") if x],
+        default=None,
+        metavar="TOKENS[,TOKENS...]",
+        help="Prefill graph token sizes replacing the powers of two from 256; "
+        "--chunk-size is always added. Fewer sizes mean fewer startup captures",
+    )
+    p.add_argument(
         "--decode-polling-interval",
         type=int,
         default=1,
@@ -517,6 +533,16 @@ def validate(args):
         raise ValueError("--decode-graph-extra-bs sizes must be positive")
     if args.decode_graph_extra_bs and not args.split_cuda_graphs:
         raise ValueError("--decode-graph-extra-bs requires --split-cuda-graphs")
+    for flag, sizes in (
+        ("--decode-graph-bs", args.decode_graph_bs),
+        ("--prefill-graph-bs", args.prefill_graph_bs),
+    ):
+        if sizes is None:
+            continue
+        if not sizes or any(bs < 1 for bs in sizes):
+            raise ValueError(f"{flag} sizes must be positive")
+        if not args.split_cuda_graphs:
+            raise ValueError(f"{flag} requires --split-cuda-graphs")
     if args.prefill_graph_max_seq_len is not None:
         if args.prefill_graph_max_seq_len <= 0:
             raise ValueError("prefill_graph_max_seq_len must be positive")
@@ -875,14 +901,24 @@ def build_plan(args):
         if args.split_cuda_graphs:
             # Powers of two up to the chunk, plus the chunk itself so a full chunk
             # never pads to the next bucket.
+            prefill_base = (
+                {1 << p for p in range(8, 15)}
+                if args.prefill_graph_bs is None
+                else set(args.prefill_graph_bs)
+            )
             prefill_buckets = sorted(
-                {1 << p for p in range(8, 15) if 1 << p <= args.chunk_size}
+                {bs for bs in prefill_base if bs <= args.chunk_size}
                 | ({args.chunk_size} if args.chunk_size >= 256 else set())
             )
             if not prefill_buckets:
                 raise ValueError("Split prefill graphs require chunk-size >= 256")
-            decode_buckets = sorted(
+            decode_base = (
                 {1 << power for power in range(requests.bit_length())}
+                if args.decode_graph_bs is None
+                else set(args.decode_graph_bs)
+            )
+            decode_buckets = sorted(
+                {bs for bs in decode_base if bs <= requests}
                 | {bs for bs in args.decode_graph_extra_bs if bs <= requests}
                 | {requests}
             )
