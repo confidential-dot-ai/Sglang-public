@@ -1215,6 +1215,9 @@ class DeepseekV4AttnBackend(
     needs_cpu_seq_lens: bool = False
     trtllm_attn: bool = False
     mega_attn: bool = False
+    # The prefill metadata kernels index per sequence; a 12288-seq x 1-token
+    # extend dummy exceeds Triton's tensor numel limit, so pack the dummy.
+    extend_dummy_seqs_capped_by_req_pool: bool = True
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         # Breakable-graph verify rereads shared state across segments.
