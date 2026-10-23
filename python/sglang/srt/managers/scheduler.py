@@ -3161,7 +3161,11 @@ class Scheduler(
 
         if self.spec_algorithm.is_dflash_family():
             error_msg = validate_dflash_request(
-                req, self.enable_overlap, self.server_args.grammar_backend
+                req,
+                self.enable_overlap,
+                self.server_args.grammar_backend,
+                # DSpark masks the target verify logits with the request's grammar.
+                masks_grammar_in_verify=self.spec_algorithm.is_dspark(),
             )
             if error_msg is not None:
                 req.set_finish_with_abort(error_msg)
