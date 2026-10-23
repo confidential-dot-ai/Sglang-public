@@ -1218,7 +1218,10 @@ def build_speculative_verify_target_probs(
 
 
 def validate_dflash_request(
-    req: Req, enable_overlap: bool, grammar_backend: Optional[str] = None
+    req: Req,
+    enable_overlap: bool,
+    grammar_backend: Optional[str] = None,
+    masks_grammar_in_verify: bool = False,
 ) -> Optional[str]:
     if req.return_logprob:
         return "DFLASH speculative decoding does not support return_logprob yet."
@@ -1232,9 +1235,9 @@ def validate_dflash_request(
         or req.sampling_params.ebnf is not None
         or req.sampling_params.structural_tag is not None
     )
-    if has_grammar_params:
-        # The verify step has no grammar masking, so a host grammar would be
-        # silently ignored; reject the request instead.
+    if has_grammar_params and not masks_grammar_in_verify:
+        # DFlash's verify step has no grammar masking, so a host grammar would
+        # be silently ignored; reject the request instead.
         return (
             "DFLASH speculative decoding does not support grammar-constrained "
             "decoding."
