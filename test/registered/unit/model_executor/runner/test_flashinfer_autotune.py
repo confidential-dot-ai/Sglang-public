@@ -68,3 +68,56 @@ def test_pd_roles_have_separate_autotune_records(tmp_path):
         assert decode != prefill
         decode.write_text("decode tactics")
         assert prefill.read_text() == "prefill tactics"
+
+
+def _extend_runner():
+    model = SimpleNamespace(
+        wants_prefill_autotune=lambda: True,
+        autotune_prefill_kernels=lambda num_tokens, dtype: 7,
+    )
+    mr = SimpleNamespace(
+        model=model,
+        dtype="bfloat16",
+        is_generation=True,
+        is_draft_worker=False,
+        spec_algorithm=SimpleNamespace(is_speculative=lambda: False),
+        attn_backend=SimpleNamespace(extend_dummy_seqs_capped_by_req_pool=False),
+        canary_manager=None,
+    )
+    return SimpleNamespace(
+        model_runner=mr,
+        _alloc_dummy_decode_buffers=lambda *a, **k: object(),
+        _dummy_run=lambda **k: None,
+    )
+
+
+def test_model_prefill_hook_does_not_skip_the_opted_in_extend_pass():
+    """DSV4.1's prefill hook tunes only its dense linears; returning early on it
+    left the fused MoE on tactics tuned for <= 16 tokens at 1K-12K-token prefill."""
+    from contextlib import nullcontext
+
+    from sglang.srt.environ import envs
+
+    for opted_in, expect_extend in ((False, False), (True, True)):
+        forwards = []
+        with (
+            envs.SGLANG_FLASHINFER_AUTOTUNE_EXTEND.override(opted_in),
+            patch.object(flashinfer_autotune, "max_prefill_buffer_tokens", return_value=12288),
+            patch.object(
+                flashinfer_autotune, "flashinfer_autotune_context", lambda *a, **k: nullcontext()
+            ),
+            patch.object(
+                flashinfer_autotune,
+                "run_flashinfer_autotune_forward",
+                lambda mr, fn, **k: forwards.append(fn),
+            ),
+            patch.object(
+                flashinfer_autotune,
+                "get_disagg",
+                return_value=SimpleNamespace(disaggregation_mode="prefill"),
+            ),
+        ):
+            flashinfer_autotune.maybe_flashinfer_autotune_extend(
+                _extend_runner(), decode_num_tokens=16
+            )
+        assert bool(forwards) == expect_extend, opted_in
