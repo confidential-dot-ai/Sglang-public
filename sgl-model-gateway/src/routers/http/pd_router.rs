@@ -783,7 +783,7 @@ impl PDRouter {
 
         // Otherwise poll both until prefill resolves; decode normally resolves
         // later, but may resolve first if it rejects the request outright.
-        while prefill_result.is_none() {
+        while prefill_result.is_none() && !decode_early.as_ref().is_some_and(Self::is_failed_send) {
             tokio::select! {
                 biased;
                 pr = &mut prefill_fut => {
@@ -795,7 +795,16 @@ impl PDRouter {
             }
         }
         let Some(prefill_result) = prefill_result else {
-            unreachable!("the loop above exits only once prefill has resolved");
+            // Prefill would wait for a decode handshake that never comes until
+            // its 300s bootstrap timeout; dropping its future closes the
+            // connection, so the prefill engine aborts the request.
+            drop(prefill_fut);
+            let Some(decode_result) = decode_early else {
+                unreachable!("the loop above exits only once prefill or decode resolved");
+            };
+            return self
+                .respond_to_failed_decode(decode_result, None, &context, prefill, decode)
+                .await;
         };
 
         // Decode can't generate without prefill's KV, so any prefill failure
@@ -847,54 +856,24 @@ impl PDRouter {
 
         events::RequestReceivedEvent {}.emit();
 
+        if Self::is_failed_send(&decode_result) {
+            return self
+                .respond_to_failed_decode(
+                    decode_result,
+                    Some(&prefill_result),
+                    &context,
+                    prefill,
+                    decode,
+                )
+                .await;
+        }
+
         // Process decode response
         match decode_result {
             Ok(res) => {
                 let status = StatusCode::from_u16(res.status().as_u16())
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                 debug!("Decode response status: {}", status);
-
-                if !status.is_success() {
-                    error!(
-                        "Decode server returned error status decode_url={} status={}",
-                        decode.url(),
-                        status
-                    );
-
-                    // Per-worker breaker attribution before the synthetic 5xx
-                    // response takes over. Prefill ran concurrently in the
-                    // `tokio::join!`: tick it based on its actual response
-                    // status, not on the decode-driven failure. For
-                    // non-streaming the response carries no tracked stream
-                    // so record decode's outcome here too — but treat 4xx
-                    // as a client fault rather than a worker fault, matching
-                    // the legacy outer-dispatcher rule and the streaming
-                    // `BreakerTrackedStream` pre-mark in
-                    // `create_streaming_response`. For streaming
-                    // `handle_decode_error_response` wraps the synthetic
-                    // error SSE in a `BreakerTrackedStream` that ticks
-                    // decode on drop, so skip to avoid double-counting.
-                    // Mark the response so the outer dispatcher skips its
-                    // status-derived `record_outcome`.
-                    let prefill_ok = match &prefill_result {
-                        Ok(r) => {
-                            let s = r.status();
-                            s.is_success() || s.is_client_error()
-                        }
-                        Err(_) => false,
-                    };
-                    prefill.record_outcome(prefill_ok);
-                    if !context.is_stream {
-                        let decode_ok = status.is_success() || status.is_client_error();
-                        decode.record_outcome(decode_ok);
-                    }
-
-                    let mut response = self
-                        .handle_decode_error_response(res, &context, prefill, decode)
-                        .await;
-                    response.extensions_mut().insert(BreakerOutcomesRecorded);
-                    return response;
-                }
 
                 // Process prefill response
                 let prefill_body = if context.return_logprob {
@@ -978,41 +957,62 @@ impl PDRouter {
                     }
                 }
             }
+            Err(_) => unreachable!("transport failures returned above"),
+        }
+    }
+
+    fn is_failed_send(result: &Result<reqwest::Response, reqwest::Error>) -> bool {
+        !matches!(result, Ok(res) if res.status().is_success())
+    }
+
+    /// Shapes decode's non-2xx or transport failure into the client response
+    /// and records both workers' breaker outcomes. `prefill_result` is `None`
+    /// when decode failed first and prefill was cancelled; prefill is then not
+    /// ticked, since the cancellation is not its fault.
+    async fn respond_to_failed_decode(
+        &self,
+        decode_result: Result<reqwest::Response, reqwest::Error>,
+        prefill_result: Option<&Result<reqwest::Response, reqwest::Error>>,
+        context: &PDRequestContext<'_>,
+        prefill: Arc<dyn Worker>,
+        decode: Arc<dyn Worker>,
+    ) -> Response {
+        // A 4xx is a client fault, not a worker fault, for either worker.
+        if let Some(prefill_result) = prefill_result {
+            prefill.record_outcome(match prefill_result {
+                Ok(res) => res.status().is_success() || res.status().is_client_error(),
+                Err(_) => false,
+            });
+        }
+        let mut response = match decode_result {
+            Ok(res) => {
+                let status = res.status();
+                error!(
+                    "Decode server returned error status decode_url={} status={}",
+                    decode.url(),
+                    status
+                );
+                // Streaming errors are ticked on drop by the `BreakerTrackedStream`
+                // that `handle_decode_error_response` wraps them in.
+                if !context.is_stream {
+                    decode.record_outcome(status.is_client_error());
+                }
+                self.handle_decode_error_response(res, context, prefill, decode)
+                    .await
+            }
             Err(e) => {
                 error!(
                     decode_url = %decode.url(),
                     error = %e,
                     "Decode request failed"
                 );
-                // Decode failed at TCP/transport level. No tracked
-                // stream will ever wrap a response (streaming path) and
-                // we shortcut past the outer non-streaming
-                // `record_outcome` too — so record decode failure
-                // directly. Prefill ran concurrently in the
-                // `tokio::join!`: record its real per-worker outcome
-                // (success on a 2xx/4xx send, failure on transport
-                // error) so the decode-driven 502 doesn't penalise a
-                // healthy prefill. Mark the response so the outer
-                // dispatcher skips its status-derived `record_outcome`
-                // and we don't double-count.
                 decode.record_outcome(false);
-                let prefill_ok = match &prefill_result {
-                    Ok(res) => {
-                        let s = res.status();
-                        s.is_success() || s.is_client_error()
-                    }
-                    Err(_) => false,
-                };
-                prefill.record_outcome(prefill_ok);
-
-                let mut response = error::bad_gateway(
-                    "decode_server_error",
-                    format!("Decode server error: {}", e),
-                );
-                response.extensions_mut().insert(BreakerOutcomesRecorded);
-                response
+                error::bad_gateway("decode_server_error", format!("Decode server error: {}", e))
             }
-        }
+        };
+        // The outer dispatcher must not record a status-derived outcome again.
+        response.extensions_mut().insert(BreakerOutcomesRecorded);
+        response
     }
 
     fn policies_need_request_text(&self) -> bool {
