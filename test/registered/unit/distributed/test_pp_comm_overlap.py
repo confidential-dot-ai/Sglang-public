@@ -2,11 +2,15 @@ import unittest
 from collections import defaultdict, deque
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import Mock, call
+from unittest.mock import Mock, call, patch
 
 import torch
 
-from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
+from sglang.srt.managers.scheduler_pp_mixin import (
+    SchedulerPPMixin,
+    _pp_can_skip_output_comm,
+)
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -116,6 +120,61 @@ class TestPPCommOverlap(CustomTestCase):
             [call(schedule), call(forward), call(copy)],
         )
         sent.record_stream.assert_called_once_with(comm)
+
+    def test_ced_prefill_skips_the_output_relay_only_when_no_output_is_read(self):
+        def batch(**req_flags):
+            req = SimpleNamespace(
+                return_sampling_mask=False, return_routed_experts=False
+            )
+            req.__dict__.update(req_flags)
+            return SimpleNamespace(
+                forward_mode=ForwardMode.EXTEND,
+                return_logprob=False,
+                contains_last_prefill_chunk=True,
+                reqs=[req, SimpleNamespace(**vars(req))],
+            )
+
+        logprob_batch = batch()
+        logprob_batch.return_logprob = True
+        cases = [
+            ("ced prefill last chunks", True, "prefill", batch(), True),
+            ("logprob", True, "prefill", logprob_batch, False),
+            ("sampling mask", True, "prefill", batch(return_sampling_mask=True), False),
+            ("routed experts", True, "prefill", batch(return_routed_experts=True), False),
+            ("not ced", False, "prefill", batch(), False),
+            ("decode", True, "decode", batch(), False),
+        ]
+        for name, ced, mode, b, expected in cases:
+            with self.subTest(name):
+                with (
+                    patch(
+                        "sglang.srt.disaggregation.utils.ced_split_enabled",
+                        return_value=ced,
+                    ),
+                    patch(
+                        "sglang.srt.managers.scheduler_pp_mixin.get_disagg",
+                        return_value=SimpleNamespace(disaggregation_mode=mode),
+                    ),
+                ):
+                    self.assertIs(_pp_can_skip_output_comm(b), expected)
+
+    def test_skipped_output_result_waits_for_the_forward_and_keeps_the_boundary(self):
+        """With the relay skipped, a last chunk's result (its KV send and boundary
+        rows) must not be processed before the chunk's forward has run."""
+        forward_stream = FakeStream(7)
+        boundary = object()
+        scheduler = _make_scheduler(
+            device="cpu",
+            forward_stream=forward_stream,
+            device_module=SimpleNamespace(Event=FakeEvent),
+        )
+        batch = SimpleNamespace(reqs=[object(), object()])
+        metadata = SimpleNamespace(can_run_cuda_graph=False, ced_boundary=boundary)
+
+        _, result, d2h_event = scheduler._pp_make_skip_output_result(batch, metadata)
+
+        self.assertIs(d2h_event.recorded_stream, forward_stream)
+        self.assertIs(result.ced_boundary, boundary)
 
     def test_inbox_returns_original_receive_event(self):
         recv_event = object()
