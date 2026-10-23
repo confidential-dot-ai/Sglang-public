@@ -434,7 +434,9 @@ def maybe_flashinfer_autotune_extend(
     if prefill_autotune is not None and mr.is_generation and not mr.is_draft_worker:
         with flashinfer_autotune_context(mr, run_lm_head=False):
             tuned = prefill_autotune(num_tokens, dtype=mr.dtype)
-        if tuned:
+        # The model hook tunes only what it calls directly (DSV4.1: its dense
+        # MXFP8 linears); the opt-in extend pass still covers the fused MoE.
+        if tuned and not envs.SGLANG_FLASHINFER_AUTOTUNE_EXTEND.get():
             return
 
     if not envs.SGLANG_FLASHINFER_AUTOTUNE_EXTEND.get():
@@ -502,6 +504,14 @@ def maybe_flashinfer_autotune_extend(
             logger,
             "FlashInfer extend autotune skipped: not enough free memory "
             f"for a {num_tokens}-token dummy forward.",
+        )
+    except Exception:
+        if _autotune_tactic_sync_group(get_parallel().tp_group) is not None:
+            raise
+        # Same fallback for a dummy shape this model cannot run (e.g. a
+        # pipeline stage); a sticky CUDA error still surfaces at the next call.
+        logger.exception(
+            "FlashInfer extend autotune failed; extend buckets stay untuned"
         )
     finally:
         # release dummy buffers before capture measures free memory
