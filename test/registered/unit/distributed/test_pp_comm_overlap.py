@@ -83,6 +83,40 @@ class TestPPCommOverlap(CustomTestCase):
         self.assertIsNone(scheduler.pp_send_done_event)
         self.assertIsNone(scheduler.pp_proxy_recv_event)
 
+    def test_overlapped_tensors_stay_owned_by_the_streams_that_use_them(self):
+        """With comm overlap, a received proxy must not be reallocated to the next
+        recv while the forward still reads it, nor a sent one to the next forward
+        while NCCL still reads it (silently wrong prefill activations)."""
+        comm, schedule, forward, copy = (FakeStream(i) for i in range(4))
+        received = Mock(spec=torch.Tensor, is_cuda=True)
+        sent = Mock(spec=torch.Tensor, is_cuda=True)
+        pp_group = Mock()
+        pp_group.recv_tensor_dict.return_value = {
+            "__msg_type__": "proxy",
+            "hidden_states": received,
+        }
+        pp_group.send_tensor_dict.return_value = []
+        scheduler = _make_scheduler(
+            pp_comm_stream=comm,
+            pp_comm_stream_ctx=nullcontext(),
+            schedule_stream=schedule,
+            forward_stream=forward,
+            copy_stream=copy,
+            device_module=SimpleNamespace(Event=FakeEvent),
+            pp_group=pp_group,
+            attn_tp_group=None,
+            _pp_tensor_dict_inbox=defaultdict(deque),
+        )
+
+        scheduler._pp_recv_typed_dict("proxy")
+        scheduler._pp_send_dict_to_next_stage({"hidden_states": sent}, msg_type="proxy")
+
+        self.assertEqual(
+            received.record_stream.call_args_list,
+            [call(schedule), call(forward), call(copy)],
+        )
+        sent.record_stream.assert_called_once_with(comm)
+
     def test_inbox_returns_original_receive_event(self):
         recv_event = object()
         tensor_dict = {"__msg_type__": "output", "value": torch.arange(2)}

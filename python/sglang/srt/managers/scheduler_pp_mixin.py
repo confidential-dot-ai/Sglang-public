@@ -689,6 +689,21 @@ class SchedulerPPMixin:
         event.record(self.pp_comm_stream)
         return event
 
+    def _pp_record_cross_stream_use(
+        self: Scheduler, tensor_dict: Dict[str, torch.Tensor], streams: tuple
+    ) -> None:
+        # The caching allocator reuses a freed block on its allocating stream at
+        # once, and NCCL work.wait() (TORCH_NCCL_AVOID_RECORD_STREAMS) orders only
+        # the comm stream; without this a sent proxy is overwritten by the next
+        # forward, and a received one by the next recv, while still in use.
+        if self.pp_comm_stream is None:
+            return
+        for tensor in tensor_dict.values():
+            if isinstance(tensor, torch.Tensor) and tensor.is_cuda:
+                for stream in streams:
+                    if stream is not None:
+                        tensor.record_stream(stream)
+
     def _pp_commit_comm_work(
         self: Scheduler,
         work: List[P2PWork],
@@ -873,6 +888,7 @@ class SchedulerPPMixin:
                     async_send=async_send,
                 )
             )
+        self._pp_record_cross_stream_use(tensor_dict, (self.pp_comm_stream,))
         return p2p_work
 
     def _pp_send_proxy_to_next_stage(
@@ -909,6 +925,10 @@ class SchedulerPPMixin:
                     all_gather_group=all_gather_group
                 )
                 recv_event = self._pp_record_comm_event()
+            self._pp_record_cross_stream_use(
+                tensor_dict,
+                (self.schedule_stream, self.forward_stream, self.copy_stream),
+            )
             received_kind = tensor_dict.get("__msg_type__", "default")
             if received_kind == expected_kind:
                 if received_kind == "default":
