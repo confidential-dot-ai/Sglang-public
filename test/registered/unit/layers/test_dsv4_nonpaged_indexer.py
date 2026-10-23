@@ -1134,3 +1134,59 @@ class TestCandidateIndexerGating(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPrefillLayoutCache(CustomTestCase):
+    """The index-source layers of one forward share their index-K layout, but a
+    layout must never be reused for a different compress ratio: the k_slots and
+    compressed lengths of one ratio are wrong slots for the other."""
+
+    def _inputs(self, ratio, cache):
+        from sglang.srt.layers.attention.dsv4.v41_indexer.types import PrefillInputs
+
+        seq_len, rows = 40, 8
+        return PrefillInputs(
+            indexer=None,
+            layer_id=0,
+            compress_ratio=ratio,
+            freqs_cis=None,
+            x=None,
+            q_lora=None,
+            positions=self.positions,
+            req_rows=None,
+            req_pool_indices=torch.tensor([1]),
+            kv_page_table=None,
+            seq_lens_cpu=[seq_len],
+            rows_per_request=[rows],
+            rows_per_request_device=torch.tensor([rows]),
+            out_raw_indices=torch.empty(0),
+            out_page_indices=None,
+            layout_cache=cache,
+        )
+
+    def test_layout_is_shared_within_a_ratio_and_never_across(self):
+        from sglang.srt.layers.attention.dsv4.v41_indexer import scoring
+
+        self.positions = torch.arange(32, 40)
+        req_to_token = torch.arange(2 * 64).view(2, 64) * 7
+        built = []
+        real = scoring._prefill_layout
+
+        def counting(inputs, table):
+            built.append(inputs.compress_ratio)
+            return real(inputs, table)
+
+        cache = {}
+        with patch.object(scoring, "_prefill_layout", counting), patch.object(
+            scoring, "_prefill_index_q_and_weights", lambda inputs: (None, None, None)
+        ), patch.object(scoring, "async_h2d", lambda v, dtype, device: torch.tensor(v, dtype=dtype)):
+            first = scoring.get_deep_gemm_prefill_data(self._inputs(1, cache), req_to_token)
+            again = scoring.get_deep_gemm_prefill_data(self._inputs(1, cache), req_to_token)
+            other = scoring.get_deep_gemm_prefill_data(self._inputs(2, cache), req_to_token)
+            uncached = scoring.get_deep_gemm_prefill_data(self._inputs(2, None), req_to_token)
+
+        self.assertEqual(built, [1, 2, 2])
+        self.assertIs(again.k_slots, first.k_slots)
+        self.assertFalse(torch.equal(other.compress_lens, first.compress_lens))
+        self.assertTrue(torch.equal(other.k_slots, uncached.k_slots))
+        self.assertTrue(torch.equal(other.compress_lens, uncached.compress_lens))

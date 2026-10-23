@@ -194,6 +194,8 @@ class CedLateGraph:
         # Preserve it across warmup/capture/replay and the independent check.
         self.source_metadata = copy.copy(self.live_metadata)
         self.source_metadata.core_attn_metadata = self.metadata.core_attn_metadata
+        # Fresh per replay: this replay's index-source breaks share one layout.
+        self.source_metadata.prefill_layout_cache = {}
 
     def replay(self, backend, inputs, batch=None):
         if batch is not None:

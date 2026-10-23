@@ -191,17 +191,21 @@ def _prefill_index_q_and_weights(
     return q_fp4, q_sf, weights.float()
 
 
-def get_deep_gemm_prefill_data(
+class PrefillLayout(msgspec.Struct, frozen=True):
+    """The index-K layout of one extend at one compress ratio; every layer of
+    that ratio in the forward reads the same one."""
+
+    k_slots: torch.Tensor
+    request_starts: torch.Tensor
+    lens_per_request: List[int]
+    compress_lens: torch.Tensor
+
+
+def _prefill_layout(
     inputs: PrefillInputs, req_to_token: torch.Tensor
-) -> Optional[DeepGEMMPrefillData]:
-    """None when the chunk has no row or no visible compressed position."""
+) -> Optional[PrefillLayout]:
     ratio = inputs.compress_ratio
     pos = inputs.positions
-    assert (
-        inputs.seq_lens_cpu is not None
-        and inputs.rows_per_request is not None
-        and inputs.rows_per_request_device is not None
-    ), "the DeepGEMM prefill indexer needs the CPU length vectors"
     device = pos.device
     # Visible compressed positions per request; (pos + 1) // ratio bounds each row.
     lens_per_request = [s // ratio for s in inputs.seq_lens_cpu]
@@ -217,8 +221,7 @@ def get_deep_gemm_prefill_data(
     )
     position = torch.arange(columns, device=device) - starts_dev[request]
     pool_rows = inputs.req_pool_indices.to(torch.int64)[request]
-    q_fp4, q_sf, weights = _prefill_index_q_and_weights(inputs)
-    return DeepGEMMPrefillData(
+    return PrefillLayout(
         k_slots=req_to_token[pool_rows, position * ratio].to(torch.int64) // ratio,
         request_starts=torch.repeat_interleave(
             starts_dev.to(torch.int32),
@@ -226,8 +229,37 @@ def get_deep_gemm_prefill_data(
             output_size=num_tokens,
         ),
         lens_per_request=lens_per_request,
-        rows_per_request=inputs.rows_per_request,
         compress_lens=((pos + 1) // ratio).to(torch.int32),
+    )
+
+
+def get_deep_gemm_prefill_data(
+    inputs: PrefillInputs, req_to_token: torch.Tensor
+) -> Optional[DeepGEMMPrefillData]:
+    """None when the chunk has no row or no visible compressed position."""
+    assert (
+        inputs.seq_lens_cpu is not None
+        and inputs.rows_per_request is not None
+        and inputs.rows_per_request_device is not None
+    ), "the DeepGEMM prefill indexer needs the CPU length vectors"
+    cache = inputs.layout_cache
+    # The rows identify the extend within the cache's forward.
+    key = (inputs.compress_ratio, inputs.positions.data_ptr(), inputs.positions.shape[0])
+    if cache is not None and key in cache:
+        layout = cache[key]
+    else:
+        layout = _prefill_layout(inputs, req_to_token)
+        if cache is not None:
+            cache[key] = layout
+    if layout is None:
+        return None
+    q_fp4, q_sf, weights = _prefill_index_q_and_weights(inputs)
+    return DeepGEMMPrefillData(
+        k_slots=layout.k_slots,
+        request_starts=layout.request_starts,
+        lens_per_request=layout.lens_per_request,
+        rows_per_request=inputs.rows_per_request,
+        compress_lens=layout.compress_lens,
         q_fp4=q_fp4,
         q_sf=q_sf,
         weights=weights,
