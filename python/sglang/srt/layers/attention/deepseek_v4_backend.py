@@ -1088,6 +1088,10 @@ class DSV4Metadata:
 
     # Set only on the metadata built for the late layers under bounded SWA replay.
     late_layer_tail: Optional[LateLayerTail] = None
+    # The index-source layers' shared index-K layout (scoring.PrefillLayout by
+    # compress ratio). Set only on metadata that is fresh per forward: a reused
+    # object would hand the next batch this batch's slots.
+    prefill_layout_cache: Optional[dict] = None
     # Captured with the late layers on a tail block (decoder SWA bounded replay
     # inside the prefill CUDA graph); replay rebuilds the tail metadata iff set.
     prefill_graph_tail: bool = False
@@ -1894,6 +1898,7 @@ class DeepseekV4AttnBackend(
         )
         metadata.core_attn_metadata.swa_out_cache_loc = swa_out_cache_loc
         if graph_tail is None:
+            metadata.prefill_layout_cache = {}
             # The graph build keeps the bucket-sized request/position rows the
             # prefill-graph metadata init published; eager uses the exact rows.
             metadata.low_ratio_req_indices = torch.repeat_interleave(
@@ -3809,6 +3814,7 @@ class DeepseekV4AttnBackend(
             rows_per_request_device=rows_per_request_device,
             q=q,
             weights=weights,
+            layout_cache=self.forward_metadata.prefill_layout_cache,
             out_raw_indices=core.sparse_raw_indices(layer.compress_ratio),
             out_page_indices=(
                 core.sparse_page_indices(layer.compress_ratio)

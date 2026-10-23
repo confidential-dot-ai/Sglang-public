@@ -67,6 +67,9 @@ class PrefillInputs(msgspec.Struct, frozen=True, kw_only=True):
     # rows; None projects them from x / q_lora.
     q: Optional[torch.Tensor] = None  # [rows, heads, 128] bf16, roped
     weights: Optional[torch.Tensor] = None  # [rows, heads] bf16 head weights
+    # Per-forward store for the layer-independent index-K layout, keyed by
+    # compress ratio; None recomputes it on every layer.
+    layout_cache: Optional[dict] = None
 
     def reset_outputs(self) -> None:
         self.out_raw_indices.fill_(-1)
