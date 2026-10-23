@@ -582,6 +582,49 @@ class TestAllocationIntegration(CustomTestCase):
                     finally:
                         override.restore()
 
+    def test_pp_middle_chunk_send_waits_for_the_chunk_forward(self):
+        """Under PP the next microbatch is scheduled while the chunk's forward can
+        still be queued; an unfenced send copies the pages' previous contents,
+        another request's KV once the pool has been reused."""
+
+        class FakeEvent:
+            def record(self, stream):
+                self.stream = stream
+
+        for pp_size in (1, 2):
+            with self.subTest(pp_size=pp_size):
+                sender = SimpleNamespace(_early_send_wait_event=None)
+                req = Mock(
+                    finished_reason=None, to_finish=None, disagg_kv_sender=sender
+                )
+                fences = []
+                scheduler = SimpleNamespace(
+                    chunked_req=req,
+                    tree_cache=Mock(),
+                    enable_overlap=False,
+                    forward_stream=object(),
+                    check_bootstrap=Mock(return_value=True),
+                    checkpoint_disagg_prefill=Mock(),
+                    send_kv_chunk=lambda r: fences.append(
+                        r.disagg_kv_sender._early_send_wait_event
+                    ),
+                )
+                with (
+                    patch(
+                        "sglang.srt.disaggregation.prefill.get_parallel",
+                        return_value=SimpleNamespace(pp_size=pp_size),
+                    ),
+                    patch("sglang.srt.disaggregation.prefill.torch.cuda.Event", FakeEvent),
+                ):
+                    SchedulerDisaggregationPrefillMixin.process_prefill_chunk(
+                        scheduler, None, SimpleNamespace(batch_is_full=True)
+                    )
+                self.assertEqual(len(fences), 1)
+                if pp_size == 1:
+                    self.assertIsNone(fences[0])
+                else:
+                    self.assertIs(fences[0].stream, scheduler.forward_stream)
+
     def inflight_scheduler(self, reqs):
         scheduler = SchedulerDisaggregationPrefillMixin()
         scheduler.tree_cache = Mock()

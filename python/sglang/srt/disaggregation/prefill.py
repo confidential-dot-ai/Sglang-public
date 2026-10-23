@@ -1462,6 +1462,13 @@ class SchedulerDisaggregationPrefillMixin:
                     len(req.origin_input_ids),
                 )
             else:
+                if get_parallel().pp_size > 1:
+                    # The PP loop schedules the next microbatch while this chunk's
+                    # forward can still be queued; without the fence the transfer
+                    # copies the pages' previous contents.
+                    ev = torch.cuda.Event()
+                    ev.record(self.forward_stream)
+                    req.disagg_kv_sender._early_send_wait_event = ev
                 self.send_kv_chunk(req)
 
             if self.chunked_req is not None:
