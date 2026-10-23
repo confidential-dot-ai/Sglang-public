@@ -746,6 +746,11 @@ def build_plan(args):
         "--served-model-name",
         "dsv41",
         "--trust-remote-code",
+        # V4.1 puts a space before its DSML tag names (" calls"); V4 parsers miss them.
+        "--tool-call-parser",
+        "deepseekv41",
+        "--reasoning-parser",
+        "deepseek-v41",
         "--host",
         "127.0.0.1",
         "--tp-size",

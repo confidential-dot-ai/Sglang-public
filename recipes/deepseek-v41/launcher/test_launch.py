@@ -792,6 +792,16 @@ class TestLaunch(unittest.TestCase):
                     expected,
                 )
 
+    def test_both_roles_parse_v41_tool_calls_and_reasoning(self):
+        for worker in launch.build_plan(self.args())["workers"]:
+            command = worker["command"]
+            self.assertEqual(
+                command[command.index("--tool-call-parser") + 1], "deepseekv41"
+            )
+            self.assertEqual(
+                command[command.index("--reasoning-parser") + 1], "deepseek-v41"
+            )
+
     def test_router_drops_idle_connections_before_servers_close_them(self):
         plan = launch.build_plan(self.args())
         for worker in plan["workers"]:
