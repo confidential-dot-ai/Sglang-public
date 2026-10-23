@@ -487,6 +487,20 @@ class TestLaunch(unittest.TestCase):
         # Without a profile the plan carries no estimate (today's plans unchanged).
         self.assertNotIn("memory", launch.build_plan(self.args()))
 
+    def test_pp_async_batch_depth_reaches_prefill_stages_only(self):
+        base = ("--cpu-engram-staging", "--split-cuda-graphs", "--ced-split",
+                "--prefill-pp", "2")
+        for extra, depth in (((), None), (("--prefill-pp-async-batch-depth", "1"), "1")):
+            prefill, decode = launch.build_plan(self.args(*base, *extra))["workers"]
+            with self.subTest(depth=depth):
+                command = prefill["command"]
+                if depth is None:
+                    self.assertNotIn("--pp-async-batch-depth", command)
+                else:
+                    flag = command.index("--pp-async-batch-depth")
+                    self.assertEqual(command[flag + 1], depth)
+                self.assertNotIn("--pp-async-batch-depth", decode["command"])
+
     def test_two_ced_pp2_prefills_two_tp2_decodes_with_stage_memory(self):
         args = self.args(
             "--cpu-engram-staging",

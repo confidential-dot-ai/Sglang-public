@@ -187,6 +187,13 @@ def parser():
         help="Pipeline stages for each prefill worker on its two GPUs (TP1 per stage)",
     )
     p.add_argument(
+        "--prefill-pp-async-batch-depth",
+        type=int,
+        default=0,
+        help="Extra in-flight microbatches per prefill pipeline (--pp-async-batch-depth); "
+        "exchanges stage outputs before the next launch instead of after it",
+    )
+    p.add_argument(
         "--prefill-pp-partition",
         default=None,
         help="Layers per prefill pipeline stage (SGLANG_PP_LAYER_PARTITION); stages "
@@ -650,7 +657,7 @@ def prefill_graph_max_seq_len(args):
     return None
 
 
-def prefill_parallelism(command, *, pp):
+def prefill_parallelism(command, *, pp, async_batch_depth=0):
     if pp == 1:
         return command
     if pp != 2:
@@ -658,7 +665,10 @@ def prefill_parallelism(command, *, pp):
     command = list(command)
     command[command.index("--tp-size") + 1] = "1"
     command[command.index("--ep-size") + 1] = "1"
-    return command + ["--pp-size", str(pp)]
+    command += ["--pp-size", str(pp)]
+    if async_batch_depth:
+        command += ["--pp-async-batch-depth", str(async_batch_depth)]
+    return command
 
 
 def without_speculative_args(command):
@@ -844,7 +854,11 @@ def build_plan(args):
         for flag in ("--tp-size", "--ep-size"):
             command[command.index(flag) + 1] = str(spec["tp"])
         if role == "prefill":
-            command = prefill_parallelism(command, pp=args.prefill_pp)
+            command = prefill_parallelism(
+                command,
+                pp=args.prefill_pp,
+                async_batch_depth=args.prefill_pp_async_batch_depth,
+            )
             if args.ced_split:
                 command = without_speculative_args(command)
         command += [
