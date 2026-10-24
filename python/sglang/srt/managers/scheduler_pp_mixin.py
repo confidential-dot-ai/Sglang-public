@@ -715,8 +715,8 @@ class SchedulerPPMixin:
         # once, and NCCL work.wait() (TORCH_NCCL_AVOID_RECORD_STREAMS) orders only
         # the comm stream; without this a sent proxy is overwritten by the next
         # forward, and a received one by the next recv, while still in use.
-        if self.pp_comm_stream is None:
-            return
+        # Without a comm stream a received proxy is allocated on the schedule
+        # stream but read on the forward stream, so it needs the same record.
         for tensor in tensor_dict.values():
             if isinstance(tensor, torch.Tensor) and tensor.is_cuda:
                 for stream in streams:
@@ -1717,6 +1717,9 @@ class SchedulerPPMixin:
                             ),
                         )
                     )
+        # Scheduling the next microbatch (a chunked request's next chunk) frees and
+        # remaps pool entries this forward has not read yet; see _apply_war_barrier.
+        self._apply_war_barrier()
         return result, event
 
     def get_rids(

@@ -121,6 +121,68 @@ class TestPPCommOverlap(CustomTestCase):
         )
         sent.record_stream.assert_called_once_with(comm)
 
+    def test_unoverlapped_received_tensors_stay_owned_by_the_forward(self):
+        """Without comm overlap a received proxy is allocated on the schedule stream
+        and read by the forward; unrecorded, the next schedule-stream allocation
+        overwrote it mid-forward (two-chunk prompts drifted run to run)."""
+        schedule, forward, copy = (FakeStream(i) for i in range(3))
+        received = Mock(spec=torch.Tensor, is_cuda=True)
+        sent = Mock(spec=torch.Tensor, is_cuda=True)
+        pp_group = Mock()
+        pp_group.recv_tensor_dict.return_value = {
+            "__msg_type__": "proxy",
+            "hidden_states": received,
+        }
+        pp_group.send_tensor_dict.return_value = []
+        scheduler = _make_scheduler(
+            pp_comm_stream=None,
+            pp_comm_stream_ctx=nullcontext(),
+            schedule_stream=schedule,
+            forward_stream=forward,
+            copy_stream=copy,
+            pp_group=pp_group,
+            attn_tp_group=None,
+            _pp_tensor_dict_inbox=defaultdict(deque),
+        )
+
+        scheduler._pp_recv_typed_dict("proxy")
+        scheduler._pp_send_dict_to_next_stage({"hidden_states": sent}, msg_type="proxy")
+
+        self.assertEqual(
+            received.record_stream.call_args_list,
+            [call(schedule), call(forward), call(copy)],
+        )
+        sent.record_stream.assert_not_called()
+
+    def test_launch_fences_scheduling_behind_the_forward(self):
+        """The PP loops schedule the next microbatch while this forward is queued;
+        for a chunked request that frees and remaps pool entries the queued chunk
+        has not read yet, so every launch must apply the WAR barrier."""
+        order = Mock()
+        result = SimpleNamespace(
+            can_run_cuda_graph=False, spec_verify_out_cache_loc=None, ced_boundary=None
+        )
+        order.run_batch.return_value = result
+        scheduler = _make_scheduler(
+            forward_stream_ctx=nullcontext(),
+            device_module=SimpleNamespace(Event=FakeEvent, current_stream=lambda: 0),
+            pp_group=SimpleNamespace(is_last_rank=False),
+            _pp_wait_forward_dependencies=Mock(),
+            run_batch=order.run_batch,
+            _apply_war_barrier=order.war_barrier,
+        )
+        batch = SimpleNamespace(
+            reqs=[], spec_algorithm=SimpleNamespace(is_none=lambda: True)
+        )
+
+        with patch("sglang.srt.managers.scheduler_pp_mixin.set_time_batch"):
+            launched, _ = scheduler._pp_launch_batch(0, batch, None, [None], deque())
+
+        self.assertIs(launched, result)
+        self.assertEqual(
+            [name for name, _, _ in order.mock_calls], ["run_batch", "war_barrier"]
+        )
+
     def test_ced_prefill_skips_the_output_relay_only_when_no_output_is_read(self):
         def batch(**req_flags):
             req = SimpleNamespace(
