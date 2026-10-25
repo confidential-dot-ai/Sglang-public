@@ -15,6 +15,7 @@ from typing import (
 import numpy as np
 import torch
 
+from sglang.srt.disaggregation.divergence_debug import log_first_tokens
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import (
@@ -305,6 +306,19 @@ class SchedulerBatchResultProcessor:
 
             # Move next_token_ids and logprobs to cpu
             next_token_ids = next_token_ids.tolist()
+            if (
+                envs.SGLANG_DEBUG_PD_DIVERGENCE.get()
+                and self.disaggregation_mode == DisaggregationMode.DECODE
+            ):
+                log_first_tokens(
+                    reqs=batch.reqs,
+                    next_token_ids=next_token_ids,
+                    logits=(
+                        None
+                        if logits_output is None
+                        else logits_output.next_token_logits
+                    ),
+                )
             self.move_logprobs_to_cpu(batch=batch, logits_output=logits_output)
             self.materialize_sampling_mask_output(batch.reqs, logits_output)
 

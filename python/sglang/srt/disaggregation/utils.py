@@ -495,6 +495,14 @@ class MetadataBuffers:
         return int(self.kv_checksum[idx, 0].item())
 
     def get_buf_infos(self):
+        bufs = self.transfer_buffers()
+        ptrs = [buf.data_ptr() for buf in bufs]
+        data_lens = [buf.nbytes for buf in bufs]
+        item_lens = [buf[0].nbytes for buf in bufs]
+        return ptrs, data_lens, item_lens
+
+    def transfer_buffers(self) -> List[torch.Tensor]:
+        """The buffers PD transfers, in aux-pointer order; row i is slot i."""
         bufs = [
             self.output_ids,
             self.cached_tokens,
@@ -516,11 +524,7 @@ class MetadataBuffers:
             bufs.append(self.kv_checksum)
         if self.ced_boundary is not None:
             bufs.append(self.ced_boundary)
-        bufs = [buf for buf in bufs if buf is not None]
-        ptrs = [buf.data_ptr() for buf in bufs]
-        data_lens = [buf.nbytes for buf in bufs]
-        item_lens = [buf[0].nbytes for buf in bufs]
-        return ptrs, data_lens, item_lens
+        return [buf for buf in bufs if buf is not None]
 
     def get_buf(self, idx: int):
         return (

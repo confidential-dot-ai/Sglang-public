@@ -10,6 +10,7 @@ import torch
 import torch.distributed
 
 from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.disaggregation.divergence_debug import ProxyChecksums
 from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
 from sglang.srt.distributed.parallel_state import P2PWork
@@ -273,6 +274,11 @@ class SchedulerPPMixin:
         release_rids: Optional[List[str]] = None
         send_transfer_work = []
         send_release_work = []
+        proxy_checksums = (
+            ProxyChecksums(torch.device("cuda", torch.cuda.current_device()))
+            if envs.SGLANG_DEBUG_PD_DIVERGENCE.get()
+            else None
+        )
 
         while True:
             server_is_idle = True
@@ -316,6 +322,13 @@ class SchedulerPPMixin:
                 if cur_batch:
                     server_is_idle = False
                     pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                    if proxy_checksums is not None and pp_proxy_tensors is not None:
+                        proxy_checksums.submit(
+                            side="recv",
+                            tensors=pp_proxy_tensors.tensors,
+                            ready_event=self.pp_proxy_recv_event,
+                            batch=cur_batch,
+                        )
 
                 if get_parallel().pp_async_batch_depth > 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
@@ -328,6 +341,8 @@ class SchedulerPPMixin:
                 if cur_batch:
                     if self.enable_staging:
                         self.maybe_prefetch_staging_for_batch(cur_batch)
+                    if proxy_checksums is not None:
+                        proxy_checksums.begin_layer_probes(self.forward_stream)
                     result, self.launch_event = self._pp_launch_batch(
                         mb_id,
                         cur_batch,
@@ -335,6 +350,23 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+                    if proxy_checksums is not None:
+                        probes_read = proxy_checksums.submit_layer_probes(
+                            ready_event=self.launch_event, batch=cur_batch
+                        )
+                        if probes_read is not None:
+                            self.forward_stream.wait_event(probes_read)
+                    if proxy_checksums is not None and not self.pp_group.is_last_rank:
+                        # A graph run's proxy is its static output, which the next
+                        # forward overwrites; hold that forward until it is hashed.
+                        self.forward_stream.wait_event(
+                            proxy_checksums.submit(
+                                side="send",
+                                tensors=result.pp_hidden_states_proxy_tensors.tensors,
+                                ready_event=self.launch_event,
+                                batch=cur_batch,
+                            )
+                        )
                 if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(

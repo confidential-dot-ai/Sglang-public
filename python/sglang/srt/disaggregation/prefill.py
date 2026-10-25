@@ -39,6 +39,7 @@ from sglang.srt.disaggregation.checksum import (
     state_indices_for_request,
 )
 from sglang.srt.disaggregation.common.conn import CommonKVManager
+from sglang.srt.disaggregation.divergence_debug import log_metadata_slot
 from sglang.srt.disaggregation.common.staging_buffer import (
     compute_grid_segments,
     staging_grid_tokens,
@@ -1586,6 +1587,13 @@ class SchedulerDisaggregationPrefillMixin:
         state_indices: Optional[List] = None
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
+            if envs.SGLANG_DEBUG_PD_DIVERGENCE.get():
+                log_metadata_slot(
+                    side=f"prefill-aux pp={get_parallel().pp_rank}",
+                    room=req.bootstrap_room,
+                    buffers=self.disagg_metadata_buffers.transfer_buffers(),
+                    index=req.metadata_buffer_index,
+                )
 
             # Most state payloads read token-pool rows and should match the KV
             # range actually materialized on prefill. C128 state is request
