@@ -1,6 +1,7 @@
-"""CED coalescing deadlines must not stop decode or diverge across TP ranks."""
+"""CED decode scheduling: coalescing deadlines must not stop decode or diverge
+across TP ranks, and grammar-constrained requests must reach preallocation."""
 
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -62,3 +63,29 @@ def test_remote_rank_deadline_controls_dispatch_without_cuda_sync():
     ) as collective:
         assert not defer(s)
         collective.assert_called_once()
+
+
+def test_ced_decode_promotes_requests_whose_grammar_compiled():
+    """Under CED a tool_choice=required/named or response_format request waits for
+    its grammar before preallocation; unless the CED scheduling path promotes it,
+    decode never bootstraps and prefill holds the request until it times out."""
+    req = object()
+    queued = []
+    s = SimpleNamespace(
+        scheduler_stage_metrics=None,
+        grammar_manager=SimpleNamespace(
+            has_waiting_grammars=lambda: True, get_ready_grammar_requests=lambda: [req]
+        ),
+        _add_request_to_queue=queued.append,
+        _merge_ced_tail_batch=lambda running: running,
+        _get_new_ced_tail_batch=lambda running: None,
+        dp_attn_adapter=SimpleNamespace(maybe_prepare_mlp_sync_batch=lambda b: b),
+    )
+    s._promote_ready_grammar_requests = MethodType(
+        SchedulerDisaggregationDecodeMixin._promote_ready_grammar_requests, s
+    )
+    with patch("sglang.srt.disaggregation.decode.ced_split_enabled", return_value=True):
+        SchedulerDisaggregationDecodeMixin.get_next_disagg_decode_batch_to_run(
+            s, SimpleNamespace(is_empty=lambda: True)
+        )
+    assert queued == [req]
