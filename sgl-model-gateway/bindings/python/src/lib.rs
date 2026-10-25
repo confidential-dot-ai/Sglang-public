@@ -412,6 +412,11 @@ struct Router {
     queue_size: usize,
     queue_timeout_secs: u64,
     rate_limit_tokens_per_second: Option<i32>,
+    reject_video: bool,
+    max_inflight_images: i64,
+    max_inflight_megapixels: i64,
+    max_images_per_request: i64,
+    unmeasured_image_megapixels: i64,
     connection_mode: core::ConnectionMode,
     model_path: Option<String>,
     tokenizer_path: Option<String>,
@@ -600,6 +605,11 @@ impl Router {
             .max_concurrent_requests(self.max_concurrent_requests)
             .queue_size(self.queue_size)
             .queue_timeout_secs(self.queue_timeout_secs)
+            .reject_video(self.reject_video)
+            .max_inflight_images(self.max_inflight_images)
+            .max_inflight_megapixels(self.max_inflight_megapixels)
+            .max_images_per_request(self.max_images_per_request)
+            .unmeasured_image_megapixels(self.unmeasured_image_megapixels)
             .cors_allowed_origins(self.cors_allowed_origins.clone())
             .retry_config(config::RetryConfig {
                 max_retries: self.retry_max_retries,
@@ -733,6 +743,11 @@ impl Router {
         queue_size = 100,
         queue_timeout_secs = 60,
         rate_limit_tokens_per_second = None,
+        reject_video = false,
+        max_inflight_images = 0,
+        max_inflight_megapixels = 0,
+        max_images_per_request = 0,
+        unmeasured_image_megapixels = 0,
         model_path = None,
         tokenizer_path = None,
         chat_template = None,
@@ -825,6 +840,11 @@ impl Router {
         queue_size: usize,
         queue_timeout_secs: u64,
         rate_limit_tokens_per_second: Option<i32>,
+        reject_video: bool,
+        max_inflight_images: i64,
+        max_inflight_megapixels: i64,
+        max_images_per_request: i64,
+        unmeasured_image_megapixels: i64,
         model_path: Option<String>,
         tokenizer_path: Option<String>,
         chat_template: Option<String>,
@@ -930,6 +950,11 @@ impl Router {
             queue_size,
             queue_timeout_secs,
             rate_limit_tokens_per_second,
+            reject_video,
+            max_inflight_images,
+            max_inflight_megapixels,
+            max_images_per_request,
+            unmeasured_image_megapixels,
             connection_mode,
             model_path,
             tokenizer_path,

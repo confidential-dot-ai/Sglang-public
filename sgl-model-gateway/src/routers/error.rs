@@ -1,5 +1,5 @@
 use axum::{
-    http::{HeaderMap, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -50,6 +50,23 @@ pub fn bad_gateway(code: impl Into<String>, message: impl Into<String>) -> Respo
 
 pub fn method_not_allowed(code: impl Into<String>, message: impl Into<String>) -> Response {
     create_error(StatusCode::METHOD_NOT_ALLOWED, code, message)
+}
+
+/// Shed load with a retry hint.
+///
+/// `Retry-After` is what turns a rejection into backpressure: without it a
+/// client that retries immediately keeps the gateway at its ceiling, and the
+/// rejections do not shed any load.
+pub fn too_many_requests(
+    code: impl Into<String>,
+    message: impl Into<String>,
+    retry_after_secs: u64,
+) -> Response {
+    let mut response = create_error(StatusCode::TOO_MANY_REQUESTS, code, message);
+    if let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
 }
 
 pub fn create_error(

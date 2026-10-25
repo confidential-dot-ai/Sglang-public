@@ -372,18 +372,20 @@ impl AppContextBuilder {
     }
 
     /// Create rate limiter based on config
+    ///
+    /// `max_concurrent_requests` is a concurrency ceiling, so it needs
+    /// `refill_rate = 0` (the TokenBucket's semaphore mode). A nonzero refill
+    /// makes it an n-per-second throughput limit that never bounds concurrency.
+    /// An explicit `rate_limit_tokens_per_second` opts into that instead.
     fn maybe_rate_limiter(mut self, config: &RouterConfig) -> Self {
         self.rate_limiter = match config.max_concurrent_requests {
             n if n <= 0 => None,
             n => {
-                let rate_limit_tokens = config
+                let refill_rate = config
                     .rate_limit_tokens_per_second
                     .filter(|&t| t > 0)
-                    .unwrap_or(n);
-                Some(Arc::new(TokenBucket::new(
-                    n as usize,
-                    rate_limit_tokens as usize,
-                )))
+                    .unwrap_or(0);
+                Some(Arc::new(TokenBucket::new(n as usize, refill_rate as usize)))
             }
         };
         self
@@ -528,5 +530,31 @@ impl AppContextBuilder {
 impl Default for AppContextBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `--max-concurrent-requests` alone caps concurrency: a permit comes back
+    /// only when a request completes, never from the passage of time.
+    #[tokio::test]
+    async fn max_concurrent_requests_alone_never_refills() {
+        let config = RouterConfig {
+            max_concurrent_requests: 2,
+            ..RouterConfig::default()
+        };
+        let bucket = AppContextBuilder::new()
+            .maybe_rate_limiter(&config)
+            .rate_limiter
+            .expect("a positive max_concurrent_requests builds a limiter");
+        assert!(bucket.try_acquire(2.0).await.is_ok());
+        // Long enough for a refill of max_concurrent_requests per second to land.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert!(bucket.try_acquire(1.0).await.is_err());
+
+        bucket.return_tokens_sync(1.0);
+        assert!(bucket.try_acquire(1.0).await.is_ok());
     }
 }
