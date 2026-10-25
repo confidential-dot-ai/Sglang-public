@@ -101,6 +101,48 @@ def parser():
         help="Router Prometheus port; distinct per replica on one host",
     )
     p.add_argument(
+        "--router-reject-video",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Refuse chat requests carrying video with 400; V4.1 has no video encoder",
+    )
+    p.add_argument(
+        "--router-max-concurrent-requests",
+        type=int,
+        default=-1,
+        help="Router admission ceiling on concurrent requests (-1 = unlimited); "
+        "retune live with POST /admission",
+    )
+    p.add_argument(
+        "--router-queue-size",
+        type=int,
+        help="Requests the router queues at its admission ceiling (router default 100)",
+    )
+    p.add_argument(
+        "--router-queue-timeout-secs",
+        type=int,
+        help="Longest a queued request waits for admission (router default 60)",
+    )
+    p.add_argument(
+        "--router-max-images-per-request",
+        type=int,
+        default=0,
+        help="Router refuses (400) chat requests carrying more images (0 = no cap)",
+    )
+    p.add_argument(
+        "--router-max-inflight-images",
+        type=int,
+        default=0,
+        help="Router refuses (429) images past this many in flight (0 = no cap)",
+    )
+    p.add_argument(
+        "--router-max-inflight-megapixels",
+        type=int,
+        default=0,
+        help="Router refuses (429) image area past this many megapixels in flight "
+        "(0 = no cap); calibrate per deployment",
+    )
+    p.add_argument(
         "--nccl-port",
         type=int,
         default=29500,
@@ -523,6 +565,17 @@ def resolve_pool_sizes(args):
 
 
 def validate(args):
+    if args.router_max_concurrent_requests == 0 or args.router_max_concurrent_requests < -1:
+        raise ValueError("--router-max-concurrent-requests must be positive, or -1")
+    for flag, value in (
+        ("--router-queue-size", args.router_queue_size),
+        ("--router-queue-timeout-secs", args.router_queue_timeout_secs),
+        ("--router-max-images-per-request", args.router_max_images_per_request),
+        ("--router-max-inflight-images", args.router_max_inflight_images),
+        ("--router-max-inflight-megapixels", args.router_max_inflight_megapixels),
+    ):
+        if value is not None and value < 0:
+            raise ValueError(f"{flag} must not be negative")
     if args.prefill_hoist_per_batch:
         raise ValueError(
             "--prefill-hoist-per-batch is not ported to cc-main: upstream rewrote "
@@ -1067,8 +1120,25 @@ def build_router(args, workers):
             str(args.port),
             "--prometheus-port",
             str(args.router_metrics_port),
+            *router_admission_args(args),
         ],
     )
+
+
+def router_admission_args(args):
+    """The router's admission caps; each is left at the router default unless set."""
+    caps = ["--reject-video"] if args.router_reject_video else []
+    for flag, value, unset in (
+        ("--max-concurrent-requests", args.router_max_concurrent_requests, -1),
+        ("--queue-size", args.router_queue_size, None),
+        ("--queue-timeout-secs", args.router_queue_timeout_secs, None),
+        ("--max-images-per-request", args.router_max_images_per_request, 0),
+        ("--max-inflight-images", args.router_max_inflight_images, 0),
+        ("--max-inflight-megapixels", args.router_max_inflight_megapixels, 0),
+    ):
+        if value != unset:
+            caps += [flag, str(value)]
+    return caps
 
 
 def checkpoint_budget(model, tp_sizes=(2,)):
