@@ -838,6 +838,46 @@ def deepseek_v4_engram_hash_ids(hasher, input_ids: torch.Tensor) -> torch.Tensor
 bcg_deepseek_v4_engram_hash_ids = eager_on_graph(True)(deepseek_v4_engram_hash_ids)
 
 
+def deepseek_v4_engram_forward_hash_ids(
+    *,
+    hasher,
+    prefetcher,
+    input_ids: torch.Tensor,
+    num_rows: int,
+    forward_batch: ForwardBatch,
+    cp_extend: bool,
+    replay_from_boundary: bool,
+) -> Optional[torch.Tensor]:
+    """A forward's Engram hash ids, padded to its ``num_rows`` local rows; None
+    without an Engram or on a boundary replay, where the encoder does not run."""
+    if hasher is None:
+        return None
+    if replay_from_boundary:
+        # Hashing still commits each request's history row: its first decode step
+        # reads it, and would otherwise see the slot's previous request.
+        hasher(input_ids, forward_batch)
+        return None
+    if cp_extend:
+        # n-gram hashing needs each token's predecessors: hash the whole prompt
+        total = int(forward_batch.attn_cp_metadata.total_seq_lens)
+        hash_ids = hasher(forward_batch.input_ids[:total], forward_batch)
+        parallel = get_parallel()
+        hash_ids = hash_ids[parallel.attn_cp_rank :: parallel.attn_cp_size]
+        pad_rows = num_rows - hash_ids.shape[0]
+        if pad_rows > 0:
+            hash_ids = torch.cat(
+                [hash_ids, hash_ids.new_zeros(pad_rows, *hash_ids.shape[1:])]
+            )
+        return hash_ids
+    if _is_breakable_prefill(forward_batch):
+        hash_ids = bcg_deepseek_v4_engram_hash_ids(hasher, input_ids)
+    else:
+        hash_ids = hasher(input_ids, forward_batch)
+    if prefetcher is not None:
+        prefetcher.start(hash_ids)
+    return hash_ids
+
+
 def _is_breakable_prefill(forward_batch: ForwardBatch) -> bool:
     # TARGET_VERIFY also satisfies is_extend(), but runs in the decode graph
     # runner without the prefill context these eager helpers require.
@@ -4063,7 +4103,6 @@ class DeepseekV4Model(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[LateLayerTail]]:
         # prev_pre_in: the previous pipeline stage's pre-mix for this stage's
         # first layer. Without it the first combine would read stream 0 alone.
-        hash_ids = None
         cp_extend = (
             is_cp_active(forward_batch) and forward_batch.forward_mode.is_extend()
         )
@@ -4072,32 +4111,15 @@ class DeepseekV4Model(nn.Module):
         boundary = forward_batch.ced_boundary if ced_boundary_enabled() else None
         injection = boundary if isinstance(boundary, CedBoundaryInjection) else None
         replay_from_boundary = injection is not None and not injection.check
-        if self.engram_hasher is not None and not replay_from_boundary:
-            if cp_extend:
-                # n-gram hashing needs each token's predecessors: hash the whole prompt
-                total = int(forward_batch.attn_cp_metadata.total_seq_lens)
-                hash_ids = self.engram_hasher(
-                    forward_batch.input_ids[:total], forward_batch
-                )
-                parallel = get_parallel()
-                hash_ids = hash_ids[parallel.attn_cp_rank :: parallel.attn_cp_size]
-                pad_rows = hidden_states.shape[0] - hash_ids.shape[0]
-                if pad_rows > 0:
-                    hash_ids = torch.cat(
-                        [hash_ids, hash_ids.new_zeros(pad_rows, *hash_ids.shape[1:])]
-                    )
-            elif _is_breakable_prefill(forward_batch):
-                hash_ids = bcg_deepseek_v4_engram_hash_ids(
-                    self.engram_hasher, input_ids
-                )
-                prefetcher = getattr(self, "engram_prefetcher", None)
-                if prefetcher is not None:
-                    prefetcher.start(hash_ids)
-            else:
-                hash_ids = self.engram_hasher(input_ids, forward_batch)
-                prefetcher = getattr(self, "engram_prefetcher", None)
-                if prefetcher is not None:
-                    prefetcher.start(hash_ids)
+        hash_ids = deepseek_v4_engram_forward_hash_ids(
+            hasher=self.engram_hasher,
+            prefetcher=getattr(self, "engram_prefetcher", None),
+            input_ids=input_ids,
+            num_rows=hidden_states.shape[0],
+            forward_batch=forward_batch,
+            cp_extend=cp_extend,
+            replay_from_boundary=replay_from_boundary,
+        )
         tail = None
         if (
             self.late_layer_start is not None
