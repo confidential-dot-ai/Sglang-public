@@ -419,6 +419,16 @@ pub async fn start_service_discovery(
     Ok(handle)
 }
 
+// A relabeled Pod or replacement ordinal can have the same name, IP, and
+// readiness as the tracked Pod. Registry absence must trigger registration.
+fn should_reconcile_worker(
+    tracked: bool,
+    url: &str,
+    registry: &crate::core::WorkerRegistry,
+) -> bool {
+    !registry.is_draining_url(url) && (!tracked || registry.get_by_url(url).is_none())
+}
+
 async fn handle_pod_event(
     pod_info: &PodInfo,
     tracked_pods: Arc<Mutex<HashSet<PodInfo>>>,
@@ -439,12 +449,13 @@ async fn handle_pod_event(
                 }
             };
 
-            if tracker.contains(pod_info) {
-                (false, tracker.len())
-            } else {
-                tracker.insert(pod_info.clone());
-                (true, tracker.len())
-            }
+            let should_add = should_reconcile_worker(
+                tracker.contains(pod_info),
+                &worker_url,
+                &app_context.worker_registry,
+            );
+            tracker.insert(pod_info.clone());
+            (should_add, tracker.len())
         };
 
         if should_add {
@@ -760,6 +771,53 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn test_tracked_worker_rejoins_with_the_same_url_after_withdrawal() {
+        let registry = crate::core::WorkerRegistry::new();
+        let url = "http://1.2.3.4:30000";
+        let id = registry.register(Arc::new(crate::core::BasicWorkerBuilder::new(url).build()));
+        assert!(!should_reconcile_worker(true, url, &registry));
+        registry.begin_drain(&id).unwrap();
+        assert!(!should_reconcile_worker(true, url, &registry));
+        assert!(!should_reconcile_worker(false, url, &registry));
+        assert!(registry.finish_drain(&id));
+        assert!(should_reconcile_worker(true, url, &registry));
+        registry.register(Arc::new(crate::core::BasicWorkerBuilder::new(url).build()));
+        assert!(!should_reconcile_worker(true, url, &registry));
+    }
+
+    #[test]
+    fn test_new_discovery_instance_excludes_traffic_ineligible_pod() {
+        let mut pod = create_k8s_pod(
+            Some("worker-0"),
+            Some("1.2.3.4"),
+            Some("Running"),
+            Some("True"),
+            None,
+        );
+        let selector = HashMap::from([
+            (
+                "app.kubernetes.io/component".into(),
+                "inference-worker".into(),
+            ),
+            ("confidential.ai/traffic-eligible".into(), "true".into()),
+        ]);
+        pod.metadata.labels = Some(std::collections::BTreeMap::from([
+            (
+                "app.kubernetes.io/component".into(),
+                "inference-worker".into(),
+            ),
+            ("confidential.ai/traffic-eligible".into(), "false".into()),
+        ]));
+        assert!(!PodInfo::matches_selector(&pod, &selector));
+        pod.metadata
+            .labels
+            .as_mut()
+            .unwrap()
+            .insert("confidential.ai/traffic-eligible".into(), "true".into());
+        assert!(PodInfo::matches_selector(&pod, &selector));
+    }
 
     fn create_k8s_pod(
         name: Option<&str>,

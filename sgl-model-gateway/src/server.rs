@@ -783,6 +783,41 @@ async fn get_worker(
     }
 }
 
+async fn drain_worker(State(state): State<Arc<AppState>>, Path(raw): Path<String>) -> Response {
+    let id = crate::core::worker_registry::WorkerId::from_string(raw);
+    match state.context.worker_registry.begin_drain(&id) {
+        Some((url, active)) => Json(json!({"worker_id": id.as_str(), "url": url, "draining": true, "active_requests": active})).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn model_routes_status(State(state): State<Arc<AppState>>) -> Response {
+    Json(state.context.worker_registry.model_routes_status()).into_response()
+}
+
+async fn model_routes(State(state): State<Arc<AppState>>) -> Response {
+    Json(state.context.worker_registry.model_routes()).into_response()
+}
+
+async fn drain_worker_status(
+    State(state): State<Arc<AppState>>,
+    Path(raw): Path<String>,
+) -> Response {
+    let id = crate::core::worker_registry::WorkerId::from_string(raw);
+    match state.context.worker_registry.drain_status(&id) {
+        Some((url, active)) => Json(json!({"worker_id": id.as_str(), "url": url, "draining": true, "active_requests": active})).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+async fn resume_worker(State(state): State<Arc<AppState>>, Path(raw): Path<String>) -> Response {
+    let id = crate::core::worker_registry::WorkerId::from_string(raw);
+    if state.context.worker_registry.finish_drain(&id) {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        StatusCode::CONFLICT.into_response()
+    }
+}
+
 async fn delete_worker(
     State(state): State<Arc<AppState>>,
     Path(worker_id_raw): Path<String>,
@@ -981,6 +1016,14 @@ pub fn build_app(
 
     // Build worker routes
     let worker_routes = Router::new()
+        .route("/model-routes", get(model_routes))
+        .route("/model-routes/status", get(model_routes_status))
+        .route(
+            "/workers/{worker_id}/drain",
+            post(drain_worker)
+                .get(drain_worker_status)
+                .delete(resume_worker),
+        )
         .route("/workers", post(create_worker).get(list_workers_rest))
         .route(
             "/workers/{worker_id}",

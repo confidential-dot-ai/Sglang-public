@@ -420,7 +420,9 @@ impl AppContextBuilder {
 
     /// Create worker registry
     fn with_worker_registry(mut self) -> Self {
-        self.worker_registry = Some(Arc::new(WorkerRegistry::new()));
+        let registry = Arc::new(WorkerRegistry::new());
+        registry.watch_model_routes();
+        self.worker_registry = Some(registry);
         self
     }
 

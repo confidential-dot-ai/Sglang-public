@@ -1331,3 +1331,45 @@ Provide --worker-urls or PD flags as usual.",
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod maintenance_cli_tests {
+    use super::*;
+
+    #[test]
+    fn maintenance_chart_flags_parse_and_keep_both_selectors() {
+        let cli = Cli::try_parse_from([
+            "sgl-model-gateway",
+            "--service-discovery",
+            "--service-discovery-namespace=confidential-inference",
+            "--service-discovery-port=30000",
+            "--selector=app.kubernetes.io/component=inference-worker",
+            "--selector=confidential.ai/traffic-eligible=true",
+            "--enable-igw",
+            "--policy=cache_aware",
+            "--cache-threshold=0.3",
+            "--balance-abs-threshold=64",
+            "--balance-rel-threshold=1.5",
+            "--eviction-interval=60",
+            "--max-tree-size=67108864",
+            "--health-check-endpoint=/health",
+            "--worker-startup-timeout-secs=3600",
+            "--host=0.0.0.0",
+            "--port=30000",
+            "--prometheus-host=0.0.0.0",
+            "--prometheus-port=29000",
+        ])
+        .unwrap();
+        assert!(cli.router_args.enable_igw);
+        let selectors = CliArgs::parse_selector(&cli.router_args.selector);
+        assert_eq!(
+            selectors.get("confidential.ai/traffic-eligible").unwrap(),
+            "true"
+        );
+        assert_eq!(
+            selectors.get("app.kubernetes.io/component").unwrap(),
+            "inference-worker"
+        );
+        assert_eq!(cli.router_args.eviction_interval, 60);
+    }
+}

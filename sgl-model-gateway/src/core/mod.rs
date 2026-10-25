@@ -17,6 +17,7 @@ pub mod error;
 pub mod job_queue;
 pub mod metrics_aggregator;
 pub mod model_card;
+pub mod model_routes;
 pub mod model_type;
 pub mod retry;
 pub mod steps;

@@ -134,19 +134,24 @@ impl Router {
     async fn select_worker_for_model(
         &self,
         model_id: Option<&str>,
+        backends: Option<&[String]>,
         text: Option<&str>,
         headers: Option<&HeaderMap>,
     ) -> Option<Arc<dyn Worker>> {
         let effective_model_id = if !self.enable_igw { None } else { model_id };
 
         // Get workers for the specified model O(1), filtered by connection mode
-        let workers = self.worker_registry.get_workers_filtered(
-            effective_model_id,
-            Some(WorkerType::Regular),
-            Some(ConnectionMode::Http),
-            None,  // any runtime type
-            false, // get all workers, we'll filter by is_available() next
-        );
+        let workers = if let Some(backends) = backends {
+            self.worker_registry.workers_for_backends(backends)
+        } else {
+            self.worker_registry.get_workers_filtered(
+                effective_model_id,
+                Some(WorkerType::Regular),
+                Some(ConnectionMode::Http),
+                None,  // any runtime type
+                false, // get all workers, we'll filter by is_available() next
+            )
+        };
 
         let available: Vec<Arc<dyn Worker>> = workers
             .iter()
@@ -164,9 +169,12 @@ impl Router {
         };
 
         // Get cached hash ring for consistent hashing (O(log n) lookup)
-        let hash_ring = self
-            .worker_registry
-            .get_hash_ring(effective_model_id.unwrap_or(UNKNOWN_MODEL_ID));
+        let hash_ring = if let Some(backends) = backends {
+            Some(self.worker_registry.hash_ring_for_backends(backends))
+        } else {
+            self.worker_registry
+                .get_hash_ring(effective_model_id.unwrap_or(UNKNOWN_MODEL_ID))
+        };
 
         let idx = policy
             .select_worker(
@@ -202,6 +210,10 @@ impl Router {
         let is_stream = typed_req.is_stream();
         let text = typed_req.extract_text_for_routing();
         let model = model_id.unwrap_or(UNKNOWN_MODEL_ID);
+        // Resolve once. A route change cannot retarget an accepted request
+        // or any of its retry attempts to another model.
+        let backends = self.worker_registry.resolve_model_route(model_id);
+        let selected_backend = std::sync::Mutex::new(None::<String>);
         let endpoint = route_to_endpoint(route);
 
         // Record request start (Layer 2)
@@ -219,7 +231,16 @@ impl Router {
             // operation per attempt
             |_: u32| async {
                 let res = self
-                    .route_typed_request_once(headers, typed_req, route, model_id, is_stream, &text)
+                    .route_typed_request_once(
+                        headers,
+                        typed_req,
+                        route,
+                        model_id,
+                        backends.as_deref(),
+                        &selected_backend,
+                        is_stream,
+                        &text,
+                    )
                     .await;
 
                 // Need to be outside `route_typed_request_once` because that function has multiple return paths
@@ -276,30 +297,45 @@ impl Router {
         typed_req: &T,
         route: &'static str,
         model_id: Option<&str>,
+        backends: Option<&[String]>,
+        selected_backend: &std::sync::Mutex<Option<String>>,
         is_stream: bool,
         text: &str,
     ) -> Response {
-        let worker = match self
-            .select_worker_for_model(model_id, Some(text), headers)
-            .await
-        {
-            Some(w) => w,
-            None => {
-                return error::service_unavailable(
-                    "no_available_workers",
-                    "No available workers (all circuits open or unhealthy)",
-                );
+        // Admission shares the withdrawal lock. A selection made before the
+        // fence must retry rather than send a request after withdrawal.
+        let (worker, load_guard) = loop {
+            let pinned = selected_backend.lock().unwrap().clone();
+            let worker = match self
+                .select_worker_for_model(
+                    model_id,
+                    pinned.as_ref().map(std::slice::from_ref).or(backends),
+                    Some(text),
+                    headers,
+                )
+                .await
+            {
+                Some(worker) => worker,
+                None => {
+                    return error::service_unavailable(
+                        "no_available_workers",
+                        "No available workers",
+                    )
+                }
+            };
+            if let Some(guard) = self
+                .worker_registry
+                .admit_http_request(worker.clone(), headers)
+            {
+                if backends.is_some() {
+                    let mut pinned = selected_backend.lock().unwrap();
+                    if pinned.is_none() {
+                        *pinned = Some(worker.model_id().to_string());
+                    }
+                }
+                break (worker, Some(guard));
             }
         };
-
-        let policy = match model_id {
-            Some(model) => self.policy_registry.get_policy_or_default(model),
-            None => self.policy_registry.get_default_policy(),
-        };
-
-        let load_guard = ["cache_aware", "manual"]
-            .contains(&policy.name())
-            .then(|| WorkerLoadGuard::new(worker.clone(), headers));
 
         // Note: Using borrowed reference avoids heap allocation
         events::RequestSentEvent { url: worker.url() }.emit();
@@ -308,7 +344,15 @@ impl Router {
         let headers = Some(&headers_with_trace);
 
         let response = self
-            .send_typed_request(headers, typed_req, route, &worker, is_stream, load_guard)
+            .send_typed_request(
+                headers,
+                typed_req,
+                route,
+                &worker,
+                backends.map(|_| worker.model_id()),
+                is_stream,
+                load_guard,
+            )
             .await;
 
         events::RequestReceivedEvent {}.emit();
@@ -490,6 +534,7 @@ impl Router {
         typed_req: &T,
         route: &'static str,
         worker: &Arc<dyn Worker>,
+        model_override: Option<&str>,
         is_stream: bool,
         load_guard: Option<WorkerLoadGuard>,
     ) -> Response {
@@ -522,6 +567,11 @@ impl Router {
             };
 
             if let Some(map) = json_val.as_object_mut() {
+                if let Some(model) = model_override {
+                    if map.contains_key("model") {
+                        map.insert("model".into(), serde_json::json!(model));
+                    }
+                }
                 // Use static key string to avoid allocation
                 map.insert(DP_RANK_KEY.to_string(), serde_json::json!(dp_rank));
                 // Only serialize if debug logging is enabled to avoid CPU overhead
@@ -541,6 +591,24 @@ impl Router {
             self.client
                 .post(format!("{}{}", worker_url_prefix, route))
                 .json(&json_val)
+        } else if let Some(model) = model_override {
+            let mut value = match serde_json::to_value(typed_req) {
+                Ok(value) => value,
+                Err(_) => {
+                    return error::bad_request(
+                        "serialization_failed",
+                        "Cannot encode the routed request",
+                    )
+                }
+            };
+            if let Some(map) = value.as_object_mut() {
+                if map.contains_key("model") {
+                    map.insert("model".into(), serde_json::json!(model));
+                }
+            }
+            self.client
+                .post(format!("{}{}", worker_url, route))
+                .json(&value)
         } else {
             self.client
                 .post(format!("{}{}", worker_url, route))
@@ -608,8 +676,11 @@ impl Router {
                 }
             };
 
-            // load_guard dropped here automatically after response body is read
-            response
+            // Keep admission counted until the client response body is released.
+            match load_guard {
+                Some(guard) => AttachedBody::wrap_response(response, guard),
+                None => response,
+            }
         } else {
             // Preserve headers for streaming response
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
@@ -855,6 +926,172 @@ impl RouterTrait for Router {
 mod tests {
     use super::*;
     use crate::core::BasicWorkerBuilder;
+
+    #[tokio::test]
+    async fn test_retry_keeps_the_first_admitted_backend_model() {
+        let router = create_test_regular_router();
+        for (id, _) in router.worker_registry.get_all_with_ids() {
+            router.worker_registry.remove(&id);
+        }
+        let mut servers = Vec::new();
+        let mut ids = std::collections::HashMap::new();
+        for model in ["old", "new"] {
+            let backend = axum::Router::new().route(
+                "/v1/completions",
+                axum::routing::post(move |Json(body): Json<serde_json::Value>| async move {
+                    if body["model"] != model {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({"error": "wrong model"})),
+                        );
+                    }
+                    (StatusCode::OK, Json(serde_json::json!({"model": model})))
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            servers.push(tokio::spawn(async move {
+                axum::serve(listener, backend).await.unwrap();
+            }));
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new(&url)
+                    .labels(std::collections::HashMap::from([(
+                        "model_id".into(),
+                        model.into(),
+                    )]))
+                    .build(),
+            );
+            ids.insert(model.to_string(), router.worker_registry.register(worker));
+        }
+        let request: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "public", "prompt": "test", "max_tokens": 2
+        }))
+        .unwrap();
+        let backends = vec!["old".to_string(), "new".to_string()];
+        let pinned = std::sync::Mutex::new(None);
+        let response = router
+            .route_typed_request_once(
+                None,
+                &request,
+                "/v1/completions",
+                Some("public"),
+                Some(&backends),
+                &pinned,
+                false,
+                "test",
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let selected = pinned.lock().unwrap().clone().unwrap();
+        assert_eq!(body["model"], selected);
+        router.worker_registry.begin_drain(&ids[&selected]).unwrap();
+        // A retry must fail rather than move the same request to another model.
+        let response = router
+            .route_typed_request_once(
+                None,
+                &request,
+                "/v1/completions",
+                Some("public"),
+                Some(&backends),
+                &pinned,
+                false,
+                "test",
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // A distinct request can still use the other backend group.
+        let response = router
+            .route_typed_request_once(
+                None,
+                &request,
+                "/v1/completions",
+                Some("public"),
+                Some(&backends),
+                &std::sync::Mutex::new(None),
+                false,
+                "test",
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        for server in servers {
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_withdrawal_preserves_an_open_http_response_stream() {
+        use futures::StreamExt;
+        let (sender, receiver) =
+            tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(4);
+        let receiver = Arc::new(std::sync::Mutex::new(Some(receiver)));
+        let backend = axum::Router::new().route(
+            "/v1/completions",
+            axum::routing::post(move || {
+                let receiver = receiver.lock().unwrap().take().unwrap();
+                async move {
+                    Response::new(Body::from_stream(
+                        tokio_stream::wrappers::ReceiverStream::new(receiver),
+                    ))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, backend).await.unwrap();
+        });
+        let router = create_test_regular_router();
+        for (id, _) in router.worker_registry.get_all_with_ids() {
+            router.worker_registry.remove(&id);
+        }
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new(&url).build());
+        let id = router.worker_registry.register(worker);
+        let request: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model", "prompt": "test", "stream": true, "max_tokens": 2
+        }))
+        .unwrap();
+        sender
+            .send(Ok(bytes::Bytes::from_static(b"data: first\n\n")))
+            .await
+            .unwrap();
+        let response = router
+            .route_typed_request_once(
+                None,
+                &request,
+                "/v1/completions",
+                None,
+                None,
+                &std::sync::Mutex::new(None),
+                true,
+                "test",
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(router.worker_registry.begin_drain(&id).unwrap().1, 1);
+        assert!(!router.worker_registry.finish_drain(&id));
+        let mut stream = response.into_body().into_data_stream();
+        assert_eq!(
+            stream.next().await.unwrap().unwrap(),
+            bytes::Bytes::from_static(b"data: first\n\n")
+        );
+        sender
+            .send(Ok(bytes::Bytes::from_static(b"data: second\n\n")))
+            .await
+            .unwrap();
+        assert_eq!(
+            stream.next().await.unwrap().unwrap(),
+            bytes::Bytes::from_static(b"data: second\n\n")
+        );
+        assert_eq!(router.worker_registry.drain_status(&id).unwrap().1, 1);
+        drop(sender);
+        assert!(stream.next().await.is_none());
+        drop(stream);
+        assert_eq!(router.worker_registry.drain_status(&id).unwrap().1, 0);
+        assert!(router.worker_registry.finish_drain(&id));
+        server.abort();
+    }
 
     fn create_test_regular_router() -> Router {
         // Create registries
