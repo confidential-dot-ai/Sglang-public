@@ -63,7 +63,7 @@ struct TopKBF16Config {
   static_assert(kElemsPerThread == 32);
 
   struct Smem {
-    uint32_t count_gt_eq;  // packed (gt << 16 | eq), the block-wide census prefix
+    uint32_t warp_census[kNumWarps];  // packed (gt << 16 | eq) of each warp's slices
     uint32_t pivot_bin;
     uint32_t pivot_remain;
     union {
@@ -200,7 +200,6 @@ __global__ __launch_bounds__(TopKBF16Config::kBlockSize, TopKBF16Config::kOccupa
     for (uint32_t idx = tx; idx < kZeroVecs; idx += C::kBlockSize) {
       zeros.store(smem.histogram, idx);
     }
-    if (tx == 0) smem.count_gt_eq = 0;
   }
 
   // NOTE: we prefetch metadata like seq_len
@@ -315,13 +314,16 @@ __global__ __launch_bounds__(TopKBF16Config::kBlockSize, TopKBF16Config::kOccupa
   const uint32_t cnt_gt = __popc(gt_mask);
   const uint32_t cnt_eq = __popc(eq_mask);
 
-  // Block-wide exclusive prefix of (gt, eq), packed: one warp scan plus one shared atomic per
-  // warp. Warps land in arrival order, which is fine since the output is unordered.
+  // Block-wide exclusive prefix of (gt, eq), packed, in element order: the selection, and
+  // which of the elements equal to the pivot fill it, must not follow warp arrival order.
   const uint32_t local = cnt_gt << 16 | cnt_eq;
   const uint32_t warp_inc = warp::inclusive_sum(local, lane_id);
-  uint32_t warp_base = 0;
-  if (lane_id == kWarpThreads - 1) warp_base = atomicAdd(&smem.count_gt_eq, warp_inc);
-  warp_base = __shfl_sync(warp::kFullMask, warp_base, kWarpThreads - 1);
+  if (lane_id == kWarpThreads - 1) smem.warp_census[warp_id] = warp_inc;
+  __syncthreads();
+  const uint32_t census = lane_id < C::kNumWarps ? smem.warp_census[lane_id] : 0;
+  const uint32_t census_inc = warp::inclusive_sum(census, lane_id);
+  const uint32_t warp_base = __shfl_sync(warp::kFullMask, census_inc - census, warp_id);
+  const uint32_t totals = __shfl_sync(warp::kFullMask, census_inc, C::kNumWarps - 1);
   const uint32_t before = warp_base + warp_inc - local;
 
   // Everything above the pivot is taken, plus `remain` of the elements equal to it.
@@ -329,21 +331,20 @@ __global__ __launch_bounds__(TopKBF16Config::kBlockSize, TopKBF16Config::kOccupa
   if (pivot_bits == C::kNegZeroBits) {
     /// NOTE: the census compares as floats, so a -0 pivot also sees +0 as equal while the
     /// histogram ranked +0 above it. Both are worth the same, so let the equal quota absorb
-    /// them: the quota then has to come from the census total (one extra barrier, rare).
-    __syncthreads();
-    eq_total = topk - (smem.count_gt_eq >> 16);
+    /// them: the quota then has to come from the census total.
+    eq_total = topk - (totals >> 16);
   }
   const uint32_t gt_before = before >> 16;
   const uint32_t eq_before = before & 0xFFFF;
   const uint32_t eq_start = min(eq_before, eq_total);
   const uint32_t eq_quota = min(eq_before + cnt_eq, eq_total) - eq_start;
-  // keep only `eq_quota` of the equal bits (which ones does not matter)
+  // the equal elements at the lowest indices fill the quota
   if (eq_quota == 0) {
     eq_mask = 0;
   } else {
 #pragma unroll 1
     for (uint32_t n = cnt_eq; n > eq_quota; --n) {
-      eq_mask &= eq_mask - 1;
+      eq_mask &= ~(1u << (31 - __clz(eq_mask)));
     }
   }
 
@@ -361,7 +362,6 @@ __global__ __launch_bounds__(TopKBF16Config::kBlockSize, TopKBF16Config::kOccupa
 
   // Slots past the census total were never staged (only NaN scores cause that: counted by the
   // histogram, never selected); write -1 there.
-  const uint32_t totals = smem.count_gt_eq;
   const uint32_t num_staged = (totals >> 16) + min(totals & 0xFFFFu, eq_total);
   // TODO(perf): unroll once k regularly exceeds 512.
   for (uint32_t t = tx; t < topk; t += C::kBlockSize) {

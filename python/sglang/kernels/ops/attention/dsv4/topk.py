@@ -93,10 +93,10 @@ def topk_transform_bf16_small(
     Row ``b`` selects the ``k = out_page_indices.shape[1]`` best of its first
     ``seq_lens[b]`` scores (``k`` at most 2048); a selected index ``i`` is
     written as ``page_table[b, i // page_size] * page_size + i % page_size``,
-    in no particular order, and ``-1`` fills the slots past
+    in ascending ``i`` order, and ``-1`` fills the slots past
     ``min(k, seq_lens[b])``. Selection is exact (two radix passes over the raw
-    bf16 bytes locate the k-th largest value); which of the elements equal to
-    it fill the last slots is arbitrary. NaN scores are not supported.
+    bf16 bytes locate the k-th largest value), and the elements equal to it at
+    the lowest indices fill the last slots. NaN scores are not supported.
     """
     _jit_topk_bf16_small_module().topk_transform(
         scores, seq_lens, page_table, out_page_indices, page_size
@@ -410,7 +410,7 @@ def topk_transform_sparse(
     out_indices: torch.Tensor,
 ) -> None:
     """Top-``k`` (``k = out_indices.shape[1]``) of each row of the bf16 sparse
-    ``logits`` within its first ``valid_lens[b]`` columns, ``-1`` padded, unordered;
+    ``logits`` within its first ``valid_lens[b]`` columns, in column order, ``-1`` padded;
     column ``j`` is written as ``blocks[b, j // 8] * 8 + j % 8``: pool slots for the
     published blocks as pool slots / 8, compressed positions for logical ids."""
     topk_transform_bf16_small(
