@@ -1,5 +1,6 @@
 """CPU-only checks: python3 -m unittest discover -s recipes/deepseek-v41/launcher."""
 
+import argparse
 import importlib.util
 import json
 import os
@@ -20,6 +21,10 @@ def load(name):
 
 
 launch = load("launch")
+ROUTER_ARGS = (
+    Path(__file__).resolve().parents[3]
+    / "sgl-model-gateway/bindings/python/src/sglang_router/router_args.py"
+)
 probe = load("probe_engram")
 car_probe = load("probe_custom_all_reduce")
 
@@ -604,6 +609,51 @@ class TestLaunch(unittest.TestCase):
         for args in cases:
             with self.subTest(args=args), self.assertRaises(ValueError):
                 launch.validate(self.args("--num-prefill", "3", *args))
+
+    @unittest.skipUnless(ROUTER_ARGS.exists(), "needs the sgl-model-gateway checkout")
+    def test_router_caps_parse_in_the_router_cli(self):
+        """The router's own parser must accept every flag the launcher passes: a
+        misspelt one makes the router exit only after the workers have loaded."""
+        spec = importlib.util.spec_from_file_location("router_args", ROUTER_ARGS)
+        router_args = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(router_args)
+        parser = argparse.ArgumentParser()
+        router_args.RouterArgs.add_cli_args(parser)
+
+        def parsed(*extra):
+            command = launch.build_plan(self.args(*extra))["router"]["command"]
+            start = command.index("sglang_router.launch_router") + 1
+            return router_args.RouterArgs.from_cli_args(
+                parser.parse_args(command[start:])
+            )
+
+        capped = parsed(
+            "--router-max-concurrent-requests", "96",
+            "--router-queue-size", "32",
+            "--router-queue-timeout-secs", "20",
+            "--router-max-images-per-request", "8",
+            "--router-max-inflight-images", "64",
+            "--router-max-inflight-megapixels", "500",
+        )  # fmt: skip
+        self.assertEqual(
+            (
+                capped.reject_video,
+                capped.max_concurrent_requests,
+                capped.queue_size,
+                capped.queue_timeout_secs,
+                capped.max_images_per_request,
+                capped.max_inflight_images,
+                capped.max_inflight_megapixels,
+            ),
+            (True, 96, 32, 20, 8, 64, 500),
+        )
+        # V4.1 has no video encoder, so video is refused unless opted out; every
+        # cap stays at the router default until set.
+        default = parsed()
+        self.assertTrue(default.reject_video)
+        self.assertEqual(default.max_concurrent_requests, -1)
+        self.assertEqual(default.max_inflight_images, 0)
+        self.assertFalse(parsed("--no-router-reject-video").reject_video)
 
     def test_target_only_control_disables_speculation_on_both_sides(self):
         plan = launch.build_plan(self.args("--no-dspark"))
