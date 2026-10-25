@@ -43,6 +43,7 @@ from sglang.srt.disaggregation.checksum import (
     state_indices_for_request,
 )
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
+from sglang.srt.disaggregation.divergence_debug import log_metadata_slot
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCachePreallocMixin,
     DecodeHiCacheTransferMixin,
@@ -2633,6 +2634,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         # Preserve the checksum before the metadata slot is freed so it can be
         # re-verified when the request enters a batch, including after retraction.
         idx = decode_req.metadata_buffer_index
+        if envs.SGLANG_DEBUG_PD_DIVERGENCE.get():
+            log_metadata_slot(
+                side="decode-recv",
+                room=decode_req.req.bootstrap_room,
+                buffers=self.metadata_buffers.transfer_buffers(),
+                index=idx,
+            )
         if self.scheduler.kv_checksum_computer is not None:
             decode_req.req.expected_kv_checksum = self.metadata_buffers.get_kv_checksum(
                 idx

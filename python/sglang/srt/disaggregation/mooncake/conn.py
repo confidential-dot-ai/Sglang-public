@@ -16,6 +16,10 @@ import zmq
 from prometheus_client import Counter
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
+from sglang.srt.disaggregation.divergence_debug import (
+    kv_checksummer,
+    log_prefill_chunk,
+)
 from sglang.srt.disaggregation.common.conn import (
     ABORT_ACK_TAG,
     ABORT_TAG,
@@ -307,6 +311,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self._staging_ctx = PrefillStagingContext() if self.enable_staging else None
             if self.enable_staging:
                 self._init_staging_buffers(len(self.transfer_queues))
+            self._divergence_kv = (
+                kv_checksummer(self.kv_args)
+                if envs.SGLANG_DEBUG_PD_DIVERGENCE.get()
+                else None
+            )
             for i, (queue, executor) in enumerate(
                 zip(self.transfer_queues, self.executors)
             ):
@@ -2507,6 +2516,16 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         # Skipped => nothing written for this aborted room; ack.
                         self._maybe_ack_drained_abort(kv_chunk.room)
                     continue
+
+                if envs.SGLANG_DEBUG_PD_DIVERGENCE.get():
+                    log_prefill_chunk(
+                        kv=self._divergence_kv,
+                        room=kv_chunk.room,
+                        pp_rank=self.pp_rank,
+                        page_indices=kv_chunk.prefill_kv_indices,
+                        first_page_position=kv_chunk.index_slice.start or 0,
+                        is_last_chunk=kv_chunk.is_last_chunk,
+                    )
 
                 if (
                     self.enable_staging

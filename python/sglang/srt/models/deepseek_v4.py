@@ -44,6 +44,11 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 )
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
+from sglang.srt.disaggregation.divergence_debug import (
+    LAYER_PROBES_ENABLED,
+    ensure_layer_probe_buffer,
+    layer_probe,
+)
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -3475,6 +3480,8 @@ class DeepseekV4CudaDecoderLayer(DeepseekV4DecoderLayerBase):
         call = hc_boundary.LayerCall(
             input_ids, input_ids_global, allow_cross_layer_fusion
         )
+        if LAYER_PROBES_ENABLED:
+            layer_probe(layer_id=self.layer_id, point="in", tensor=hidden_states)
         hidden_states = self.attn_boundary.prepare(
             hidden_states, forward_batch, read_context=call
         )
@@ -3483,6 +3490,8 @@ class DeepseekV4CudaDecoderLayer(DeepseekV4DecoderLayerBase):
             hidden_states = self._run_boundary_attention(
                 hidden_states, positions, forward_batch, quantized
             )
+            if LAYER_PROBES_ENABLED:
+                layer_probe(layer_id=self.layer_id, point="attn", tensor=hidden_states)
             hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(
             hidden_states, forward_batch, read_context=call
@@ -3498,7 +3507,10 @@ class DeepseekV4CudaDecoderLayer(DeepseekV4DecoderLayerBase):
                 return_moe_output=transport.return_moe_output,
                 leave_output_sum=True,
             )
-            return output.finish(hidden_states)
+            hidden_states = output.finish(hidden_states)
+        if LAYER_PROBES_ENABLED:
+            layer_probe(layer_id=self.layer_id, point="out", tensor=hidden_states)
+        return hidden_states
 
     @functools.cached_property
     def _can_fuse_attn_mhc(self) -> bool:
@@ -3705,6 +3717,8 @@ class DeepseekV4Model(nn.Module):
             if _is_cuda
             else None,
         )
+        if LAYER_PROBES_ENABLED:
+            ensure_layer_probe_buffer(torch.device("cuda", torch.cuda.current_device()))
         # Layers a CED-split prefill does not build keep their ids addressable.
         self.layers.extend(
             PPMissingLayer()
