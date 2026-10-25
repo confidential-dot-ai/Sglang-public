@@ -6,9 +6,31 @@
 name: dsv41
 
 services:
+  # Assembles DSV41_MODEL from pinned Hub sources when DSV41_CHECKPOINT names a
+  # spec (launcher/prepare_checkpoint.py); exits at once when it is unset or the
+  # checkpoint is already complete.
+  checkpoint:
+    image: ${DSV41_IMAGE:-dsv41-pd:latest}
+    command: [checkpoint]
+    environment:
+      MODEL: ${DSV41_MODEL:-/data/DeepSeek-V4.1-Flash}
+      CHECKPOINT_SPEC: ${DSV41_CHECKPOINT:-}
+      # Files to reuse instead of downloading (an earlier copy of a source repo).
+      CHECKPOINT_SEED: ${DSV41_CHECKPOINT_SEED:+/seed}
+      HF_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      # The model's parent, so the checkpoint directory can be created.
+      - ${DSV41_MODEL_ROOT:-/data}:${DSV41_MODEL_ROOT:-/data}
+      # Seed files are copied: hard links cannot cross into this mount.
+      - ${DSV41_CHECKPOINT_SEED:-${DSV41_MODEL_ROOT:-/data}}:/seed:ro
+    restart: "no"
+
   engram-cache:
     image: ${DSV41_IMAGE:-dsv41-pd:latest}
     command: [engram]
+    depends_on:
+      checkpoint:
+        condition: service_completed_successfully
     environment:
       MODEL: ${DSV41_MODEL:-/data/DeepSeek-V4.1-Flash}
     volumes:

@@ -2,8 +2,8 @@
 # every pair. dsv41-pd requires it; stopping this stops the pair first.
 [Unit]
 Description=DeepSeek-V4.1 Engram holder (container)
-Requires=docker.service
-After=docker.service
+Requires=docker.service dsv41-checkpoint.service
+After=docker.service dsv41-checkpoint.service
 
 [Service]
 WorkingDirectory=/home/ubuntu/sglang-private/recipes/deepseek-v41/container

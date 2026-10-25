@@ -1,12 +1,23 @@
 #!/usr/bin/env bash
-# `engram` holds the Engram pages, `pd` runs one PD pair through tp2-pd.sh with
-# the holder's PID; anything else runs as given (e.g. a probe).
+# `checkpoint` assembles $MODEL from pinned Hub sources when CHECKPOINT_SPEC names
+# one, `engram` holds the Engram pages, `pd` runs one PD pair through tp2-pd.sh
+# with the holder's PID; anything else runs as given (e.g. a probe).
 set -euo pipefail
 cd /opt/sglang
 export MODEL="${MODEL:-/data/DeepSeek-V4.1-Flash}"
 READY_FILE="${ENGRAM_READY_FILE:-/run/dsv41/engram.ready}"
 
 case "${1:-pd}" in
+checkpoint)
+    shift
+    if [[ -z "${CHECKPOINT_SPEC:-}" ]]; then
+        echo "No CHECKPOINT_SPEC; using $MODEL as is"
+        exit 0
+    fi
+    exec python recipes/deepseek-v41/launcher/prepare_checkpoint.py \
+        --spec "$CHECKPOINT_SPEC" --local-dir "$MODEL" \
+        ${CHECKPOINT_SEED:+--seed-dir "$CHECKPOINT_SEED"} "$@"
+    ;;
 engram)
     shift
     exec python recipes/deepseek-v41/launcher/hold_engram_cache.py \
