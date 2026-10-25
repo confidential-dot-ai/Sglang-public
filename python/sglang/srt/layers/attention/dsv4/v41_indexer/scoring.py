@@ -286,7 +286,9 @@ def topk_ragged(
     offsets: torch.Tensor,
 ) -> None:
     """Top-k of each row's first ``lens`` columns plus ``offsets`` into ``out``,
-    ``-1`` padded, unordered: DeepSelect for bf16 logits, top-k v2 for fp32."""
+    ascending, ``-1`` padded: DeepSelect for bf16 logits, top-k v2 for fp32."""
+    from sglang.kernels.ops.attention.dsv4 import sort_selection_
+
     if logits.dtype == torch.bfloat16:
         from sglang.kernels.ops.attention.deep_select import topk
 
@@ -298,10 +300,11 @@ def topk_ragged(
             output_idx_offset=offsets,
             idx_oob_fill_value=-1,
         )
-        return
-    from sglang.kernels.ops.attention.dsv4 import topk_transform_ragged_v2
+    else:
+        from sglang.kernels.ops.attention.dsv4 import topk_transform_ragged_v2
 
-    topk_transform_ragged_v2(logits, lens, out_offsets=offsets, out_indices=out)
+        topk_transform_ragged_v2(logits, lens, out_offsets=offsets, out_indices=out)
+    sort_selection_(out)
 
 
 def dense_prefill_topk(
