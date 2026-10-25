@@ -150,6 +150,28 @@ def topk_transform_paged_torch(
         out_raw_indices.copy_(torch.where(reach, idx, -1).to(torch.int32))
 
 
+def sort_selection_(indices: torch.Tensor) -> None:
+    """Sort each row of a top-k selection ascending in place, ``-1`` padding last.
+
+    The radix top-k kernels claim output slots with shared-memory atomics, so a
+    row past ``topk`` candidates comes out in a different order every run, and
+    the sparse attention's rounding follows that order. Rows at or under
+    ``topk`` are already ascending."""
+    pad = torch.iinfo(indices.dtype).max
+    keys = indices.masked_fill(indices < 0, pad).sort(dim=-1).values
+    indices.copy_(keys.masked_fill(keys == pad, -1))
+
+
+def selection_page_indices(
+    raw_indices: torch.Tensor, page_tables: torch.Tensor, page_size: int
+) -> torch.Tensor:
+    """Pool slots of the positions ``raw_indices`` through ``page_tables``, as the
+    paged top-k kernels compute them; ``-1`` stays ``-1``."""
+    idx = raw_indices.clamp_min(0).to(torch.int64)
+    slots = page_tables.gather(-1, idx // page_size) * page_size + idx % page_size
+    return torch.where(raw_indices >= 0, slots, -1).to(torch.int32)
+
+
 # metadata is (batch+1, 2) int32: row 0 = {cluster_threshold, num_cluster_items};
 # rows 1..N = {batch_id, seq_len} of items routed to the persistent cluster pool.
 _PLAN_METADATA_INTS_PER_BATCH = 2

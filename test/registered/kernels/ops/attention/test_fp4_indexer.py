@@ -1128,5 +1128,49 @@ def test_flat_indexer_slot_count_does_not_recompile(write_raw):
     assert len(hashes) == 1, "Changing the visible slot count must reuse the kernel"
 
 
+@pytest.mark.skipif(_is_xpu, reason="The paged top-k kernels are CUDA JIT kernels")
+@pytest.mark.parametrize("use_topk_v2", [True, False])
+def test_paged_selection_is_ascending_positions(use_topk_v2):
+    """A decode row past topk candidates is selected in ascending position order,
+    then mapped to pool slots: the sparse attention rounds in selection order, and
+    a position's slot changes with the allocation, so only position order repeats."""
+    from sglang.kernels.ops.attention.dsv4 import plan_topk_v2
+    from sglang.srt.layers.attention.dsv4.indexer import (
+        topk_transform_paged_from_metadata,
+    )
+
+    torch.manual_seed(5)
+    page_size, topk, pages_per_row = 128, 512, 16
+    lens = torch.tensor(
+        [1, 511, 512, 513, 700, 1500, 2048, 2048], dtype=torch.int32, device="cuda"
+    )
+    rows = lens.shape[0]
+    page_table = torch.stack(
+        [torch.randperm(4096, device="cuda")[:pages_per_row] for _ in range(rows)]
+    ).to(torch.int32)
+    logits = torch.randn(rows, pages_per_row * page_size, device="cuda")
+    metadata = SimpleNamespace(
+        compressed_seq_lens=lens,
+        page_table=page_table,
+        compressed_page_size=page_size,
+        use_topk_v2=use_topk_v2,
+        topk_metadata=plan_topk_v2(lens) if use_topk_v2 else None,
+    )
+    pages = torch.full((rows, topk), -7, dtype=torch.int32, device="cuda")
+    topk_transform_paged_from_metadata(logits.clone(), metadata, pages)
+
+    columns = torch.arange(logits.shape[1], device="cuda")
+    masked = logits.masked_fill(columns >= lens[:, None], -torch.inf)
+    positions = masked.topk(topk, dim=-1).indices.sort(dim=-1).values
+    positions = torch.where(positions < lens[:, None], positions, -1)
+    clamped = positions.clamp_min(0)
+    expected = torch.where(
+        positions >= 0,
+        page_table.gather(-1, clamped // page_size) * page_size + clamped % page_size,
+        -1,
+    )
+    torch.testing.assert_close(pages, expected.int(), rtol=0, atol=0)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

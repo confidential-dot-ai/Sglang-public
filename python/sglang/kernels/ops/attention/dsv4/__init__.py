@@ -26,6 +26,8 @@ from .elementwise import (
 from .fp8_wo_a import sglang_per_token_group_quant_fp8_dsv4_wo_a
 from .topk import (
     plan_topk_v2,
+    selection_page_indices,
+    sort_selection_,
     topk_transform_kpool_ragged_v2,
     topk_transform_kpool_v2,
     topk_transform_paged,
@@ -59,4 +61,6 @@ __all__ = [
     "topk_transform_paged_v2",
     "topk_transform_ragged_v2",
     "plan_topk_v2",
+    "selection_page_indices",
+    "sort_selection_",
 ]
