@@ -171,6 +171,38 @@ pub(crate) fn init_metrics() {
         "smg_http_rate_limit_total",
         "Rate limiting decisions by result (allowed/rejected)"
     );
+    describe_gauge!(
+        "smg_admission_limit",
+        "Current admission ceiling (max concurrent requests on this gateway)"
+    );
+    describe_gauge!(
+        "smg_admission_inflight",
+        "Requests currently holding an admission permit"
+    );
+    describe_counter!(
+        "smg_admission_rejected_total",
+        "Requests refused by the admission limiter, by reason"
+    );
+    describe_gauge!(
+        "smg_image_limit",
+        "Ceiling on images in flight on this gateway (max_inflight_images; 0 = disabled)"
+    );
+    describe_gauge!(
+        "smg_image_inflight",
+        "Images held by admitted requests whose responses are still open"
+    );
+    describe_gauge!(
+        "smg_image_pixels_limit",
+        "Ceiling on image area in flight, in pixels (0 = disabled)"
+    );
+    describe_gauge!(
+        "smg_image_pixels_inflight",
+        "Image area held by admitted requests whose responses are still open, in pixels"
+    );
+    describe_counter!(
+        "smg_image_rejected_total",
+        "Requests refused by an image admission limit, by endpoint"
+    );
 
     // Layer 2: Router metrics
     describe_counter!(
@@ -522,6 +554,48 @@ impl Metrics {
         counter!(
             "smg_http_rate_limit_total",
             "result" => result
+        )
+        .increment(1);
+    }
+
+    /// Publish the admission ceiling alongside in-flight occupancy.
+    ///
+    /// Both are sampled from the live TokenBucket at each admission decision, so
+    /// a 429 spike can be attributed to load (inflight at limit) rather than to
+    /// someone lowering the limit via POST /admission.
+    pub fn set_admission_state(limit: f64, in_flight: f64) {
+        gauge!("smg_admission_limit").set(limit);
+        gauge!("smg_admission_inflight").set(in_flight);
+    }
+
+    pub fn record_admission_rejected(reason: &'static str) {
+        counter!(
+            "smg_admission_rejected_total",
+            "reason" => reason
+        )
+        .increment(1);
+    }
+
+    /// Publish the image ceilings; set once at startup, they have no runtime retune.
+    pub fn set_image_limits(images: i64, pixels: i64) {
+        gauge!("smg_image_limit").set(images as f64);
+        gauge!("smg_image_pixels_limit").set(pixels as f64);
+    }
+
+    pub fn set_image_inflight(in_flight: i64) {
+        gauge!("smg_image_inflight").set(in_flight as f64);
+    }
+
+    /// Image area in flight, in pixels: it rises before an out-of-memory, where
+    /// the count does not.
+    pub fn set_image_pixels_inflight(in_flight: i64) {
+        gauge!("smg_image_pixels_inflight").set(in_flight as f64);
+    }
+
+    pub fn record_image_rejected(endpoint: &'static str) {
+        counter!(
+            "smg_image_rejected_total",
+            "endpoint" => endpoint
         )
         .increment(1);
     }

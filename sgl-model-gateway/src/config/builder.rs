@@ -229,6 +229,31 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn reject_video(mut self, reject: bool) -> Self {
+        self.config.reject_video = reject;
+        self
+    }
+
+    pub fn max_inflight_images(mut self, max: i64) -> Self {
+        self.config.max_inflight_images = max;
+        self
+    }
+
+    pub fn max_inflight_megapixels(mut self, max: i64) -> Self {
+        self.config.max_inflight_megapixels = max;
+        self
+    }
+
+    pub fn max_images_per_request(mut self, max: i64) -> Self {
+        self.config.max_images_per_request = max;
+        self
+    }
+
+    pub fn unmeasured_image_megapixels(mut self, megapixels: i64) -> Self {
+        self.config.unmeasured_image_megapixels = megapixels;
+        self
+    }
+
     pub fn rate_limit_tokens_per_second(mut self, tokens: i32) -> Self {
         self.config.rate_limit_tokens_per_second = Some(tokens);
         self

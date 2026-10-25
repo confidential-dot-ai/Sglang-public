@@ -349,9 +349,57 @@ struct CliArgs {
     #[arg(long, default_value_t = 60, help_heading = "Rate Limiting")]
     queue_timeout_secs: u64,
 
-    /// Token bucket refill rate (tokens per second)
+    /// Token bucket refill rate (tokens per second). Unset keeps
+    /// --max-concurrent-requests a pure concurrency limit.
     #[arg(long, help_heading = "Rate Limiting")]
     rate_limit_tokens_per_second: Option<i32>,
+
+    /// Refuse chat requests carrying video parts with 400. Set this when the
+    /// deployment has declared it does not accept video traffic.
+    #[arg(long, env = "SMG_REJECT_VIDEO", help_heading = "Rate Limiting")]
+    reject_video: bool,
+
+    /// Reject with 429 any chat request whose image parts would push the
+    /// number of images in flight on this gateway above N (0 = disabled)
+    #[arg(
+        long,
+        value_name = "N",
+        env = "SMG_MAX_INFLIGHT_IMAGES",
+        default_value_t = 0,
+        help_heading = "Rate Limiting"
+    )]
+    max_inflight_images: i64,
+
+    /// Image area admitted concurrently, in megapixels (0 = disabled)
+    #[arg(
+        long,
+        value_name = "MP",
+        env = "SMG_MAX_INFLIGHT_MEGAPIXELS",
+        default_value_t = 0,
+        help_heading = "Rate Limiting"
+    )]
+    max_inflight_megapixels: i64,
+
+    /// Images accepted in a single request, 400 above it (0 = disabled)
+    #[arg(
+        long,
+        value_name = "N",
+        env = "SMG_MAX_IMAGES_PER_REQUEST",
+        default_value_t = 0,
+        help_heading = "Rate Limiting"
+    )]
+    max_images_per_request: i64,
+
+    /// Area charged to an image whose dimensions cannot be read, in megapixels
+    /// (0 = the built-in default)
+    #[arg(
+        long,
+        value_name = "MP",
+        env = "SMG_UNMEASURED_IMAGE_MEGAPIXELS",
+        default_value_t = 0,
+        help_heading = "Rate Limiting"
+    )]
+    unmeasured_image_megapixels: i64,
 
     // ==================== Retry Configuration ====================
     /// Maximum number of retry attempts
@@ -1017,6 +1065,11 @@ impl CliArgs {
             .max_concurrent_requests(self.max_concurrent_requests)
             .queue_size(self.queue_size)
             .queue_timeout_secs(self.queue_timeout_secs)
+            .reject_video(self.reject_video)
+            .max_inflight_images(self.max_inflight_images)
+            .max_inflight_megapixels(self.max_inflight_megapixels)
+            .max_images_per_request(self.max_images_per_request)
+            .unmeasured_image_megapixels(self.unmeasured_image_megapixels)
             .cors_allowed_origins(self.cors_allowed_origins.clone())
             .retry_config(RetryConfig {
                 max_retries: self.retry_max_retries,

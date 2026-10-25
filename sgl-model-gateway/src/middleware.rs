@@ -32,7 +32,7 @@ use crate::{
         inflight_tracker::InFlightRequestTracker,
         metrics::{method_to_static_str, metrics_labels, Metrics},
     },
-    routers::error::extract_error_code_from_response,
+    routers::error::{self, extract_error_code_from_response},
     server::AppState,
     wasm::{
         module::{MiddlewareAttachPoint, WasmModuleAttachPoint},
@@ -45,6 +45,13 @@ use crate::{
         types::WasmComponentInput,
     },
 };
+
+/// `Retry-After` on an admission rejection.
+///
+/// Arbitrary; a permit frees whenever some request completes, and the gateway
+/// has no estimate of that. Picked to be long enough that a retrying client
+/// does not re-enter the ceiling immediately.
+const ADMISSION_RETRY_AFTER_SECONDS: u64 = 5;
 
 /// A body wrapper that holds a token and returns it when the body is fully consumed or dropped.
 /// This ensures that for streaming responses, the token is only returned after the entire
@@ -101,6 +108,41 @@ impl http_body::Body for TokenGuardBody {
 
     fn size_hint(&self) -> http_body::SizeHint {
         self.inner.size_hint()
+    }
+}
+
+/// Holds an acquired token and returns it on drop unless disarmed.
+///
+/// Covers the window between acquiring a permit and handing it to
+/// `TokenGuardBody`: a request cancelled in that window would otherwise drop
+/// its permit, and a pure-concurrency bucket has no refill to recover it.
+struct PermitGuard {
+    token_bucket: Option<Arc<TokenBucket>>,
+    tokens: f64,
+}
+
+impl PermitGuard {
+    fn new(token_bucket: Arc<TokenBucket>, tokens: f64) -> Self {
+        Self {
+            token_bucket: Some(token_bucket),
+            tokens,
+        }
+    }
+
+    /// Hands the bucket to the body guard, which owns the return from here.
+    fn disarm(mut self) -> Arc<TokenBucket> {
+        self.token_bucket
+            .take()
+            .expect("PermitGuard is armed until disarmed exactly once")
+    }
+}
+
+impl Drop for PermitGuard {
+    fn drop(&mut self) {
+        if let Some(bucket) = self.token_bucket.take() {
+            debug!("PermitGuard: request dropped before response, returning token");
+            bucket.return_tokens_sync(self.tokens);
+        }
     }
 }
 
@@ -434,7 +476,12 @@ impl QueueProcessor {
             if self.token_bucket.try_acquire(1.0).await.is_ok() {
                 // Got token immediately
                 debug!("Queue: acquired token immediately for queued request");
-                let _ = queued.permit_tx.send(Ok(()));
+                // The token is already out of the bucket, so a waiter that has
+                // gone away (client disconnected, request cancelled) strands it.
+                if queued.permit_tx.send(Ok(())).is_err() {
+                    debug!("Queue: waiter gone before handoff, returning token");
+                    self.token_bucket.return_tokens_sync(1.0);
+                }
             } else {
                 // Need to wait for token
                 let token_bucket = self.token_bucket.clone();
@@ -447,7 +494,10 @@ impl QueueProcessor {
                         .is_ok()
                     {
                         debug!("Queue: acquired token after waiting");
-                        let _ = queued.permit_tx.send(Ok(()));
+                        if queued.permit_tx.send(Ok(())).is_err() {
+                            debug!("Queue: waiter gone before handoff, returning token");
+                            token_bucket.return_tokens_sync(1.0);
+                        }
                     } else {
                         warn!("Queue: request timed out waiting for token");
                         let _ = queued.permit_tx.send(Err(StatusCode::REQUEST_TIMEOUT));
@@ -534,13 +584,17 @@ pub async fn concurrency_limit_middleware(
     if token_bucket.try_acquire(1.0).await.is_ok() {
         debug!("Acquired token immediately");
         Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_ALLOWED);
+        Metrics::set_admission_state(token_bucket.capacity(), token_bucket.in_flight());
+        // Held across the handler so a cancelled request returns its token;
+        // `TokenGuardBody` only covers the window once the body exists.
+        let permit = PermitGuard::new(token_bucket, 1.0);
         let response = next.run(request).await;
 
         // Wrap the response body with TokenGuardBody to return token when stream ends
         // This ensures that for streaming responses, the token is only returned
         // after the entire stream has been sent to the client.
         let (parts, body) = response.into_parts();
-        let guarded_body = TokenGuardBody::new(body, token_bucket, 1.0);
+        let guarded_body = TokenGuardBody::new(body, permit.disarm(), 1.0);
         Response::from_parts(parts, Body::new(guarded_body))
     } else {
         // No tokens available, try to queue if enabled
@@ -573,25 +627,41 @@ pub async fn concurrency_limit_middleware(
                                 EMBEDDINGS_QUEUE_SIZE.fetch_sub(1, Ordering::Relaxed);
                             }
 
+                            Metrics::set_admission_state(
+                                token_bucket.capacity(),
+                                token_bucket.in_flight(),
+                            );
+                            // See the immediate-acquire path: the permit is live
+                            // from here, not from when the body is built.
+                            let permit = PermitGuard::new(token_bucket, 1.0);
                             let response = next.run(request).await;
 
                             // Wrap the response body with TokenGuardBody to return token when stream ends
                             let (parts, body) = response.into_parts();
-                            let guarded_body = TokenGuardBody::new(body, token_bucket, 1.0);
+                            let guarded_body = TokenGuardBody::new(body, permit.disarm(), 1.0);
                             Response::from_parts(parts, Body::new(guarded_body))
                         }
                         Ok(Err(status)) => {
                             warn!("Queue returned error status: {}", status);
                             Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
+                            Metrics::record_admission_rejected("queue_timeout");
                             // Dequeue for embeddings on error
                             if is_embeddings {
                                 EMBEDDINGS_QUEUE_SIZE.fetch_sub(1, Ordering::Relaxed);
                             }
-                            status.into_response()
+                            // Rejected because we stayed over capacity for the
+                            // whole wait, so this is rate limiting; the 408 the
+                            // queue reports blames the caller for our own load.
+                            error::too_many_requests(
+                                "admission_queue_timeout",
+                                "Timed out waiting for capacity.",
+                                ADMISSION_RETRY_AFTER_SECONDS,
+                            )
                         }
                         Err(_) => {
                             error!("Queue response channel closed");
                             Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
+                            Metrics::record_admission_rejected("queue_channel_closed");
                             // Dequeue for embeddings on channel error
                             if is_embeddings {
                                 EMBEDDINGS_QUEUE_SIZE.fetch_sub(1, Ordering::Relaxed);
@@ -603,13 +673,25 @@ pub async fn concurrency_limit_middleware(
                 Err(_) => {
                     warn!("Request queue is full, returning 429");
                     Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
-                    StatusCode::TOO_MANY_REQUESTS.into_response()
+                    Metrics::record_admission_rejected("queue_full");
+                    Metrics::set_admission_state(token_bucket.capacity(), token_bucket.in_flight());
+                    error::too_many_requests(
+                        "concurrency_limit_exceeded",
+                        "Server is at its concurrency limit and the wait queue is full.",
+                        ADMISSION_RETRY_AFTER_SECONDS,
+                    )
                 }
             }
         } else {
             warn!("No tokens available and queuing is disabled, returning 429");
             Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
-            StatusCode::TOO_MANY_REQUESTS.into_response()
+            Metrics::record_admission_rejected("no_queue");
+            Metrics::set_admission_state(token_bucket.capacity(), token_bucket.in_flight());
+            error::too_many_requests(
+                "concurrency_limit_exceeded",
+                "Server is at its concurrency limit.",
+                ADMISSION_RETRY_AFTER_SECONDS,
+            )
         }
     }
 }

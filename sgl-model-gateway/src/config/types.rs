@@ -27,6 +27,34 @@ pub struct RouterConfig {
     pub worker_startup_check_interval_secs: u64,
     pub dp_aware: bool,
     pub api_key: Option<String>,
+    /// Refuse chat requests carrying video parts. Set when the deployment has
+    /// declared that it does not accept video traffic.
+    #[serde(default)]
+    pub reject_video: bool,
+    /// Ceiling on the number of images in flight on this gateway. A chat
+    /// request whose image parts would push the total above it is refused with
+    /// 429; slots are held until its response body is done. 0 disables.
+    #[serde(default)]
+    pub max_inflight_images: i64,
+    /// Image area admitted concurrently, in megapixels. 0 disables.
+    ///
+    /// Count alone does not bound preprocessing: 200 thumbnails and 200
+    /// full-resolution photographs are the same count. Calibrate per
+    /// deployment; the value depends on where images are preprocessed.
+    #[serde(default)]
+    pub max_inflight_megapixels: i64,
+    /// Images accepted in a single request (400 above it). 0 disables.
+    ///
+    /// The in-flight ceilings bound concurrency; this bounds the request
+    /// itself, so the boundary does not move with load.
+    #[serde(default)]
+    pub max_images_per_request: i64,
+    /// Area charged to an image whose dimensions cannot be read, in megapixels.
+    ///
+    /// Remote URLs above all: the router does not fetch them, so their size is
+    /// unknowable at admission. 0 falls back to `UNMEASURED_IMAGE_PIXELS`.
+    #[serde(default)]
+    pub unmeasured_image_megapixels: i64,
     pub discovery: Option<DiscoveryConfig>,
     pub metrics: Option<MetricsConfig>,
     pub trace_config: Option<TraceConfig>,
@@ -45,7 +73,10 @@ pub struct RouterConfig {
     pub max_concurrent_requests: i32,
     pub queue_size: usize,
     pub queue_timeout_secs: u64,
-    /// If not set, defaults to max_concurrent_requests
+    /// Token bucket refill rate. If not set, the bucket runs in pure
+    /// concurrency mode (permits return only on request completion), which is
+    /// what `max_concurrent_requests` and `POST /admission` describe. Setting
+    /// this opts into throughput rate limiting instead.
     pub rate_limit_tokens_per_second: Option<i32>,
     pub cors_allowed_origins: Vec<String>,
     pub retry: RetryConfig,
@@ -515,6 +546,11 @@ impl Default for RouterConfig {
             worker_startup_check_interval_secs: 30,
             dp_aware: false,
             api_key: None,
+            reject_video: false,
+            max_inflight_images: 0,
+            max_inflight_megapixels: 0,
+            max_images_per_request: 0,
+            unmeasured_image_megapixels: 0,
             discovery: None,
             metrics: None,
             trace_config: None,
@@ -564,6 +600,15 @@ impl RouterConfig {
             mode,
             policy,
             ..Default::default()
+        }
+    }
+
+    /// Pixels charged to an image whose dimensions cannot be read.
+    pub fn unmeasured_image_pixels(&self) -> u64 {
+        if self.unmeasured_image_megapixels <= 0 {
+            crate::media_policy::UNMEASURED_IMAGE_PIXELS
+        } else {
+            (self.unmeasured_image_megapixels as u64).saturating_mul(1_000_000)
         }
     }
 
