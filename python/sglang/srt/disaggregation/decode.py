@@ -3280,6 +3280,9 @@ class SchedulerDisaggregationDecodeMixin:
     ) -> NextBatchPlan:
         """Process prebuilt batch and schedule the next decode batch."""
         if ced_split_enabled():
+            # The prebuilt path below is the other caller; without this a grammar
+            # request never reaches preallocation, so prefill waits on its bootstrap.
+            self._promote_ready_grammar_requests()
             running_batch = self._merge_ced_tail_batch(running_batch)
             tail_batch = self._get_new_ced_tail_batch(running_batch)
             if tail_batch is not None:
@@ -3490,14 +3493,17 @@ class SchedulerDisaggregationDecodeMixin:
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_transfer_failed_reqs()
 
+    def _promote_ready_grammar_requests(self: Scheduler) -> None:
+        """Queue requests whose grammar finished compiling for preallocation."""
+        if self.grammar_manager.has_waiting_grammars():
+            for req in self.grammar_manager.get_ready_grammar_requests():
+                self._add_request_to_queue(req)
+
     def _get_new_prebuilt_batch(
         self: Scheduler, running_batch: ScheduleBatch
     ) -> Optional[ScheduleBatch]:
         """Create a schedulebatch for fake completed prefill"""
-        if self.grammar_manager.has_waiting_grammars():
-            ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
-            for req in ready_grammar_requests:
-                self._add_request_to_queue(req)
+        self._promote_ready_grammar_requests()
 
         if len(self.waiting_queue) == 0:
             return None

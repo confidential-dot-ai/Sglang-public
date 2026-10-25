@@ -56,6 +56,7 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     build_kv_layer_ids,
     build_staging_slot_metadata,
+    ced_split_enabled,
     disagg_swa_transfer_window,
     get_dsa_tail_state_indices,
     get_kv_class,
@@ -1033,7 +1034,10 @@ class SchedulerDisaggregationPrefillMixin:
                     continue
 
                 req.output_ids.append(next_token_id)
-                if req.grammar is not None:
+                # A CED-split prefill's token is a placeholder that decode discards
+                # before sampling the first token itself, so it must not advance
+                # the grammar.
+                if req.grammar is not None and not ced_split_enabled():
                     try:
                         req.grammar.accept_token(next_token_id)
                     except ValueError as e:
