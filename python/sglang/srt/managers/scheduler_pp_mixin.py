@@ -4,12 +4,13 @@ import logging
 from collections import defaultdict, deque
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed
 
 from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.disaggregation.divergence_debug import ProxyChecksums
 from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
 from sglang.srt.distributed.parallel_state import P2PWork
@@ -46,13 +47,32 @@ if TYPE_CHECKING:
 
 def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
     """Check if output send/recv can be skipped for this batch."""
+    if batch is None or batch.forward_mode != ForwardMode.EXTEND:
+        return False
+    if batch.return_logprob:
+        return False
+    if _ced_prefill_needs_no_output(batch):
+        return True
     return (
         envs.SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM.get()
-        and batch is not None
-        and batch.forward_mode == ForwardMode.EXTEND
         and len(batch.reqs) == 1
         and not batch.contains_last_prefill_chunk
-        and not batch.return_logprob
+    )
+
+
+def _ced_prefill_needs_no_output(batch: ScheduleBatch) -> bool:
+    # A CED-split prefill runs only the encoder and decode samples the first token
+    # itself, so the last stage's token is never read; every stage decides this
+    # from the batch alone, which keeps each skipped send matched to its recv.
+    from sglang.srt.disaggregation.utils import ced_split_enabled
+
+    return (
+        ced_split_enabled()
+        and get_disagg().disaggregation_mode == "prefill"
+        and not any(
+            req.return_sampling_mask or req.return_routed_experts
+            for req in batch.reqs
+        )
     )
 
 
@@ -89,6 +109,9 @@ class PPBatchMetadata:
     # composition that actually ran the forward.
     fwd_batch: Optional[ScheduleBatch] = None
     verify_out_cache_loc: Optional[torch.Tensor] = None
+    # CED boundary capture of the stage that ran the boundary layer; the rebuilt
+    # result must carry it or prefill never writes the handoff slot.
+    ced_boundary: Optional[Any] = None
 
 
 class SchedulerPPMixin:
@@ -251,6 +274,11 @@ class SchedulerPPMixin:
         release_rids: Optional[List[str]] = None
         send_transfer_work = []
         send_release_work = []
+        proxy_checksums = (
+            ProxyChecksums(torch.device("cuda", torch.cuda.current_device()))
+            if envs.SGLANG_DEBUG_PD_DIVERGENCE.get()
+            else None
+        )
 
         while True:
             server_is_idle = True
@@ -294,6 +322,13 @@ class SchedulerPPMixin:
                 if cur_batch:
                     server_is_idle = False
                     pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                    if proxy_checksums is not None and pp_proxy_tensors is not None:
+                        proxy_checksums.submit(
+                            side="recv",
+                            tensors=pp_proxy_tensors.tensors,
+                            ready_event=self.pp_proxy_recv_event,
+                            batch=cur_batch,
+                        )
 
                 if get_parallel().pp_async_batch_depth > 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
@@ -306,6 +341,8 @@ class SchedulerPPMixin:
                 if cur_batch:
                     if self.enable_staging:
                         self.maybe_prefetch_staging_for_batch(cur_batch)
+                    if proxy_checksums is not None:
+                        proxy_checksums.begin_layer_probes(self.forward_stream)
                     result, self.launch_event = self._pp_launch_batch(
                         mb_id,
                         cur_batch,
@@ -313,6 +350,23 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+                    if proxy_checksums is not None:
+                        probes_read = proxy_checksums.submit_layer_probes(
+                            ready_event=self.launch_event, batch=cur_batch
+                        )
+                        if probes_read is not None:
+                            self.forward_stream.wait_event(probes_read)
+                    if proxy_checksums is not None and not self.pp_group.is_last_rank:
+                        # A graph run's proxy is its static output, which the next
+                        # forward overwrites; hold that forward until it is hashed.
+                        self.forward_stream.wait_event(
+                            proxy_checksums.submit(
+                                side="send",
+                                tensors=result.pp_hidden_states_proxy_tensors.tensors,
+                                ready_event=self.launch_event,
+                                batch=cur_batch,
+                            )
+                        )
                 if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -686,6 +740,21 @@ class SchedulerPPMixin:
         event.record(self.pp_comm_stream)
         return event
 
+    def _pp_record_cross_stream_use(
+        self: Scheduler, tensor_dict: Dict[str, torch.Tensor], streams: tuple
+    ) -> None:
+        # The caching allocator reuses a freed block on its allocating stream at
+        # once, and NCCL work.wait() (TORCH_NCCL_AVOID_RECORD_STREAMS) orders only
+        # the comm stream; without this a sent proxy is overwritten by the next
+        # forward, and a received one by the next recv, while still in use.
+        # Without a comm stream a received proxy is allocated on the schedule
+        # stream but read on the forward stream, so it needs the same record.
+        for tensor in tensor_dict.values():
+            if isinstance(tensor, torch.Tensor) and tensor.is_cuda:
+                for stream in streams:
+                    if stream is not None:
+                        tensor.record_stream(stream)
+
     def _pp_commit_comm_work(
         self: Scheduler,
         work: List[P2PWork],
@@ -870,6 +939,7 @@ class SchedulerPPMixin:
                     async_send=async_send,
                 )
             )
+        self._pp_record_cross_stream_use(tensor_dict, (self.pp_comm_stream,))
         return p2p_work
 
     def _pp_send_proxy_to_next_stage(
@@ -906,6 +976,10 @@ class SchedulerPPMixin:
                     all_gather_group=all_gather_group
                 )
                 recv_event = self._pp_record_comm_event()
+            self._pp_record_cross_stream_use(
+                tensor_dict,
+                (self.schedule_stream, self.forward_stream, self.copy_stream),
+            )
             received_kind = tensor_dict.get("__msg_type__", "default")
             if received_kind == expected_kind:
                 if received_kind == "default":
@@ -957,10 +1031,13 @@ class SchedulerPPMixin:
             can_run_cuda_graph=(
                 mb_metadata.can_run_cuda_graph if mb_metadata else False
             ),
+            ced_boundary=mb_metadata.ced_boundary if mb_metadata else None,
             skipped_output_comm=True,
         )
+        # No relayed output orders the result after the forward, and processing a
+        # last chunk reads its KV (transfer) and boundary rows: wait on the forward.
         d2h_event = self.device_module.Event()
-        d2h_event.record(self.device_module.current_stream())
+        d2h_event.record(self.forward_stream)
         return None, batch_result, d2h_event
 
     def _pp_prep_batch_result(
@@ -1048,6 +1125,7 @@ class SchedulerPPMixin:
                 extend_input_len_per_req=extend_input_len_per_req,
                 extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
                 can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
+                ced_boundary=mb_metadata.ced_boundary,
             )
             return output_result
 
@@ -1125,6 +1203,7 @@ class SchedulerPPMixin:
                         else next_draft_input.hidden_states
                     ),
                 ),
+                future_indices_cpu=batch.req_pool_indices_cpu,
             )
         batch.input_ids = None
         output_result = GenerationBatchResult(
@@ -1135,6 +1214,7 @@ class SchedulerPPMixin:
             extend_input_len_per_req=extend_input_len_per_req,
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
+            ced_boundary=mb_metadata.ced_boundary,
         )
         output_result.copy_auxiliary_output_to_cpu()
         return output_result
@@ -1655,6 +1735,7 @@ class SchedulerPPMixin:
                     can_run_cuda_graph=result.can_run_cuda_graph,
                     fwd_batch=_pp_snapshot_forward_batch(cur_batch),
                     verify_out_cache_loc=result.spec_verify_out_cache_loc,
+                    ced_boundary=result.ced_boundary,
                 )
                 event = self.device_module.Event()
                 event.record(self.device_module.current_stream())
@@ -1668,6 +1749,9 @@ class SchedulerPPMixin:
                             ),
                         )
                     )
+        # Scheduling the next microbatch (a chunked request's next chunk) frees and
+        # remaps pool entries this forward has not read yet; see _apply_war_barrier.
+        self._apply_war_barrier()
         return result, event
 
     def get_rids(

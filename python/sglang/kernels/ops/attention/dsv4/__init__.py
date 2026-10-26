@@ -10,6 +10,7 @@ from .c128_cleanup import clear_unaccepted_c128_draft_states
 from .compress import (
     CompressorDecodePlan,
     CompressorPrefillPlan,
+    compress_c4_norm_rope_store_fp4,
     compress_forward,
     compress_norm_rope_store,
 )
@@ -25,6 +26,8 @@ from .elementwise import (
 from .fp8_wo_a import sglang_per_token_group_quant_fp8_dsv4_wo_a
 from .topk import (
     plan_topk_v2,
+    selection_page_indices,
+    sort_selection_,
     topk_transform_kpool_ragged_v2,
     topk_transform_kpool_v2,
     topk_transform_paged,
@@ -36,6 +39,7 @@ from .utils import make_name
 __all__ = [
     "CompressorDecodePlan",
     "CompressorPrefillPlan",
+    "compress_c4_norm_rope_store_fp4",
     "compress_forward",
     "compress_norm_rope_store",
     "clear_unaccepted_c128_draft_states",
@@ -57,4 +61,6 @@ __all__ = [
     "topk_transform_paged_v2",
     "topk_transform_ragged_v2",
     "plan_topk_v2",
+    "selection_page_indices",
+    "sort_selection_",
 ]

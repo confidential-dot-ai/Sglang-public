@@ -64,6 +64,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
             snapshot_auxiliary_output_starts=Mock(return_value=[]),
             move_logprobs_to_cpu=Mock(),
             consume_auxiliary_output=Mock(),
+            _wait_result_copy=Mock(),
         )
         self.spec_algorithm = SimpleNamespace(is_eagle=lambda: False)
         self.tree_cache = Mock()
@@ -348,6 +349,20 @@ class TestPrefillCompleteResult(CustomTestCase):
         self.assertEqual(observed, [([11], [1.0, 2.0], [5, 6], True)])
         self.assertTrue(req.pending_bootstrap)
         scheduler.send_kv_chunk.assert_not_called()
+
+    @patch("sglang.srt.disaggregation.prefill.ced_split_enabled", return_value=True)
+    @patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache")
+    def test_ced_split_placeholder_token_skips_grammar(self, cache, ced):
+        scheduler = _Scheduler()
+        req = _Req(inflight_middle_chunks=0)
+        req.to_finish = None
+        req.time_stats.set_prefill_transfer_queue_entry_time = Mock()
+        req.grammar = Mock()
+        req.grammar.accept_token.side_effect = ValueError("invalid token")
+        scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
+        req.grammar.accept_token.assert_not_called()
+        self.assertFalse(req.finished())
+        self.assertEqual(scheduler.disagg_prefill_inflight_queue, [req])
 
     @patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
     def test_aborted_final_result_never_publishes_ready(self, release):

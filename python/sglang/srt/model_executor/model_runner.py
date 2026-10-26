@@ -1545,7 +1545,7 @@ class ModelRunner:
                 model=getattr(self, "model", None),
                 model_dtype=getattr(self, "dtype", torch.bfloat16),
                 is_draft_worker=getattr(self, "is_draft_worker", False),
-                is_dflash=(
+                is_dflash_family=(
                     spec_algorithm.is_dflash_family()
                     if spec_algorithm is not None
                     else False
@@ -2106,6 +2106,12 @@ class ModelRunner:
                 logits_output, forward_batch.sampling_info
             )
 
+        # For prefill, we only use the position of the last token.
+        positions = (
+            forward_batch.positions
+            if forward_batch.forward_mode.is_decode()
+            else forward_batch.seq_lens - 1
+        )
         watermark_state = self.watermark_state
         if (
             watermark_state is not None
@@ -2139,12 +2145,7 @@ class ModelRunner:
             forward_batch.return_logprob,
             forward_batch.top_logprobs_nums,
             forward_batch.token_ids_logprobs,
-            # For prefill, we only use the position of the last token.
-            (
-                forward_batch.positions
-                if forward_batch.forward_mode.is_decode()
-                else forward_batch.seq_lens - 1
-            ),
+            positions,
             **(
                 {"logprob_logits": logprob_logits} if logprob_logits is not None else {}
             ),
@@ -2154,6 +2155,7 @@ class ModelRunner:
                 observer_state,
                 next_token_ids,
             )
+
         self.ngram_embedding_manager.update_after_decode(
             next_token_ids=next_token_ids,
             forward_batch=forward_batch,

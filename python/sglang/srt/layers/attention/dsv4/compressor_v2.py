@@ -8,6 +8,7 @@ from sglang.kernels.jit.utils import is_hip_runtime
 from sglang.kernels.ops.attention.dsv4 import (
     CompressorDecodePlan,
     CompressorPrefillPlan,
+    compress_c4_norm_rope_store_fp4,
     compress_forward,
     compress_norm_rope_store,
 )
@@ -102,6 +103,21 @@ class CompressorBackendMixin:
             last_dim = 2 * head_dim * coff
             assert kv_score_buffer.shape[-1] == last_dim
             kv_score_buffer = kv_score_buffer.view(-1, compress_ratio, last_dim)
+
+        if use_fp4_indexer and envs.SGLANG_OPT_FUSE_C4_FP4_STORE.get():
+            compress_c4_norm_rope_store_fp4(
+                kv_score_buffer=kv_score_buffer,
+                kv_score_input=kv_score_input,
+                ape=ape.view(-1, head_dim),
+                plan=plan,
+                norm_weight=norm.weight,
+                norm_eps=norm.variance_epsilon,
+                freq_cis=freqs_cis_cache,
+                out_loc=out_loc,
+                kvcache=kv_cache,
+                page_size=page_size,
+            )
+            return
 
         # Step 1: compress_forward
         compress_out = None

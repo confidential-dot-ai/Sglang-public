@@ -237,14 +237,18 @@ def _use_cached_default_models(model_repo: str):
     return ""
 
 
+def _visible_device_ordinal() -> int:
+    # CUDA_VISIBLE_DEVICES legitimately holds "", "-1", or "GPU-<uuid>"; int() on
+    # its first character raised IndexError/ValueError at import time, which took
+    # down collection for every module that imports this one.
+    head = os.environ.get("CUDA_VISIBLE_DEVICES", "0")[:1]
+    return int(head) if head.isdigit() else 0
+
+
 if is_in_ci():
-    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
-        10000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 2000
-    )
+    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = 10000 + _visible_device_ordinal() * 2000
 else:
-    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
-        20000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 1000
-    )
+    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = 20000 + _visible_device_ordinal() * 1000
 DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 1000}"
 
 if is_in_amd_ci():

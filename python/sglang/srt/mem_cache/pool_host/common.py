@@ -15,6 +15,7 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.storage.mmap import alloc_mmap
 from sglang.srt.runtime_context import get_memory
 from sglang.srt.utils import is_hip
+from sglang.srt.utils.common import is_host_pinning_effective
 
 logger = logging.getLogger(__name__)
 
@@ -344,10 +345,33 @@ def alloc_with_host_register(
         assert device == "cpu", f"HiCache host pools are CPU memory; got {device!r}"
         _log_hip_owned_host_pool()
         return _alloc_hip_host_tensor(dims=dims, dtype=dtype)
-    buffer = allocator.allocate(dims, dtype=dtype, device=device)
     if pin_memory:
+        # A GPU-CC guest refuses cudaHostRegister outright (rc=801: user-space
+        # cannot hand its own pages to the compute cores), so allocate-then-
+        # register cannot build a host tier there at all. Ask before calling:
+        # a refused register leaves a sticky per-thread CUDA error that fails
+        # every later call in the context. torch's own pinned allocation still
+        # works there -- the driver backs it with CUDA Managed memory, which
+        # the GPU reads correctly.
+        if not is_host_pinning_effective():
+            if type(allocator) is not HostTensorAllocator:
+                raise RuntimeError(
+                    "cudaHostRegister is unavailable; the selected storage "
+                    "allocator cannot be replaced with torch-owned memory."
+                )
+            logger.warning(
+                "cudaHostRegister is unavailable (confidential-compute guest); "
+                "allocating the host tier as torch pinned (driver-managed) "
+                "memory instead. Device reads are correct, but throughput is "
+                "throttled by the CC sysmem path."
+            )
+            buffer = torch.empty(dims, dtype=dtype, device=device, pin_memory=True)
+            setattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, [])
+            return buffer
+        buffer = allocator.allocate(dims, dtype=dtype, device=device)
         _cuda_host_register(buffer, registration_granularity_bytes)
-    return buffer
+        return buffer
+    return allocator.allocate(dims, dtype=dtype, device=device)
 
 
 def alloc_with_pin_memory(
@@ -362,6 +386,8 @@ def alloc_with_pin_memory(
     Allocate tensor using PyTorch's built-in pin_memory flag.
     """
     buffer = torch.empty(dims, dtype=dtype, device=device, pin_memory=pin_memory)
+    # Torch owns any pinning registration; host-pool teardown must not undo it.
+    setattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, [])
     return buffer
 
 

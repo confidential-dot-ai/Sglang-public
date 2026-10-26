@@ -79,6 +79,7 @@ from sglang.srt.speculative.spec_utils import (
     build_grammar_vocab_mask,
     draft_pp_context,
     draft_tp_context,
+    lens_to_device,
     prepare_mamba_track_for_verify,
 )
 from sglang.srt.utils import (
@@ -86,7 +87,6 @@ from sglang.srt.utils import (
     is_cuda_alike,
     is_hip,
     is_npu,
-    is_pin_memory_available,
 )
 
 if TYPE_CHECKING:
@@ -240,6 +240,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             if self._draft_dp_context_enabled
             else parallel.tp_group
         )
+
+        self._need_mamba_verify_commit = False  # set in init_attention_backends
 
         if get_parallel().tp_rank == 0:
             logger.info(
@@ -483,6 +485,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "DSpark prefill target-hidden projection runs before "
                 "sequence-parallel gather."
             )
+        # Same condition DFlashWorkerV2 computes here.
         self._need_mamba_verify_commit = mambaish_config(
             self.model_runner.model_config
         ) is not None and hasattr(
@@ -573,6 +576,33 @@ class DSparkWorkerV2(BaseSpecWorker):
             return
         self._observers.note_request_finished(rid=rid, natural_stop=natural_stop)
 
+    def _append_target_hidden_to_draft_kv_by_loc(
+        self,
+        *,
+        target_hidden: torch.Tensor,
+        cache_loc: torch.Tensor,
+        positions: torch.Tensor,
+        cache_loc_2d: Optional[torch.Tensor] = None,
+        commit_lens: Optional[torch.Tensor] = None,
+    ) -> None:
+        """DFlash-named entry point for the PD hidden-state fast path.
+
+        disaggregation/decode.py's _materialize_dflash_draft_kv_for_prebuilt
+        calls this name on model_worker when prefill shipped real hidden
+        states. DSpark performs the same injection via _kv_injector, and the
+        two signatures match exactly, so delegate rather than duplicate.
+
+        Without this, __getattr__ forwards the lookup to target_worker (which
+        also lacks it) and the decode scheduler dies with AttributeError.
+        """
+        self._kv_injector.inject_target_hidden(
+            target_hidden=target_hidden,
+            cache_loc=cache_loc,
+            positions=positions,
+            cache_loc_2d=cache_loc_2d,
+            commit_lens=commit_lens,
+        )
+
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,
@@ -580,6 +610,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         grammar_barrier=None,
         *,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        capture_hidden_mode: Optional[CaptureHiddenMode] = None,
     ) -> GenerationBatchResult:
         if not self._hosts_draft:
             batch_output = self.target_worker.forward_batch_generation(
@@ -604,7 +635,12 @@ class DSparkWorkerV2(BaseSpecWorker):
                     )
             self._verify_planner.note_non_decode_step()
             self._observers.note_prefill_step()
-            return self._forward_prefill(batch, on_publish, pp_proxy_tensors)
+            return self._forward_prefill(
+                batch,
+                on_publish,
+                pp_proxy_tensors=pp_proxy_tensors,
+                capture_hidden_mode=capture_hidden_mode,
+            )
 
         return self._forward_decode(batch, on_publish, grammar_barrier)
 
@@ -636,7 +672,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         self,
         batch: ScheduleBatch,
         on_publish,
+        *,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        capture_hidden_mode: Optional[CaptureHiddenMode] = None,
     ) -> GenerationBatchResult:
         if batch.forward_mode.is_idle():
             if get_parallel().attn_dp_enabled:
@@ -682,13 +720,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         # Must inject before prefill returns: the scheduler may update radix
         # afterward, invalidating out_cache_loc.
         device = next_token_ids.device
-        pin_memory = is_pin_memory_available(device)
-        ctx_lens = torch.tensor(
-            batch.extend_lens, dtype=torch.int32, pin_memory=pin_memory
-        ).to(device, non_blocking=True)
-        draft_seq_lens = torch.tensor(
-            batch.prefix_lens, dtype=torch.int32, pin_memory=pin_memory
-        ).to(device, non_blocking=True)
+        ctx_lens = lens_to_device(lens=batch.extend_lens, device=device)
+        draft_seq_lens = lens_to_device(lens=batch.prefix_lens, device=device)
         positions, _ = compute_position(
             self.model_runner.prefill_attention_backend_str,
             draft_seq_lens,
@@ -746,9 +779,16 @@ class DSparkWorkerV2(BaseSpecWorker):
             final_pos=final_pos,
             target_hidden_is_projected=target_hidden_is_projected,
         )
-        # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
-        logits_output.hidden_states = None
-        logits_output.hidden_states_token_indices = None
+        # Normally nulled to keep large hidden-state buffers out of
+        # overlap scheduling's D2H path. Under PD hidden-state transfer the
+        # scheduler reads this tensor immediately after we return (see
+        # scheduler.py's write_target_hidden_states call), so nulling it
+        # would make the transfer deliver nothing and silently fall back to
+        # _recompute_dflash_draft_kv_inplace -- the exact work this feature
+        # removes. Keep it only when the caller asked to capture.
+        if capture_hidden_mode is None:
+            logits_output.hidden_states = None
+            logits_output.hidden_states_token_indices = None
 
         batch_output.next_draft_input = make_next_draft_input(
             bonus_tokens=next_token_ids,
@@ -779,7 +819,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         ):
             return None
         return dp_global_verify_tier_num_tokens(
-            global_tier_num_tokens=batch.global_spec_verify_tier_num_tokens
+            global_tier_num_tokens=getattr(
+                batch, "global_spec_verify_tier_num_tokens", None
+            )
         )
 
     def _decode_idle_result(
@@ -1030,6 +1072,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             req_pool_indices=batch.req_pool_indices,
             commit_lens=accept.commit_lens,
         )
+        out_tokens = accept.out_tokens
+        commit_lens = accept.commit_lens
+        bonus = accept.bonus
+        new_seq_lens = accept.new_seq_lens
+
         sampling_mask_capture = SpeculativeSamplingMaskCapture.from_logits(
             sampling_info,
             next_token_logits=logits_output.next_token_logits,
@@ -1040,22 +1087,22 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         if sampling_mask_capture is not None:
             logits_output.sampling_mask_output = sampling_mask_capture.build_output(
-                out_tokens=accept.out_tokens,
-                commit_lens=accept.commit_lens,
+                out_tokens=out_tokens,
+                commit_lens=commit_lens,
             )
         if batch.return_logprob:
             compute_spec_logprobs(
                 batch,
                 logits_output,
-                accept.out_tokens.reshape(-1),
+                out_tokens.reshape(-1),
                 chain_stride=self.verify_num_draft_tokens,
             )
 
         if on_publish is not None:
             if confidence is not None:
-                on_publish(accept.new_seq_lens, confidence=confidence)
+                on_publish(new_seq_lens, confidence=confidence)
             else:
-                on_publish(accept.new_seq_lens)
+                on_publish(new_seq_lens)
 
         self._commit_target_mamba_states_after_verify(
             batch=batch,
@@ -1074,7 +1121,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 hidden_strided=hidden_strided,
                 verify_window=verify_window,
                 logits_output=logits_output,
-                commit_lens=accept.commit_lens,
+                commit_lens=commit_lens,
                 bs=bs,
                 run_compact=run_compact,
             )
@@ -1096,8 +1143,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             sampling_info=sampling_info,
             correct_len=accept.correct_len,
             cap_trim_lens=accept.cap_trim_lens,
-            bonus=accept.bonus,
-            commit_lens=accept.commit_lens,
+            bonus=bonus,
+            commit_lens=commit_lens,
             verify_token_budget=verify_token_budget,
             req_pool_indices=batch.req_pool_indices,
             verify_tier_num_tokens=int(batch.spec_verify_tier_num_tokens),
@@ -1105,13 +1152,13 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
         next_draft_input = make_next_draft_input(
-            bonus_tokens=accept.bonus,
-            new_seq_lens=accept.new_seq_lens,
+            bonus_tokens=bonus,
+            new_seq_lens=new_seq_lens,
         )
         return GenerationBatchResult(
             logits_output=logits_output,
-            next_token_ids=accept.out_tokens.reshape(-1),
-            accept_lens=accept.commit_lens,
+            next_token_ids=out_tokens.reshape(-1),
+            accept_lens=commit_lens,
             block_accept_lens=accept.commit_lens + accept.cap_trim_lens,
             cap_lens=(
                 layout.verify_lens.to(torch.int32) if layout is not None else None
@@ -1119,7 +1166,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
             speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
-            new_seq_lens=accept.new_seq_lens,
+            new_seq_lens=new_seq_lens,
         )
 
     def _commit_target_mamba_states_after_verify(

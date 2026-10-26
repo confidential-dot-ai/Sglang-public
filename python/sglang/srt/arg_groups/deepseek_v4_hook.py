@@ -234,6 +234,75 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
     )
 
 
+# Context the captured ratio-1/2 indexer scores by default; the candidate window of
+# the V4.1 checkpoint is 2048 blocks x 8 positions.
+_CAPTURED_INDEXER_MAX_SEQ_LEN = 16 * 1024
+
+
+def _resolve_prefill_graph_max_seq_len(server_args: ServerArgs) -> None:
+    cfg = resolving_view(server_args)
+    prefill_graph = cfg.cuda_graph_config.prefill
+    if prefill_graph.backend == Backend.DISABLED:
+        return
+    eager_indexer = envs.SGLANG_OPT_DSV41_PREFILL_GRAPH_EAGER_INDEXER.get()
+    if eager_indexer and (
+        cfg.attn_cp_size != 1 or cfg.dcp_size != 1 or cfg.enable_prefill_cp
+    ):
+        # Under CP the index layers are not an eager break of the prefill graph.
+        logger.warning(
+            "SGLANG_OPT_DSV41_PREFILL_GRAPH_EAGER_INDEXER does not apply under "
+            "context parallelism; keeping the captured indexer."
+        )
+        eager_indexer = False
+
+    max_seq_len = prefill_graph.max_seq_len
+    # Interleaved prefill CP keeps a breakable prefill graph uncapped.
+    cp_breakable_prefill = (
+        cfg.enable_prefill_cp
+        and cfg.cp_strategy == "interleave"
+        and cfg.tp_size > 1
+        and prefill_graph.backend == Backend.BREAKABLE
+    )
+    if max_seq_len is None:
+        if cp_breakable_prefill:
+            return
+        if eager_indexer:
+            logger.info(
+                "DeepSeek-V4.1 prefill graphs replay any context length; the "
+                "ratio-1/2 index layers run as eager breaks."
+            )
+            return
+        # The captured low-ratio indexer scores a static context width; 16k
+        # keeps it inside the candidate window at under 1 ms per layer.
+        declare_resolution(
+            server_args,
+            "validate_deepseek_v41_features",
+            cuda_graph_config=with_phase(
+                cfg.cuda_graph_config,
+                Phase.PREFILL,
+                max_seq_len=_CAPTURED_INDEXER_MAX_SEQ_LEN,
+            ),
+        )
+        logger.warning(
+            "Setting cuda_graph_config[prefill].max_seq_len to 16384 for "
+            "DeepSeek-V4.1; longer contexts run eager prefill. Set "
+            "SGLANG_OPT_DSV41_PREFILL_GRAPH_EAGER_INDEXER=1 to replay them."
+        )
+        return
+
+    if eager_indexer or max_seq_len <= _CAPTURED_INDEXER_MAX_SEQ_LEN:
+        return
+    text_config = model_config_of(server_args).hf_text_config
+    window = text_config.candidate_topk_blocks * text_config.candidate_block_size
+    if 0 < window < max_seq_len:
+        raise ValueError(
+            f"cuda_graph_config[prefill].max_seq_len={max_seq_len} exceeds the "
+            f"{window}-position candidate window the captured indexer can score; "
+            "set SGLANG_OPT_DSV41_PREFILL_GRAPH_EAGER_INDEXER=1 to run the index "
+            "layers as an eager break, or lower max_seq_len."
+        )
+
+
 def validate_deepseek_v41_encoder_replay_budget(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
     if not cfg.enable_encoder_swa_bounded_replay:
@@ -331,7 +400,17 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             cfg.dsv4_attn_backend == "trtllm" and cfg.enable_encoder_swa_bounded_replay,
         ),
         ("two-batch overlap", cfg.enable_two_batch_overlap),
-        ("pipeline parallelism", cfg.pp_size > 1),
+        (
+            "pipeline parallelism outside a CED-split prefill",
+            cfg.pp_size > 1
+            and not (
+                (
+                    envs.SGLANG_OPT_DSV41_CED_SPLIT.get()
+                    or envs.SGLANG_OPT_DSV41_PREFILL_TAIL.get()
+                )
+                and cfg.disaggregation_mode == "prefill"
+            ),
+        ),
     )
     for feature, enabled in unsupported:
         if enabled:
@@ -369,29 +448,7 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "both servers use the same block size and target/draft KV layout."
             )
 
-    prefill_graph = cfg.cuda_graph_config.prefill
-    cp_breakable_prefill = (
-        cfg.enable_prefill_cp
-        and cfg.cp_strategy == "interleave"
-        and cfg.tp_size > 1
-        and prefill_graph.backend == Backend.BREAKABLE
-    )
-    if (
-        prefill_graph.backend != Backend.DISABLED
-        and prefill_graph.max_seq_len is None
-        and not cp_breakable_prefill
-    ):
-        declare_resolution(
-            server_args,
-            "validate_deepseek_v41_features",
-            cuda_graph_config=with_phase(
-                cfg.cuda_graph_config, Phase.PREFILL, max_seq_len=16 * 1024
-            ),
-        )
-        logger.warning(
-            "Setting cuda_graph_config[prefill].max_seq_len to 16384 for "
-            "DeepSeek-V4.1; longer contexts run eager prefill."
-        )
+    _resolve_prefill_graph_max_seq_len(server_args)
 
     incompatible = (
         (
@@ -413,6 +470,11 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                     )
                 )
             ),
+        ),
+        (
+            "prefill graph with CP",
+            cfg.cuda_graph_config.prefill.backend == Backend.BREAKABLE
+            and (cfg.attn_cp_size != 1 or cfg.dcp_size != 1 or cfg.enable_prefill_cp),
         ),
     )
     if cfg.enable_decoder_swa_bounded_replay:

@@ -13,12 +13,15 @@ from sglang.kernels.ops.attention.deepseek_v4_rope import (
 )
 from sglang.kernels.ops.attention.dsv4 import (
     CompressorDecodePlan,
+    compress_c4_norm_rope_store_fp4,
+    compress_forward,
     compress_norm_rope_store,
     fused_q_indexer_rope_hadamard_fp4_quant,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
     finish_paged_indexer_topk,
     fp4_index_logits_decode,
+    _store_fp4_index_k_cache_unfused,
     fp4_index_logits_paged,
     quantize_fp4_indexer_tensor,
     store_fp4_index_k_cache,
@@ -27,7 +30,9 @@ from sglang.srt.utils import get_device, is_xpu
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.deepseek_v4.common import (
     ceil_ue8m0_exp_ref,
-    fp4_e2m1_code_ref,
+    make_legacy_context,
+    make_state_pool,
+    to_seq_extend,
 )
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -47,6 +52,42 @@ PAGE_SIZE = 64
 E2M1_MAX = 6.0
 
 
+def _fp4_e2m1_code_rne_ref(x: torch.Tensor) -> torch.Tensor:
+    """E2M1 nibble of ``x`` under round-to-nearest-even, the dsv41 default:
+    midpoints round toward the even code, so every other threshold is inclusive."""
+    ax = torch.minimum(x.abs(), torch.tensor(E2M1_MAX, device=x.device))
+    idx = torch.zeros_like(ax, dtype=torch.uint8)
+    for threshold, inclusive in (
+        (0.25, False),
+        (0.75, True),
+        (1.25, False),
+        (1.75, True),
+        (2.5, False),
+        (3.5, True),
+        (5.0, False),
+    ):
+        comparison = ax >= threshold if inclusive else ax > threshold
+        idx += comparison.to(torch.uint8)
+    sign = ((x < 0) & (idx != 0)).to(torch.uint8) * 8
+    return idx | sign
+
+
+def _fold_negative_zero(packed: torch.Tensor) -> torch.Tensor:
+    """Packed e2m1 bytes with -0 (code 8) written as +0. Native PTX cvt keeps the
+    sign of a value that rounds to zero and the software path drops it; both are 0."""
+    packed = packed.view(torch.uint8)
+    lo, hi = packed & 0x0F, packed & 0xF0
+    return torch.where(lo == 0x08, 0, lo) | torch.where(hi == 0x80, 0, hi)
+
+
+def _fold_cache_negative_zero(cache: torch.Tensor) -> torch.Tensor:
+    """An index-K cache with -0 folded in the fp4 payload; scale bytes kept as is."""
+    folded = cache.clone()
+    payload = folded[:, : PAGE_SIZE * FP4_DIM]
+    payload.copy_(_fold_negative_zero(payload))
+    return folded
+
+
 def _ref_quantize_fp4_indexer(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     x = x.contiguous().view(-1, HEAD_DIM).float()
     groups = x.view(-1, SCALE_GROUPS, GROUP_SIZE)
@@ -55,7 +96,7 @@ def _ref_quantize_fp4_indexer(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tens
     scale = (scale_exp << 23).contiguous().view(torch.float32)
 
     scaled = (groups / scale.unsqueeze(-1)).view(-1, HEAD_DIM)
-    code = fp4_e2m1_code_ref(scaled)
+    code = _fp4_e2m1_code_rne_ref(scaled)
     packed = (code[:, 0::2].to(torch.int16) | (code[:, 1::2].to(torch.int16) << 4)).to(
         torch.uint8
     )
@@ -104,7 +145,7 @@ def test_quantize_fp4_indexer_tensor(num_tokens: int) -> None:
     x_fp4, x_sf = quantize_fp4_indexer_tensor(x)
     ref_fp4, ref_sf = _ref_quantize_fp4_indexer(x)
 
-    torch.testing.assert_close(x_fp4.view(torch.uint8), ref_fp4)
+    torch.testing.assert_close(_fold_negative_zero(x_fp4), ref_fp4)
     torch.testing.assert_close(x_sf, ref_sf)
 
 
@@ -191,6 +232,23 @@ def test_prefill_quantization_nonfinite_group_replay(dtype, rne):
             assert torch.equal(a, b)
 
 
+def test_quantize_fp4_indexer_rounds_midpoints_to_even() -> None:
+    # A value of 6.0 makes the UE8M0 scale exactly 1.0. This leaves the E2M1
+    # midpoints unchanged and locks native PTX's nibble order and tie behavior.
+    midpoints = torch.tensor(
+        [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, 6.0],
+        device=get_device(),
+        dtype=torch.float32,
+    )
+    values = torch.cat((midpoints, -midpoints)).repeat(8).reshape(1, HEAD_DIM)
+
+    x_fp4, x_sf = quantize_fp4_indexer_tensor(values)
+    ref_fp4, ref_sf = _ref_quantize_fp4_indexer(values)
+
+    torch.testing.assert_close(_fold_negative_zero(x_fp4), ref_fp4)
+    torch.testing.assert_close(x_sf, ref_sf)
+
+
 @pytest.mark.parametrize("num_tokens", [1, 16, 96])
 def test_fp4_index_cache_store_layout(num_tokens: int) -> None:
     torch.manual_seed(num_tokens)
@@ -210,7 +268,33 @@ def test_fp4_index_cache_store_layout(num_tokens: int) -> None:
 
     ref_fp4, ref_sf = _ref_quantize_fp4_indexer(x)
     expected = _ref_store_fp4_index_cache(ref_fp4, ref_sf, loc, num_pages)
-    torch.testing.assert_close(cache, expected)
+    torch.testing.assert_close(_fold_cache_negative_zero(cache), expected)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 7, 64, 129])
+@pytest.mark.parametrize("rne", [False, True])
+def test_fp4_index_cache_fused_matches_unfused(num_tokens: int, rne: bool) -> None:
+    torch.manual_seed(num_tokens + 1000)
+    num_pages = max(1, (num_tokens + PAGE_SIZE - 1) // PAGE_SIZE)
+    # Include tiny values to lock the UE8M0 minimum-scale behavior as well as
+    # ordinary activation magnitudes.
+    x = torch.randn(num_tokens, HEAD_DIM, device=get_device(), dtype=torch.bfloat16)
+    x[0].fill_(1.0e-5)
+    loc = torch.randperm(num_pages * PAGE_SIZE, device=get_device())[:num_tokens].to(
+        torch.int64
+    )
+    fused = torch.full(
+        (num_pages, PAGE_SIZE * (FP4_DIM + SCALE_BYTES)),
+        0xA5,
+        device=get_device(),
+        dtype=torch.uint8,
+    )
+    control = fused.clone()
+
+    store_fp4_index_k_cache(x, fused, loc, page_size=PAGE_SIZE, rne=rne)
+    _store_fp4_index_k_cache_unfused(x, control, loc, page_size=PAGE_SIZE, rne=rne)
+
+    torch.testing.assert_close(fused, control)
 
 
 @pytest.mark.parametrize("num_tokens", [1, 16, 96])
@@ -272,7 +356,206 @@ def test_fp4_fused_norm_rope_store_layout(num_tokens: int) -> None:
         loc.to(torch.int64),
         num_pages,
     )
-    torch.testing.assert_close(cache, expected)
+    torch.testing.assert_close(_fold_cache_negative_zero(cache), expected)
+
+
+def test_fp4_fused_norm_rope_skips_unaligned_decode_rows() -> None:
+    num_tokens = 16
+    compress_ratio = 4
+    num_pages = 1
+    torch.manual_seed(2026)
+    kv = torch.randn(num_tokens, HEAD_DIM, device=get_device(), dtype=torch.bfloat16)
+    norm_weight = torch.randn(HEAD_DIM, device=get_device(), dtype=torch.bfloat16)
+    seq_lens = torch.arange(1, num_tokens + 1, device=get_device(), dtype=torch.int64)
+    req_pool_indices = torch.arange(num_tokens, device=get_device(), dtype=torch.int64)
+    loc = torch.arange(num_tokens, device=get_device(), dtype=torch.int64)
+    freqs_cis = precompute_freqs_cis(
+        64, int(seq_lens.max().item()) + 1, 0, 10000, 1, 32, 1
+    ).to(get_device())
+    cache = torch.full(
+        (num_pages, PAGE_SIZE * (FP4_DIM + SCALE_BYTES)),
+        0xA5,
+        device=get_device(),
+        dtype=torch.uint8,
+    )
+    control = cache.clone()
+
+    mixed_plan = CompressorDecodePlan.generate_legacy(
+        compress_ratio, req_pool_indices, seq_lens
+    )
+    compress_norm_rope_store(
+        kv.clone(),
+        mixed_plan,
+        norm_weight=norm_weight,
+        norm_eps=1.0e-6,
+        freq_cis=freqs_cis,
+        out_loc=loc,
+        kvcache=cache,
+        page_size=PAGE_SIZE,
+        use_fp4=True,
+    )
+
+    valid = seq_lens.remainder(compress_ratio) == 0
+    valid_plan = CompressorDecodePlan.generate_legacy(
+        compress_ratio, req_pool_indices[valid], seq_lens[valid]
+    )
+    compress_norm_rope_store(
+        kv[valid].clone(),
+        valid_plan,
+        norm_weight=norm_weight,
+        norm_eps=1.0e-6,
+        freq_cis=freqs_cis,
+        out_loc=loc[valid],
+        kvcache=control,
+        page_size=PAGE_SIZE,
+        use_fp4=True,
+    )
+
+    torch.testing.assert_close(cache, control)
+
+
+def _run_c4_fp4_control(
+    state: torch.Tensor,
+    kv_score_input: torch.Tensor,
+    ape: torch.Tensor,
+    plan,
+    norm_weight: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    out_loc: torch.Tensor,
+    cache: torch.Tensor,
+) -> None:
+    compressed = compress_forward(
+        state,
+        kv_score_input,
+        ape,
+        plan,
+        head_dim=HEAD_DIM,
+        compress_ratio=4,
+    )
+    compress_norm_rope_store(
+        compressed,
+        plan,
+        norm_weight=norm_weight,
+        norm_eps=1.0e-6,
+        freq_cis=freqs_cis,
+        out_loc=out_loc,
+        kvcache=cache,
+        page_size=PAGE_SIZE,
+        use_fp4=True,
+    )
+
+
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_c4_fp4_fused_prefill_matches_two_kernel_control(
+    state_dtype: torch.dtype,
+) -> None:
+    num_tokens = 16
+    ctx = make_legacy_context(bs=1, compress_ratio=4, head_dim=HEAD_DIM)
+    seq_lens, extend_lens, num_q_tokens = to_seq_extend(
+        [(num_tokens, num_tokens)]
+    )
+    plan = ctx.make_prefill_plan(seq_lens, extend_lens, num_q_tokens)
+    torch.manual_seed(3001)
+    kv_score_input = torch.randn(
+        num_tokens, 4 * HEAD_DIM, device=get_device(), dtype=torch.float32
+    )
+    ape = torch.randn(8, HEAD_DIM, device=get_device(), dtype=torch.float32)
+    norm_weight = torch.randn(HEAD_DIM, device=get_device(), dtype=torch.float32)
+    freqs_cis = precompute_freqs_cis(
+        64, num_tokens + 1, 0, 10000, 1, 32, 1
+    ).to(get_device())
+    out_loc = torch.arange(num_tokens, device=get_device(), dtype=torch.int64)
+    fused_state = make_state_pool(ctx.num_pages, 4, HEAD_DIM).to(state_dtype)
+    control_state = fused_state.clone()
+    fused_cache = torch.full(
+        (1, PAGE_SIZE * (FP4_DIM + SCALE_BYTES)),
+        0xA5,
+        device=get_device(),
+        dtype=torch.uint8,
+    )
+    control_cache = fused_cache.clone()
+
+    compress_c4_norm_rope_store_fp4(
+        fused_state,
+        kv_score_input,
+        ape,
+        plan,
+        norm_weight=norm_weight,
+        norm_eps=1.0e-6,
+        freq_cis=freqs_cis,
+        out_loc=out_loc,
+        kvcache=fused_cache,
+        page_size=PAGE_SIZE,
+    )
+    _run_c4_fp4_control(
+        control_state,
+        kv_score_input,
+        ape,
+        plan,
+        norm_weight,
+        freqs_cis,
+        out_loc,
+        control_cache,
+    )
+
+    torch.testing.assert_close(fused_state, control_state)
+    torch.testing.assert_close(fused_cache, control_cache)
+
+
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_c4_fp4_fused_decode_matches_two_kernel_control(
+    state_dtype: torch.dtype,
+) -> None:
+    ctx = make_legacy_context(bs=1, compress_ratio=4, head_dim=HEAD_DIM)
+    torch.manual_seed(3002)
+    kv_score_input = torch.randn(
+        4, 4 * HEAD_DIM, device=get_device(), dtype=torch.float32
+    )
+    ape = torch.randn(8, HEAD_DIM, device=get_device(), dtype=torch.float32)
+    norm_weight = torch.randn(HEAD_DIM, device=get_device(), dtype=torch.float32)
+    freqs_cis = precompute_freqs_cis(64, 5, 0, 10000, 1, 32, 1).to(
+        get_device()
+    )
+    fused_state = make_state_pool(ctx.num_pages, 4, HEAD_DIM).to(state_dtype)
+    control_state = fused_state.clone()
+    fused_cache = torch.full(
+        (1, PAGE_SIZE * (FP4_DIM + SCALE_BYTES)),
+        0xA5,
+        device=get_device(),
+        dtype=torch.uint8,
+    )
+    control_cache = fused_cache.clone()
+
+    for step in range(1, 5):
+        seq_lens = torch.tensor([step], device=get_device(), dtype=torch.int64)
+        plan = ctx.make_decode_plan(seq_lens)
+        out_loc = torch.tensor([step - 1], device=get_device(), dtype=torch.int64)
+        current = kv_score_input[step - 1 : step]
+        compress_c4_norm_rope_store_fp4(
+            fused_state,
+            current,
+            ape,
+            plan,
+            norm_weight=norm_weight,
+            norm_eps=1.0e-6,
+            freq_cis=freqs_cis,
+            out_loc=out_loc,
+            kvcache=fused_cache,
+            page_size=PAGE_SIZE,
+        )
+        _run_c4_fp4_control(
+            control_state,
+            current,
+            ape,
+            plan,
+            norm_weight,
+            freqs_cis,
+            out_loc,
+            control_cache,
+        )
+
+        torch.testing.assert_close(fused_state, control_state)
+        torch.testing.assert_close(fused_cache, control_cache)
 
 
 @pytest.mark.skipif(
@@ -307,7 +590,7 @@ def test_fp4_fused_q_indexer_rope_hadamard_quant(batch_size: int) -> None:
     ref_fp4 = ref_fp4.view(batch_size, num_heads, FP4_DIM)
     ref_sf = ref_sf.view(batch_size, num_heads)
 
-    torch.testing.assert_close(q_fp4.view(torch.uint8), ref_fp4)
+    torch.testing.assert_close(_fold_negative_zero(q_fp4), ref_fp4)
     torch.testing.assert_close(q_sf, ref_sf)
     torch.testing.assert_close(weights_out.squeeze(-1), weight.float() * weight_scale)
 
@@ -843,6 +1126,50 @@ def test_flat_indexer_slot_count_does_not_recompile(write_raw):
             expected_raw = torch.where(chosen, selected - starts[:, None], -1)
             torch.testing.assert_close(raw, expected_raw, rtol=0, atol=0)
     assert len(hashes) == 1, "Changing the visible slot count must reuse the kernel"
+
+
+@pytest.mark.skipif(_is_xpu, reason="The paged top-k kernels are CUDA JIT kernels")
+@pytest.mark.parametrize("use_topk_v2", [True, False])
+def test_paged_selection_is_ascending_positions(use_topk_v2):
+    """A decode row past topk candidates is selected in ascending position order,
+    then mapped to pool slots: the sparse attention rounds in selection order, and
+    a position's slot changes with the allocation, so only position order repeats."""
+    from sglang.kernels.ops.attention.dsv4 import plan_topk_v2
+    from sglang.srt.layers.attention.dsv4.indexer import (
+        topk_transform_paged_from_metadata,
+    )
+
+    torch.manual_seed(5)
+    page_size, topk, pages_per_row = 128, 512, 16
+    lens = torch.tensor(
+        [1, 511, 512, 513, 700, 1500, 2048, 2048], dtype=torch.int32, device="cuda"
+    )
+    rows = lens.shape[0]
+    page_table = torch.stack(
+        [torch.randperm(4096, device="cuda")[:pages_per_row] for _ in range(rows)]
+    ).to(torch.int32)
+    logits = torch.randn(rows, pages_per_row * page_size, device="cuda")
+    metadata = SimpleNamespace(
+        compressed_seq_lens=lens,
+        page_table=page_table,
+        compressed_page_size=page_size,
+        use_topk_v2=use_topk_v2,
+        topk_metadata=plan_topk_v2(lens) if use_topk_v2 else None,
+    )
+    pages = torch.full((rows, topk), -7, dtype=torch.int32, device="cuda")
+    topk_transform_paged_from_metadata(logits.clone(), metadata, pages)
+
+    columns = torch.arange(logits.shape[1], device="cuda")
+    masked = logits.masked_fill(columns >= lens[:, None], -torch.inf)
+    positions = masked.topk(topk, dim=-1).indices.sort(dim=-1).values
+    positions = torch.where(positions < lens[:, None], positions, -1)
+    clamped = positions.clamp_min(0)
+    expected = torch.where(
+        positions >= 0,
+        page_table.gather(-1, clamped // page_size) * page_size + clamped % page_size,
+        -1,
+    )
+    torch.testing.assert_close(pages, expected.int(), rtol=0, atol=0)
 
 
 if __name__ == "__main__":

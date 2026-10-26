@@ -52,6 +52,8 @@ import tqdm
 from sglang.kernels.ops.kvcache.kv_indices import (
     create_chunked_prefix_cache_kv_indices,
 )
+from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
+from sglang.srt.configs.deepseek_v41 import DeepseekV41Config
 from sglang.srt.configs.model_config import is_qwen4_exp
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
@@ -426,6 +428,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # (e.g. a residual-stream merge) writes a wider tensor than
         # `config.hidden_size`, so let it declare that width.
         input_embeds_hidden_size = self._input_embeds_hidden_size()
+        config = self.model_runner.model_config.hf_text_config
+        pp_prev_pre_size = (
+            config.hc_mult
+            if isinstance(config, (DeepSeekV4Config, DeepseekV41Config))
+            and config.hc_pre_from_prev_sublayer
+            else None
+        )
         self.buffers: PrefillInputBuffers = PrefillInputBuffers.create(
             device=self.device,
             max_bs=self.max_bs,
@@ -448,6 +457,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             pp_proxy_dspark_hidden_size=(
                 self.model_runner.get_pp_proxy_dspark_hidden_size()
             ),
+            pp_prev_pre_size=pp_prev_pre_size,
         )
         self.buffers.share_buffers()
         # Token-axis FB-shared slot registry adopting PrefillInputBuffers
@@ -863,7 +873,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     self.layer_model, forward_batch, pp_proxy_tensors
                 )
                 if pp_proxy_tensors is not None:
-                    input_ids = None
+                    # Later stages take hidden states from the proxy but keep the
+                    # token ids: DeepSeek-V4.1's Engram layers hash them mid-stack.
                     for embeds_name in ("input_embeds", "inputs_embeds"):
                         if embeds_name in kwargs:
                             kwargs[embeds_name] = None
@@ -2011,6 +2022,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         static_forward_batch.encoder_swa_compress_rows = (
             forward_batch.encoder_swa_compress_rows
         )
+        # The CED boundary break fills the live batch's capture at replay; the
+        # padding rows sit after every real row, so its row indices still hold.
+        static_forward_batch.ced_boundary = forward_batch.ced_boundary
         static_forward_batch = self.model_runner.prepare_dummy_forward_batch(
             static_forward_batch
         )

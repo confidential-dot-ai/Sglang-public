@@ -649,12 +649,24 @@ def _deepseek_v4_num_host_pages(
 
     device_swa_pages = (kvcache.swa_size + swa_page_size - 1) // swa_page_size
 
-    if get_memory().hicache_size > 0:
-        raise ValueError(
-            "DeepSeek V4 HiCache currently does not support --hicache-size; "
-            "use --hicache-ratio instead."
+    memory = get_memory()
+    if memory.hicache_size > 0:
+        # Every V4 host pool mirrors its device pool at one shared page ratio, so a
+        # --hicache-size budget (GB per rank, as for the other pools) becomes that
+        # ratio. A ratio below 1 keeps a host tier smaller than the device pool.
+        device_bytes = _dsv4_device_kv_bytes(kvcache)
+        ratio = _min_across_pp(
+            memory.hicache_size * 1e9 / device_bytes, params=params
         )
-    ratio = get_memory().hicache_ratio
+        logger.info(
+            "DeepSeek V4 HiCache: --hicache-size %s GB over %.2f GB of device KV "
+            "is a host ratio of %.4f",
+            memory.hicache_size,
+            device_bytes / 1e9,
+            ratio,
+        )
+    else:
+        ratio = memory.hicache_ratio
     full_host_pages = int(device_full_pages * ratio)
     swa_host_pages = int(device_swa_pages * ratio)
 
@@ -667,6 +679,33 @@ def _deepseek_v4_num_host_pages(
         c128_host_pages = int(c128_attn_allocator.num_pages * ratio)
     return full_host_pages, swa_host_pages, c128_host_pages
 
+
+def _min_across_pp(ratio: float, *, params: CacheInitParams) -> float:
+    """PP1+ mirror PP0's tree and pop PP0's ack counts, so every stage needs the
+    same host page count; stages hold different layer counts, so a byte budget
+    alone gives each a different ratio. MIN keeps every stage within budget."""
+    if params.pp_size <= 1 or params.pp_cache_group is None:
+        return ratio
+    import torch
+
+    t = torch.tensor([ratio], dtype=torch.float64)
+    torch.distributed.all_reduce(
+        t, op=torch.distributed.ReduceOp.MIN, group=params.pp_cache_group
+    )
+    return float(t.item())
+
+
+
+def _dsv4_device_kv_bytes(kvcache: Any) -> int:
+    """Device bytes the V4 host pools mirror: paged KV, compressed and indexer
+    buffers, plus the SWA/state buffers."""
+    total = sum(kvcache.get_contiguous_buf_infos()[1])
+    get_state = getattr(kvcache, "get_state_buf_infos", None)
+    if get_state is not None:
+        total += sum(get_state()[1])
+    if total <= 0:
+        raise ValueError("DeepSeek V4 HiCache found no device KV to size against")
+    return total
 
 def _dsv4_compressed_region_buffers(kvcache: Any, ratio: int) -> tuple[list, int]:
     """

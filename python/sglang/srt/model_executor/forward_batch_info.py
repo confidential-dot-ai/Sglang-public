@@ -40,6 +40,10 @@ from sglang.kernels.ops.attention.clamp_position import clamp_position
 from sglang.kernels.ops.attention.position import compute_position_triton
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.utils import all_gather_single
+from sglang.srt.disaggregation.ced_boundary import (
+    ced_boundary_enabled,
+    ced_boundary_for_forward,
+)
 from sglang.srt.environ import envs
 from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
     compute_req_all_ids_info,
@@ -650,6 +654,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     minimax_m3_precached_sparse_layers: Optional[Set[int]] = None
 
+    # CED boundary handoff: prefill's capture spec of the rows in each prompt's
+    # last window, or decode's handed-off state to start the tail replay from.
+    ced_boundary: Optional[object] = None
+
     # === Forward-derived (built in init_new on the forward stream; FB-owned) ===
     # Position information
     positions: torch.Tensor = None
@@ -1142,11 +1150,26 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         num_tokens = len(batch.input_ids) if batch.input_ids is not None else 0
         if enable_num_token_non_padded():
-            ret.global_num_token_non_padded = torch.tensor(
-                num_tokens,
-                dtype=torch.int32,
-                pin_memory=is_pin_memory_available(device),
-            ).to(device, non_blocking=True)
+            # Allocating a fresh tensor here is illegal during active CUDA graph
+            # capture. Reuse the decode graph runner's own
+            # pre-allocated num_token_non_padded buffer -- the same one it
+            # already fills in-place on every real decode tick -- instead of
+            # allocating. Outside capture, behavior is unchanged.
+            graph_runner = getattr(model_runner, "decode_cuda_graph_runner", None)
+            reusable_buf = (
+                graph_runner.buffers.num_token_non_padded
+                if graph_runner is not None
+                else None
+            )
+            if reusable_buf is not None and torch.cuda.is_current_stream_capturing():
+                reusable_buf.fill_(num_tokens)
+                ret.global_num_token_non_padded = reusable_buf
+            else:
+                ret.global_num_token_non_padded = torch.tensor(
+                    num_tokens,
+                    dtype=torch.int32,
+                    pin_memory=is_pin_memory_available(device),
+                ).to(device, non_blocking=True)
         ret.global_num_token_non_padded_cpu = num_tokens
 
         ret.init_mlp_sync_metadata(
@@ -1257,6 +1280,186 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ret.positions % parallel.attn_dcp_size == parallel.attn_dcp_rank
             )
 
+        if ced_boundary_enabled():
+            ret.ced_boundary = ced_boundary_for_forward(
+                batch=batch,
+                forward_batch=ret,
+                window=model_runner.sliding_window_size,
+                device=device,
+            )
+
+        return ret
+
+    @classmethod
+    def init_dspark_target_verify(
+        cls,
+        batch: ScheduleBatch,
+        model_runner: ModelRunner,
+        *,
+        capture_hidden_mode: CaptureHiddenMode,
+        return_hidden_states_before_norm: bool,
+        kv_loc_plan: Optional[KVLocPlan] = None,
+        write_cols: Optional[Cols] = None,
+    ):
+        """Minimal, reusable ForwardBatch boundary for DSPARK target verify.
+
+        The generic initializer supports every serving mode and consequently
+        scans request metadata and derives fields that target verification
+        never consumes. Two shells are reused because overlap scheduling keeps
+        the previous ForwardBatch alive for two iterations.
+
+        Uncommon features fall back to init_new rather than constructing an
+        incomplete batch.
+        """
+        graph_runner = getattr(model_runner, "decode_cuda_graph_runner", None)
+        unsafe_fast_path = (
+            graph_runner is None
+            or not batch.forward_mode.is_target_verify()
+            or not batch.spec_algorithm.is_dspark()
+            or model_runner.server_args.enable_lora
+            or model_runner.ngram_embedding_manager.enabled
+            or model_runner.model_config.model_is_mrope
+            or batch.dllm_config is not None
+            or envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get()
+            or envs.SGLANG_KV_CANARY_ENABLE_VERIFY_TOKEN_ASSERT.get()
+        )
+        if unsafe_fast_path:
+            return cls.init_new(
+                batch,
+                model_runner,
+                capture_hidden_mode=capture_hidden_mode,
+                return_hidden_states_before_norm=return_hidden_states_before_norm,
+                kv_loc_plan=kv_loc_plan,
+                write_cols=write_cols,
+            )
+
+        def bind_kv_loc_plan(ret) -> None:
+            # Same binding as init_new: each verify forward joins the
+            # iteration's plan, or owns one when it is the only forward.
+            translator = model_runner.kv_index_translator
+            plan = translator.own_plan(ret) if kv_loc_plan is None else kv_loc_plan
+            plan.bind(ret, translator, cols=write_cols)
+
+        seq_lens_cpu = batch.seq_lens_cpu
+        if batch.seq_lens_sum is None and seq_lens_cpu is not None:
+            batch.seq_lens_sum = int(seq_lens_cpu.sum())
+
+        values = {
+            "forward_mode": batch.forward_mode,
+            "batch_size": len(batch.seq_lens),
+            "input_ids": batch.input_ids,
+            "req_pool_indices": batch.req_pool_indices,
+            "seq_lens": batch.seq_lens,
+            "out_cache_loc": batch.out_cache_loc,
+            "seq_lens_sum": batch.seq_lens_sum,
+            "seq_lens_cpu": seq_lens_cpu,
+            "orig_seq_lens": batch.orig_seq_lens,
+            "out_cache_loc_dsv4": batch.out_cache_loc_dsv4,
+            "mamba_track_indices": batch.mamba_track_indices,
+            "mamba_track_mask": batch.mamba_track_mask,
+            "mamba_track_seqlens": batch.mamba_track_seqlens,
+            "mamba_cow_src_indices": batch.mamba_cow_src_indices,
+            "mamba_cow_dst_indices": batch.mamba_cow_dst_indices,
+            "mamba_clear_indices": batch.mamba_clear_indices,
+            "encoder_lens": batch.encoder_lens,
+            "encoder_out_cache_loc": batch.encoder_out_cache_loc,
+            "input_embeds": batch.input_embeds,
+            "replace_embeds": batch.replace_embeds,
+            "replace_positions": batch.replace_positions,
+            "return_logprob": batch.return_logprob,
+            "is_extend_in_batch": batch.is_extend_in_batch,
+            "can_run_decode_cuda_graph": batch.can_run_decode_cuda_graph,
+            "can_run_dp_prefill_cuda_graph": batch.can_run_dp_prefill_cuda_graph,
+            "global_forward_mode": batch.global_forward_mode,
+            "is_prefill_only": batch.is_prefill_only,
+            "spec_algorithm": batch.spec_algorithm,
+            "capture_hidden_mode": capture_hidden_mode,
+            "return_hidden_states_before_norm": return_hidden_states_before_norm,
+            "tbo_split_seq_index": batch.tbo_split_seq_index,
+            "top_logprobs_nums": batch.top_logprobs_nums,
+            "token_ids_logprobs": batch.token_ids_logprobs,
+            "mm_inputs": batch.multimodal_inputs,
+            "encoder_cached": batch.encoder_cached,
+            "encoder_lens_cpu": batch.encoder_lens_cpu,
+            "lora_ids": None,
+            "rids": None,
+            "sampling_info": batch.sampling_info,
+            "spec_info": batch.spec_info,
+        }
+
+        def populate_reusable_scalars(ret, initializing: bool) -> None:
+            num_tokens = len(batch.input_ids)
+            ret.num_token_non_padded_cpu = num_tokens
+            if enable_num_token_non_padded():
+                if initializing:
+                    ret.num_token_non_padded = torch.empty(
+                        (), dtype=torch.int32, device=model_runner.device
+                    )
+                ret.num_token_non_padded.fill_(num_tokens)
+
+            if batch.global_num_tokens is None:
+                return
+            assert batch.global_num_tokens_for_logprob is not None
+            from sglang.srt.speculative.spec_info import (
+                spec_scale_global_num_tokens,
+            )
+
+            global_tokens, global_logprob_tokens = spec_scale_global_num_tokens(
+                batch.spec_info,
+                batch.global_num_tokens,
+                batch.global_num_tokens_for_logprob,
+            )
+            ret.original_global_num_tokens_cpu = batch.global_num_tokens
+            ret.global_num_tokens_cpu = global_tokens
+            ret.global_num_tokens_for_logprob_cpu = global_logprob_tokens
+            if initializing:
+                ret.global_num_tokens_gpu = torch.tensor(
+                    global_tokens, dtype=torch.int64, device=model_runner.device
+                )
+                ret.global_num_tokens_for_logprob_gpu = torch.tensor(
+                    global_logprob_tokens,
+                    dtype=torch.int64,
+                    device=model_runner.device,
+                )
+            elif len(global_tokens) == 1 and len(global_logprob_tokens) == 1:
+                ret.global_num_tokens_gpu.fill_(global_tokens[0])
+                ret.global_num_tokens_for_logprob_gpu.fill_(
+                    global_logprob_tokens[0]
+                )
+            else:
+                ret.global_num_tokens_gpu.copy_(
+                    torch.tensor(
+                        global_tokens, dtype=torch.int64, device=model_runner.device
+                    )
+                )
+                ret.global_num_tokens_for_logprob_gpu.copy_(
+                    torch.tensor(
+                        global_logprob_tokens,
+                        dtype=torch.int64,
+                        device=model_runner.device,
+                    )
+                )
+
+        pool = getattr(graph_runner, "_dspark_verify_fb_pool", None)
+        if pool is None:
+            pool = []
+            graph_runner._dspark_verify_fb_pool = pool
+        cursor = 0
+        if cursor >= len(pool):
+            ret = cls(**values)
+            populate_reusable_scalars(ret, initializing=True)
+            ret.positions = batch.spec_info.positions
+            pool.append((ret, dict(ret.__dict__)))
+            bind_kv_loc_plan(ret)
+            return ret
+
+        ret, pristine = pool[cursor]
+        ret.__dict__.clear()
+        ret.__dict__.update(pristine)
+        ret.__dict__.update(values)
+        populate_reusable_scalars(ret, initializing=False)
+        ret.positions = batch.spec_info.positions
+        bind_kv_loc_plan(ret)
         return ret
 
     def _maybe_init_non_generation_fields(self, batch: ScheduleBatch):

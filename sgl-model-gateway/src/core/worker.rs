@@ -1145,6 +1145,7 @@ impl Worker for DPAwareWorker {
 /// which is essential for streaming responses where the function returns
 /// immediately but the stream continues in the background.
 pub struct WorkerLoadGuard {
+    request_counter: Option<Arc<AtomicUsize>>,
     worker: Arc<dyn Worker>,
     routing_key: Option<String>,
 }
@@ -1162,14 +1163,28 @@ impl WorkerLoadGuard {
         }
 
         Self {
+            request_counter: None,
             worker,
             routing_key,
         }
+    }
+    pub fn with_request_counter(
+        worker: Arc<dyn Worker>,
+        headers: Option<&http::HeaderMap>,
+        counter: Arc<AtomicUsize>,
+    ) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        let mut guard = Self::new(worker, headers);
+        guard.request_counter = Some(counter);
+        guard
     }
 }
 
 impl Drop for WorkerLoadGuard {
     fn drop(&mut self) {
+        if let Some(counter) = &self.request_counter {
+            counter.fetch_sub(1, Ordering::AcqRel);
+        }
         self.worker.decrement_load();
         if let Some(ref key) = self.routing_key {
             self.worker.worker_routing_key_load().decrement(key);

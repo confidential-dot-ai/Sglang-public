@@ -68,11 +68,27 @@ class DFlashDraftInputV2(SpecInput):
     ) -> None:
         pin_memory = is_pin_memory_available(device)
 
+        # Resolve to the concrete per-rank device (e.g. "cuda:2") before
+        # comparing against buf.device (task #142): torch.empty(...,
+        # device="cuda") lands on whatever this process's current CUDA
+        # device is and reports that concrete device on the resulting
+        # tensor, but the unresolved string "cuda" never equals "cuda:N" --
+        # so comparing str(buf.device) against the caller's raw (often
+        # unindexed) `device` arg was true on literally every call
+        # regardless of real growth need, doubling capacity every single
+        # prepare_for_decode() tick forever. Confirmed live: bs stayed
+        # single digits/teens for the whole run while capacity still
+        # doubled 32 -> 64 -> ... -> 4294967296, OOMing on the next
+        # doubling's 18.25 GiB int32 allocation.
+        resolved_device = torch.device(device)
+        if resolved_device.type == "cuda" and resolved_device.index is None:
+            resolved_device = torch.device("cuda", torch.cuda.current_device())
+
         def needs_cpu_alloc(buf: Optional[torch.Tensor]) -> bool:
             return buf is None or buf.numel() < bs
 
         def needs_gpu_alloc(buf: Optional[torch.Tensor]) -> bool:
-            return buf is None or buf.numel() < bs or str(buf.device) != str(device)
+            return buf is None or buf.numel() < bs or buf.device != resolved_device
 
         def grown_capacity(buf: Optional[torch.Tensor]) -> int:
             current = 0 if buf is None else int(buf.numel())
@@ -232,7 +248,32 @@ class DFlashDraftInputV2(SpecInput):
             self.nxt_kv_lens_sum = int(self.nxt_kv_lens_cpu.sum().item())
 
         if self.future_indices is not None:
+            prev_bs = int(self.future_indices.shape[0])
             self.future_indices = self.future_indices[new_indices]
+            # The Eagle-shaped fields below are documented as "unused" on the
+            # FutureMap relay path -- true for DFLASH, which resolves them out
+            # of the future map. DSPARK does NOT: dspark_worker_v2's
+            # _forward_decode reads draft_input.bonus_tokens directly
+            # (draft_block_ids[:, 0].copy_(bonus_tokens.view(-1))). Returning
+            # here without filtering them left every one at the PRE-filter
+            # width, so any row-filtering of a DSpark batch desynced them from
+            # batch.reqs (the next decode tick crashed with e.g. "size of tensor
+            # a (4) must match tensor b (67)").
+            #
+            # Filter by matching first-dim only: these are legitimately
+            # zero-width placeholders on some construction paths (see
+            # DFlashDraftInputV2 construction with torch.empty((0,))), and
+            # indexing those would raise instead of no-op.
+            for _name in (
+                "topk_p",
+                "topk_index",
+                "bonus_tokens",
+                "new_seq_lens",
+                "hidden_states",
+            ):
+                _t = getattr(self, _name, None)
+                if _t is not None and _t.dim() > 0 and _t.shape[0] == prev_bs:
+                    setattr(self, _name, _t[new_indices])
             return
 
         self.topk_p = self.topk_p[new_indices]

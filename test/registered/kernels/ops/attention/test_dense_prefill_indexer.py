@@ -267,6 +267,17 @@ class TestDensePrefillIndexer(CustomTestCase):
                         )
                         self.assert_topk(tail_inputs, selected, consumer_scores[rows])
 
+    def test_selection_is_ascending_past_topk(self):
+        """A row with more candidates than topk is selected in ascending position
+        order, as a shorter row is: the sparse attention rounds in selection order,
+        and an order that varied between runs made identical prompts drift."""
+        inputs = make_inputs([(64, 2048), (3, 300)])
+        selected, _ = run_dense(inputs, publish_candidates=False, candidates=None)
+        self.assertTrue((inputs["lengths"] > inputs["topk"]).any())
+        pad = torch.iinfo(selected.dtype).max
+        keys = selected.masked_fill(selected < 0, pad)
+        self.assertTrue(((keys[:, 1:] > keys[:, :-1]) | (keys[:, 1:] == pad)).all())
+
     def test_unfiltered_and_zero_length_requests(self):
         for request_lengths in ([(257, 8192)], [(1, 0), (1, 1), (0, 7)]):
             for publish in (False, True):

@@ -24,15 +24,16 @@ from sglang.kernels.ops.attention.dsv4.topk import (
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import async_h2d
 
+from .memory_budget import INDEX_LOGITS_BUDGET_CAP_BYTES, planned_index_logits_budget
 from .types import DecodeInputs, PrefillInputs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsv4.dsv41_sparse import DeepseekV41Indexer
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
-# TODO: use a per-forward mqa_logits_budget_bytes() budget that also
-# leaves room for candidate block ids and block-selection scratch.
-_DEEP_GEMM_SCORE_BUDGET_BYTES = 2 << 30
+# Cap of one fp32 logits tile; startup planning (memory_budget) may lower it to
+# what CUDA-graph capture leaves free.
+_DEEP_GEMM_SCORE_BUDGET_BYTES = INDEX_LOGITS_BUDGET_CAP_BYTES
 
 
 class DeepGEMMDecodeData(msgspec.Struct, frozen=True):
@@ -158,17 +159,53 @@ def get_deep_gemm_decode_data(
     return DeepGEMMDecodeData(q_fp4, q_sf, weights, k_cache)
 
 
-def get_deep_gemm_prefill_data(
+def get_prefill_queries(inputs: PrefillInputs) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Roped queries [rows, heads, 128] and bf16 head weights [rows, heads]."""
+    assert (inputs.q is None) == (inputs.weights is None), (
+        "a precomputed prefill query comes with its head weights"
+    )
+    if inputs.q is not None:
+        return inputs.q, inputs.weights
+    indexer = inputs.indexer
+    return (
+        indexer.queries(inputs.q_lora, inputs.freqs_cis[inputs.positions]),
+        indexer.head_weights(inputs.x),
+    )
+
+
+def _prefill_index_q_and_weights(
+    inputs: PrefillInputs,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``_index_q_and_weights`` for a prefill chunk, or the quantized queries and
+    fp32 weights the prefill graph's projection break already computed."""
+    if inputs.q is None:
+        return _index_q_and_weights(
+            indexer=inputs.indexer,
+            x=inputs.x,
+            q_lora=inputs.q_lora,
+            freqs_cis=inputs.freqs_cis,
+            positions=inputs.positions,
+        )
+    q, weights = get_prefill_queries(inputs)
+    q_fp4, q_sf = quantize_index_q(q)
+    return q_fp4, q_sf, weights.float()
+
+
+class PrefillLayout(msgspec.Struct, frozen=True):
+    """The index-K layout of one extend at one compress ratio; every layer of
+    that ratio in the forward reads the same one."""
+
+    k_slots: torch.Tensor
+    request_starts: torch.Tensor
+    lens_per_request: List[int]
+    compress_lens: torch.Tensor
+
+
+def _prefill_layout(
     inputs: PrefillInputs, req_to_token: torch.Tensor
-) -> Optional[DeepGEMMPrefillData]:
-    """None when the chunk has no row or no visible compressed position."""
+) -> Optional[PrefillLayout]:
     ratio = inputs.compress_ratio
     pos = inputs.positions
-    assert (
-        inputs.seq_lens_cpu is not None
-        and inputs.rows_per_request is not None
-        and inputs.rows_per_request_device is not None
-    ), "the DeepGEMM prefill indexer needs the CPU length vectors"
     device = pos.device
     # Visible compressed positions per request; (pos + 1) // ratio bounds each row.
     lens_per_request = [s // ratio for s in inputs.seq_lens_cpu]
@@ -184,14 +221,7 @@ def get_deep_gemm_prefill_data(
     )
     position = torch.arange(columns, device=device) - starts_dev[request]
     pool_rows = inputs.req_pool_indices.to(torch.int64)[request]
-    q_fp4, q_sf, weights = _index_q_and_weights(
-        indexer=inputs.indexer,
-        x=inputs.x,
-        q_lora=inputs.q_lora,
-        freqs_cis=inputs.freqs_cis,
-        positions=pos,
-    )
-    return DeepGEMMPrefillData(
+    return PrefillLayout(
         k_slots=req_to_token[pool_rows, position * ratio].to(torch.int64) // ratio,
         request_starts=torch.repeat_interleave(
             starts_dev.to(torch.int32),
@@ -199,8 +229,37 @@ def get_deep_gemm_prefill_data(
             output_size=num_tokens,
         ),
         lens_per_request=lens_per_request,
-        rows_per_request=inputs.rows_per_request,
         compress_lens=((pos + 1) // ratio).to(torch.int32),
+    )
+
+
+def get_deep_gemm_prefill_data(
+    inputs: PrefillInputs, req_to_token: torch.Tensor
+) -> Optional[DeepGEMMPrefillData]:
+    """None when the chunk has no row or no visible compressed position."""
+    assert (
+        inputs.seq_lens_cpu is not None
+        and inputs.rows_per_request is not None
+        and inputs.rows_per_request_device is not None
+    ), "the DeepGEMM prefill indexer needs the CPU length vectors"
+    cache = inputs.layout_cache
+    # The rows identify the extend within the cache's forward.
+    key = (inputs.compress_ratio, inputs.positions.data_ptr(), inputs.positions.shape[0])
+    if cache is not None and key in cache:
+        layout = cache[key]
+    else:
+        layout = _prefill_layout(inputs, req_to_token)
+        if cache is not None:
+            cache[key] = layout
+    if layout is None:
+        return None
+    q_fp4, q_sf, weights = _prefill_index_q_and_weights(inputs)
+    return DeepGEMMPrefillData(
+        k_slots=layout.k_slots,
+        request_starts=layout.request_starts,
+        lens_per_request=layout.lens_per_request,
+        rows_per_request=inputs.rows_per_request,
+        compress_lens=layout.compress_lens,
         q_fp4=q_fp4,
         q_sf=q_sf,
         weights=weights,
@@ -215,7 +274,7 @@ def score_tiles(data: DeepGEMMPrefillData, kv: Tuple[torch.Tensor, torch.Tensor]
         starts=data.request_starts,
         lengths=data.compress_lens,
         context_lengths=data.lens_per_request,
-        budget_bytes=_DEEP_GEMM_SCORE_BUDGET_BYTES,
+        budget_bytes=min(_DEEP_GEMM_SCORE_BUDGET_BYTES, planned_index_logits_budget()),
     )
 
 
@@ -227,7 +286,9 @@ def topk_ragged(
     offsets: torch.Tensor,
 ) -> None:
     """Top-k of each row's first ``lens`` columns plus ``offsets`` into ``out``,
-    ``-1`` padded, unordered: DeepSelect for bf16 logits, top-k v2 for fp32."""
+    ascending, ``-1`` padded: DeepSelect for bf16 logits, top-k v2 for fp32."""
+    from sglang.kernels.ops.attention.dsv4 import sort_selection_
+
     if logits.dtype == torch.bfloat16:
         from sglang.kernels.ops.attention.deep_select import topk
 
@@ -239,10 +300,11 @@ def topk_ragged(
             output_idx_offset=offsets,
             idx_oob_fill_value=-1,
         )
-        return
-    from sglang.kernels.ops.attention.dsv4 import topk_transform_ragged_v2
+    else:
+        from sglang.kernels.ops.attention.dsv4 import topk_transform_ragged_v2
 
-    topk_transform_ragged_v2(logits, lens, out_offsets=offsets, out_indices=out)
+        topk_transform_ragged_v2(logits, lens, out_offsets=offsets, out_indices=out)
+    sort_selection_(out)
 
 
 def dense_prefill_topk(
@@ -306,8 +368,7 @@ def prefill_requests(
     req, pos = inputs.req_rows, inputs.positions
     assert req is not None, "the torch indexer needs the batch's rows"
     inputs.reset_outputs()
-    q = indexer.queries(inputs.q_lora, inputs.freqs_cis[pos])
-    weights = indexer.head_weights(inputs.x)
+    q, weights = get_prefill_queries(inputs)
     # A compressed position is visible once the query has passed its last token.
     compress_lens = (pos + 1) // ratio
     topk = indexer.index_topk

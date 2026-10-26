@@ -1226,7 +1226,10 @@ class CommonKVManager(BaseKVManager):
                     "enable DSpark with the same block size and target/draft KV "
                     "layout. Upgrade both servers together."
                 )
-
+            # A CED-split prefill runs no DSpark; its latent KV fans out to any
+            # decode TP size like other MLA KV.
+            ced_split = (local_layout or {}).get("ced_split", False)
+            prefill_tail = (local_layout or {}).get("prefill_tail", False)
             decode_tp_size_aligns_prefill_world_size = (
                 info.attn_cp_size > 1
                 and (self.is_mla_backend or self.is_hybrid_mla_backend)
@@ -1234,7 +1237,8 @@ class CommonKVManager(BaseKVManager):
                 and info.attn_tp_size * info.attn_cp_size == self.attn_tp_size
             )
             if (
-                info.attn_tp_size != self.attn_tp_size
+                not (ced_split or prefill_tail)
+                and info.attn_tp_size != self.attn_tp_size
                 and not decode_tp_size_aligns_prefill_world_size
             ):
                 raise RuntimeError(
@@ -2720,6 +2724,11 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         dsv41_spec_layout = data.get("dsv41_spec_layout")
 
         if self._registered_count and self.dsv41_spec_layout != dsv41_spec_layout:
+            logger.error(
+                "DSV41 PP layout mismatch: registered=%s incoming=%s",
+                self.dsv41_spec_layout,
+                dsv41_spec_layout,
+            )
             return web.Response(
                 text="DeepSeek-V4.1 DSpark PD layout differs across prefill ranks",
                 status=400,

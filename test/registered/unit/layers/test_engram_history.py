@@ -1,4 +1,5 @@
-"""Engram history rows the scheduler builds for multimodal requests. CPU only."""
+"""Engram history rows: what the scheduler builds for multimodal requests, and
+what a CED boundary replay commits. CPU only."""
 
 import unittest
 from types import SimpleNamespace
@@ -83,6 +84,39 @@ class TestEngramHistoryMultimodalPads(CustomTestCase):
         self.assertEqual(
             manager.engram_hasher.history[1].tolist(), [MM_PAD_SHIFT_VALUE] * 2
         )
+
+
+class TestEngramHistoryBoundaryReplay(CustomTestCase):
+    def test_boundary_replay_commits_the_prompt_tail(self):
+        """A CED tail replayed from prefill's boundary state runs no Engram layer,
+        yet the request's history row must end at its last prompt tokens: its first
+        decode step hashes from that row, which otherwise still holds whatever the
+        slot's previous request left there."""
+        from sglang.srt.models.deepseek_v4 import deepseek_v4_engram_forward_hash_ids
+
+        hasher = _make_manager().engram_hasher
+        hasher.history[1] = torch.tensor([5, 6], dtype=torch.int32)
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            req_pool_indices=torch.tensor([1]),
+            positions=torch.arange(4),
+            extend_seq_lens=torch.tensor([4]),
+            extend_start_loc=torch.tensor([0]),
+            extend_seq_lens_cpu=[4],
+            engram_history=torch.zeros(1, 2, dtype=torch.int32),
+            out_cache_loc=torch.tensor([10, 11, 12, 13]),
+        )
+        hash_ids = deepseek_v4_engram_forward_hash_ids(
+            hasher=hasher,
+            prefetcher=None,
+            input_ids=torch.tensor([1, 2, 3, 4]),
+            num_rows=4,
+            forward_batch=forward_batch,
+            cp_extend=False,
+            replay_from_boundary=True,
+        )
+        self.assertIsNone(hash_ids)
+        self.assertEqual(hasher.history[1].tolist(), [3, 4])
 
 
 if __name__ == "__main__":

@@ -473,7 +473,11 @@ class SchedulePolicy:
 
         Call sites that omit `processed_tokens` (dllm, disagg decode)
         degrade to rid-lexicographic order; those queues carry no prefill work.
+
+        ``SGLANG_HRRN_SIZE_EXPONENT`` raises ``uncached`` to a power: 1.0 is the
+        ratio above, larger values favor short prefills more strongly.
         """
+        exponent = envs.SGLANG_HRRN_SIZE_EXPONENT.get()
 
         def _key(r: Req):
             rid = r.rid
@@ -484,7 +488,7 @@ class SchedulePolicy:
                 # No prefill work; drain immediately.
                 return (-float("inf"), rid)
             waited_tokens = max(0, processed_tokens - r.arrival_processed_tokens)
-            ratio_delta = waited_tokens / uncached
+            ratio_delta = waited_tokens / uncached**exponent
             return (-ratio_delta, rid)
 
         waiting_queue.sort(key=_key)

@@ -12,6 +12,9 @@ from torch.nn.parameter import Parameter, UninitializedParameter
 from sglang.kernels.ops.embeddings.vocab_parallel_embedding import (
     vocab_parallel_embedding as fused_vocab_parallel_embedding,
 )
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+    is_in_tc_piecewise_cuda_graph,
+)
 from sglang.srt.distributed import (
     divide,
     tensor_model_parallel_all_reduce,
@@ -135,8 +138,7 @@ class VocabParallelEmbeddingShardIndices:
         assert self.num_added_elements <= self.num_added_elements_padded
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
-def get_masked_input_and_mask(
+def _masked_input_and_mask_impl(
     input_: torch.Tensor,
     org_vocab_start_index: int,
     org_vocab_end_index: int,
@@ -144,8 +146,6 @@ def get_masked_input_and_mask(
     added_vocab_start_index: int,
     added_vocab_end_index: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    # torch.compile will fuse all of the pointwise ops below
-    # into a single kernel, making it very fast
     org_vocab_mask = (input_ >= org_vocab_start_index) & (input_ < org_vocab_end_index)
     added_vocab_mask = (input_ >= added_vocab_start_index) & (
         input_ < added_vocab_end_index
@@ -161,6 +161,27 @@ def get_masked_input_and_mask(
     vocab_mask = org_vocab_mask | added_vocab_mask
     input_ = vocab_mask * (input_ - valid_offset)
     return input_, ~vocab_mask
+
+
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+def get_masked_input_and_mask(
+    input_: torch.Tensor,
+    org_vocab_start_index: int,
+    org_vocab_end_index: int,
+    num_org_vocab_padding: int,
+    added_vocab_start_index: int,
+    added_vocab_end_index: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    # torch.compile will fuse all of the pointwise ops below
+    # into a single kernel, making it very fast
+    return _masked_input_and_mask_impl(
+        input_,
+        org_vocab_start_index,
+        org_vocab_end_index,
+        num_org_vocab_padding,
+        added_vocab_start_index,
+        added_vocab_end_index,
+    )
 
 
 def get_embedding_tp_kwargs() -> dict:
@@ -497,14 +518,34 @@ class VocabParallelEmbedding(torch.nn.Module):
                 output_parallel = output_parallel.to(self.output_dtype)
             return output_parallel
         # Map out-of-shard ids to index 0, gather, then zero those rows.
-        masked_input, input_mask = get_masked_input_and_mask(
-            input_,
-            self.shard_indices.org_vocab_start_index,
-            self.shard_indices.org_vocab_end_index,
-            self.shard_indices.num_org_vocab_padding,
-            self.shard_indices.added_vocab_start_index,
-            self.shard_indices.added_vocab_end_index,
-        )
+        # get_masked_input_and_mask is independently torch.compiled
+        # (dynamic=True) but is called from inside the outer
+        # piecewise-CUDA-graph-traced forward pass. Its first trace
+        # specializes on whatever shape[0] it first sees, then
+        # recompiles the moment a real request supplies a different
+        # token count -- a recompile only the deliberate capture sweep
+        # is set up to handle safely (see cuda_piecewise_backend.py's
+        # PCG-capture-stream fallback). Bypass the nested compile
+        # entirely while inside piecewise CUDA graph capture/replay and
+        # run the (small, pointwise) masking logic eagerly instead.
+        if is_in_tc_piecewise_cuda_graph():
+            masked_input, input_mask = _masked_input_and_mask_impl(
+                input_,
+                self.shard_indices.org_vocab_start_index,
+                self.shard_indices.org_vocab_end_index,
+                self.shard_indices.num_org_vocab_padding,
+                self.shard_indices.added_vocab_start_index,
+                self.shard_indices.added_vocab_end_index,
+            )
+        else:
+            masked_input, input_mask = get_masked_input_and_mask(
+                input_,
+                self.shard_indices.org_vocab_start_index,
+                self.shard_indices.org_vocab_end_index,
+                self.shard_indices.num_org_vocab_padding,
+                self.shard_indices.added_vocab_start_index,
+                self.shard_indices.added_vocab_end_index,
+            )
         with symm_alloc:
             output_parallel = self.quant_method.embedding(self, masked_input.long())
         if self.output_dtype is not None:

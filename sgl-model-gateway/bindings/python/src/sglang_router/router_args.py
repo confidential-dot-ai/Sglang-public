@@ -96,8 +96,19 @@ class RouterArgs:
     queue_size: int = 100
     # Maximum time (in seconds) a request can wait in queue before timing out
     queue_timeout_secs: int = 60
-    # Token bucket refill rate (tokens per second). If not set, defaults to max_concurrent_requests
+    # Token bucket refill rate (tokens per second). If not set, max_concurrent_requests
+    # is a pure concurrency limit.
     rate_limit_tokens_per_second: Optional[int] = None
+    # Refuse chat requests carrying video parts with 400.
+    reject_video: bool = False
+    # Ceiling on images in flight on this gateway; 429 above it. 0 disables.
+    max_inflight_images: int = 0
+    # Ceiling on image area in flight, in megapixels; 429 above it. 0 disables.
+    max_inflight_megapixels: int = 0
+    # Images accepted in one request; 400 above it. 0 disables.
+    max_images_per_request: int = 0
+    # Area charged to an image whose size cannot be read, in megapixels. 0 = built-in default.
+    unmeasured_image_megapixels: int = 0
     # CORS allowed origins
     cors_allowed_origins: List[str] = dataclasses.field(default_factory=list)
     # Retry configuration
@@ -571,7 +582,44 @@ class RouterArgs:
             f"--{prefix}rate-limit-tokens-per-second",
             type=int,
             default=RouterArgs.rate_limit_tokens_per_second,
-            help="Token bucket refill rate (tokens per second). If not set, defaults to max_concurrent_requests",
+            help="Token bucket refill rate (tokens per second). If not set, "
+            "--max-concurrent-requests is a pure concurrency limit.",
+        )
+        rate_limit_group.add_argument(
+            f"--{prefix}reject-video",
+            action="store_true",
+            help="Refuse chat requests carrying video parts with 400.",
+        )
+        rate_limit_group.add_argument(
+            f"--{prefix}max-inflight-images",
+            type=int,
+            metavar="N",
+            default=RouterArgs.max_inflight_images,
+            help="Reject with 429 any chat request whose image parts would push the "
+            "number of images in flight on this gateway above N. 0 disables.",
+        )
+        rate_limit_group.add_argument(
+            f"--{prefix}max-inflight-megapixels",
+            type=int,
+            metavar="MP",
+            default=RouterArgs.max_inflight_megapixels,
+            help="Reject with 429 any chat request whose images would push the image "
+            "area in flight above MP megapixels. 0 disables.",
+        )
+        rate_limit_group.add_argument(
+            f"--{prefix}max-images-per-request",
+            type=int,
+            metavar="N",
+            default=RouterArgs.max_images_per_request,
+            help="Reject with 400 any chat request carrying more than N images. 0 disables.",
+        )
+        rate_limit_group.add_argument(
+            f"--{prefix}unmeasured-image-megapixels",
+            type=int,
+            metavar="MP",
+            default=RouterArgs.unmeasured_image_megapixels,
+            help="Area charged to an image whose dimensions cannot be read (remote "
+            "URLs), in megapixels. 0 uses the built-in default.",
         )
 
         # Retry configuration

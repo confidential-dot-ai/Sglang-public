@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
+from sglang.srt.disaggregation.ced_options import validate_ced_options
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs, exportable_env_vars
 from sglang.srt.managers.io_struct import (
@@ -182,6 +183,9 @@ class SchedulerInternalStateController:
             "dspark_clear_info_records": _UpdateHandler(
                 self._validate_dspark_clear_records, self._apply_dspark_clear_records
             ),
+            "ced_tail_options": _UpdateHandler(
+                self._validate_ced_tail_options, self._apply_ced_tail_options
+            ),
         }
 
     def _validate_pp_micro_batch_size(self, key: str, value: Any) -> None:
@@ -231,6 +235,23 @@ class SchedulerInternalStateController:
     def _apply_dspark_clear_records(self, key: str, value: Any) -> None:
         if value:
             self.scheduler.draft_worker.clear_info_records()
+
+    def _validate_ced_tail_options(self, key: str, value: Any) -> None:
+        if (
+            self.scheduler.disaggregation_mode != DisaggregationMode.DECODE
+            or not envs.SGLANG_OPT_DSV41_CED_SPLIT.get()
+        ):
+            raise UpdateRejected(f"{key} requires a CED-split decode worker.")
+        try:
+            validate_ced_options(value)
+        except (ValueError, TypeError) as error:
+            raise UpdateRejected(f"Invalid CED tail options: {error}") from error
+
+    def _apply_ced_tail_options(self, key: str, value: Any) -> None:
+        # CED tail knobs are read through envs on every rank, not server args.
+        for name, option in validate_ced_options(value).items():
+            getattr(envs, name).set(option)
+        logger.info("CED tail options updated: %s", value)
 
     def _require_dspark_worker(self, key: str, command: str) -> None:
         if not self.scheduler.spec_algorithm.is_dspark() or not hasattr(

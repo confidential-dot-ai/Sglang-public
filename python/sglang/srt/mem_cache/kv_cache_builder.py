@@ -273,14 +273,20 @@ def validate_decode_radix_cache(
             "device-resident cache and is incompatible with "
             "--enable-hierarchical-cache."
         )
-    # DeepSeek-V4 qualifies only on the unified KV layout (bf16 or fp8 rows): its
-    # SWA ring and c128 state are request-scoped and always transferred whole, so
-    # the tree shares only the compressed full-attention pages.
-    if getattr(model_config, "is_deepseek_v4_arch", False) and not getattr(
-        token_to_kv_pool, "_unified_kv", False
+    # DeepSeek-V4: the tree shares the compressed full-attention pages (c4/c128
+    # KV and the indexer rows, all addressed by full page id, so a page-aligned
+    # prefix holds whole compression groups); the c128 state is request-scoped
+    # and always transferred whole. The unified layout keeps SWA in a request
+    # ring; the paged layout's SWA is a component pool the tree retains like any
+    # SWA model's, with the window transferred fresh. ROCm runs only the
+    # unified layout.
+    if (
+        getattr(model_config, "is_deepseek_v4_arch", False)
+        and not getattr(token_to_kv_pool, "_unified_kv", False)
+        and is_hip()
     ):
         raise ValueError(
-            "--disaggregation-decode-enable-radix-cache with DeepSeek-V4 "
+            "--disaggregation-decode-enable-radix-cache with DeepSeek-V4 on ROCm "
             "requires the unified KV layout "
             "(SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton)."
         )

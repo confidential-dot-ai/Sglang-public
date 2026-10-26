@@ -1,6 +1,6 @@
 use std::{
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicI64, Ordering},
         Arc,
     },
     time::Duration,
@@ -36,7 +36,7 @@ use crate::{
     middleware::{self, AuthConfig, QueuedRequest},
     observability::{
         logging::{self, LoggingConfig},
-        metrics::{self, PrometheusConfig},
+        metrics::{self, Metrics, PrometheusConfig},
         otel_trace,
     },
     protocols::{
@@ -181,15 +181,298 @@ async fn generate(
         .await
 }
 
+/// 400 for a declined modality, naming the offending field so a caller does not
+/// have to bisect a long conversation to find it.
+fn video_rejected(param: String) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error": {
+            "message": "video input is not accepted by this deployment",
+            "type": "invalid_request_error",
+            "param": param,
+            "code": "video_not_supported",
+        }})),
+    )
+        .into_response()
+}
+
+/// Images held by admitted requests whose responses are still open.
+///
+/// Process-global: every admitted image lands on the same workers. Worker
+/// preprocessing load grows with the number of images handled concurrently,
+/// which is why this bounds images rather than requests
+/// (`max_concurrent_requests` already does that).
+static IMAGE_INFLIGHT: AtomicI64 = AtomicI64::new(0);
+
+/// Image area in flight, in pixels.
+///
+/// Preprocessing cost scales with area, not with how many files were attached.
+static IMAGE_PIXELS_INFLIGHT: AtomicI64 = AtomicI64::new(0);
+
+/// `Retry-After` on an image-capacity rejection.
+///
+/// Slots free as soon as an image-carrying response finishes, so a shorter
+/// hint than the request-admission one is appropriate.
+const IMAGE_RETRY_AFTER_SECONDS: u64 = 2;
+
+/// Image slots held by one request; released when dropped.
+///
+/// Must outlive the response body: a streaming response returns from the
+/// handler long before the worker is done with the images, so the guard is
+/// threaded into the body (see `hold_image_slots`) and released only when
+/// the body is consumed or dropped. A request that fails before routing
+/// drops it on the way out, which releases the same way.
+#[derive(Debug)]
+struct ImageSlotGuard {
+    counter: &'static AtomicI64,
+    images: i64,
+    pixel_counter: &'static AtomicI64,
+    pixels: i64,
+}
+
+impl Drop for ImageSlotGuard {
+    fn drop(&mut self) {
+        if self.images > 0 {
+            let previous = self.counter.fetch_sub(self.images, Ordering::AcqRel);
+            Metrics::set_image_inflight(previous - self.images);
+        }
+        if self.pixels > 0 {
+            let previous = self.pixel_counter.fetch_sub(self.pixels, Ordering::AcqRel);
+            Metrics::set_image_pixels_inflight(previous - self.pixels);
+        }
+    }
+}
+
+/// Reserve `amount` against `counter` without exceeding `limit`.
+///
+/// A CAS loop rather than fetch_add-then-check so a refused request never
+/// briefly inflates the count and refuses a neighbour that would have fit.
+/// `Ok` carries the new total, `Err` the headroom that was free at the time.
+fn try_reserve(counter: &'static AtomicI64, amount: i64, limit: i64) -> Result<i64, i64> {
+    match counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |inflight| {
+        inflight.checked_add(amount).filter(|total| *total <= limit)
+    }) {
+        Ok(previous) => Ok(previous + amount),
+        Err(inflight) => Err((limit - inflight).max(0)),
+    }
+}
+
+/// A request that did not fit under an image ceiling.
+///
+/// Rendered as a 429 with the same body shape and `Retry-After` as the
+/// request-admission rejection, so a client's existing backoff handles both.
+/// The two variants are reported separately because they mean different
+/// things operationally: a count refusal is a busy endpoint, an area refusal
+/// is traffic heavy enough to threaten base-GPU memory.
+#[derive(Debug)]
+enum ImageCapacityExceeded {
+    Count { images: i64, free: i64, limit: i64 },
+    Area { pixels: i64, free: i64, limit: i64 },
+}
+
+impl IntoResponse for ImageCapacityExceeded {
+    fn into_response(self) -> Response {
+        let message = match self {
+            Self::Count {
+                images,
+                free,
+                limit,
+            } => format!(
+                "request carries {images} image(s) but only {free} of {limit} image slots are free on this endpoint; retry shortly"
+            ),
+            Self::Area {
+                pixels,
+                free,
+                limit,
+            } => format!(
+                "request carries {:.1} MP of image data but only {:.1} of {:.1} MP are free on this endpoint; retry shortly",
+                pixels as f64 / 1e6,
+                free as f64 / 1e6,
+                limit as f64 / 1e6
+            ),
+        };
+        crate::routers::error::too_many_requests(
+            "image_capacity_exceeded",
+            message,
+            IMAGE_RETRY_AFTER_SECONDS,
+        )
+    }
+}
+
+/// A request carrying more images than the endpoint declares it accepts.
+///
+/// Distinct from the capacity ceilings: those are about what is in flight right
+/// now and clear on their own, so they answer 429. This is a property of the
+/// request itself -- retrying changes nothing -- so it answers 400.
+#[derive(Debug)]
+struct ImagesPerRequestExceeded {
+    images: i64,
+    limit: i64,
+}
+
+impl IntoResponse for ImagesPerRequestExceeded {
+    fn into_response(self) -> Response {
+        crate::routers::error::bad_request(
+            "images_per_request_exceeded",
+            format!(
+                "request carries {} image(s) but this endpoint accepts at most {} per request",
+                self.images, self.limit
+            ),
+        )
+    }
+}
+
+/// Reject a request that exceeds the declared per-request image maximum.
+///
+/// The in-flight ceilings alone leave behaviour load-dependent: a 399-image
+/// request is admitted on an idle endpoint and refused on a busy one, and the
+/// admitted case is a single allocation larger than anything the spec
+/// contemplates. Cap it explicitly so the boundary is a property of the
+/// endpoint rather than of the moment.
+fn admit_images_per_request(
+    config: &RouterConfig,
+    images: usize,
+) -> Result<(), ImagesPerRequestExceeded> {
+    let limit = config.max_images_per_request;
+    if limit <= 0 {
+        return Ok(());
+    }
+    let images = i64::try_from(images).unwrap_or(i64::MAX);
+    if images > limit {
+        return Err(ImagesPerRequestExceeded { images, limit });
+    }
+    Ok(())
+}
+
+/// Admit a request carrying `images` image parts covering `pixels` of area.
+///
+/// Two ceilings, because one cannot do the job: 200 thumbnails and 200
+/// full-resolution photographs are the same count and ~14x apart in
+/// preprocessing cost.
+///
+/// `Ok(None)` when both limits are off or the request carries no images, so
+/// text traffic is never touched. Count is reserved first and rolls back
+/// through `Drop` if the area check then refuses.
+fn admit_images(
+    config: &RouterConfig,
+    images: usize,
+    pixels: u64,
+    endpoint: &'static str,
+) -> Result<Option<ImageSlotGuard>, ImageCapacityExceeded> {
+    let count_limit = config.max_inflight_images;
+    let area_limit = config.max_inflight_megapixels.saturating_mul(1_000_000);
+    if images == 0 || (count_limit <= 0 && area_limit <= 0) {
+        return Ok(None);
+    }
+    let images = i64::try_from(images).unwrap_or(i64::MAX);
+    let pixels = i64::try_from(pixels).unwrap_or(i64::MAX);
+
+    let mut guard = ImageSlotGuard {
+        counter: &IMAGE_INFLIGHT,
+        images: 0,
+        pixel_counter: &IMAGE_PIXELS_INFLIGHT,
+        pixels: 0,
+    };
+
+    if count_limit > 0 {
+        match try_reserve(&IMAGE_INFLIGHT, images, count_limit) {
+            Ok(total) => {
+                guard.images = images;
+                Metrics::set_image_inflight(total);
+            }
+            Err(free) => {
+                Metrics::record_image_rejected(endpoint);
+                debug!(
+                    "Image admission: refused {endpoint} request carrying {images} image(s), {free} of {count_limit} slots free"
+                );
+                return Err(ImageCapacityExceeded::Count {
+                    images,
+                    free,
+                    limit: count_limit,
+                });
+            }
+        }
+    }
+
+    if area_limit > 0 {
+        match try_reserve(&IMAGE_PIXELS_INFLIGHT, pixels, area_limit) {
+            Ok(total) => {
+                guard.pixels = pixels;
+                Metrics::set_image_pixels_inflight(total);
+            }
+            Err(free) => {
+                Metrics::record_image_rejected(endpoint);
+                debug!(
+                    "Image admission: refused {endpoint} request carrying {pixels} px of image area, {free} of {area_limit} px free"
+                );
+                // `guard` drops on the way out, returning the slots above.
+                return Err(ImageCapacityExceeded::Area {
+                    pixels,
+                    free,
+                    limit: area_limit,
+                });
+            }
+        }
+    }
+
+    Ok(Some(guard))
+}
+
+/// Keep `guard` alive for as long as the response body.
+///
+/// The guard is moved into a frame mapper on the body, so it is dropped --
+/// and the slots released -- when the body is fully streamed or the client
+/// goes away, not when the handler returns.
+fn hold_image_slots(response: Response, guard: Option<ImageSlotGuard>) -> Response {
+    let Some(guard) = guard else {
+        return response;
+    };
+    response.map(|body| {
+        axum::body::Body::new(http_body_util::BodyExt::map_frame(body, move |frame| {
+            let _hold = &guard;
+            frame
+        }))
+    })
+}
+
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
     ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
 ) -> Response {
-    state
+    // Refused here rather than at the worker: the deployment has declared it
+    // does not take video, so the request must not reach a decoder at all.
+    if state.context.router_config.reject_video {
+        if let Some(index) = crate::media_policy::first_video_message(&body.messages) {
+            return video_rejected(format!("messages[{index}]"));
+        }
+    }
+
+    // Reserved before routing so an over-ceiling request never reaches a
+    // worker, and held until the body is done so a streaming response counts
+    // for its whole lifetime.
+    let image_count = crate::media_policy::count_image_parts(&body.messages);
+    if let Err(refused) = admit_images_per_request(&state.context.router_config, image_count) {
+        return refused.into_response();
+    }
+    let image_slots = match admit_images(
+        &state.context.router_config,
+        image_count,
+        crate::media_policy::sum_image_pixels(
+            &body.messages,
+            state.context.router_config.unmeasured_image_pixels(),
+        ),
+        "chat",
+    ) {
+        Ok(slots) => slots,
+        Err(refused) => return refused.into_response(),
+    };
+
+    let response = state
         .router
         .route_chat(Some(&headers), &body, Some(&body.model))
-        .await
+        .await;
+    hold_image_slots(response, image_slots)
 }
 
 async fn v1_completions(
@@ -398,6 +681,72 @@ async fn v1_conversations_delete_item(
     .await
 }
 
+#[derive(Deserialize)]
+struct SetAdmissionRequest {
+    max_concurrent: f64,
+}
+
+fn admission_snapshot(state: &AppState) -> Value {
+    match &state.context.rate_limiter {
+        Some(bucket) => json!({
+            "enabled": true,
+            "max_concurrent": bucket.capacity(),
+            "in_flight": bucket.in_flight(),
+        }),
+        None => json!({
+            "enabled": false,
+            "detail": "router started without --max-concurrent-requests; \
+                       admission limiting is disabled and cannot be enabled at runtime",
+        }),
+    }
+}
+
+async fn get_admission(State(state): State<Arc<AppState>>) -> Response {
+    Json(admission_snapshot(&state)).into_response()
+}
+
+/// Retune the admission ceiling. Lowering it never aborts in-flight requests:
+/// concurrency drains to the new ceiling as they complete.
+async fn set_admission(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SetAdmissionRequest>,
+) -> Response {
+    if !req.max_concurrent.is_finite() || req.max_concurrent < 1.0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "max_concurrent must be a finite number >= 1"})),
+        )
+            .into_response();
+    }
+
+    let Some(bucket) = state.context.rate_limiter.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(admission_snapshot(&state)),
+        )
+            .into_response();
+    };
+
+    let previous = bucket.capacity();
+    bucket.set_capacity(req.max_concurrent);
+    info!(
+        "Admission limit changed {} -> {} via /admission",
+        previous, req.max_concurrent
+    );
+    // Also sampled on the admission path, but that only runs when a request is
+    // admitted; without this an idle router reports the old ceiling until the
+    // next request arrives.
+    Metrics::set_admission_state(bucket.capacity(), bucket.in_flight());
+
+    Json(json!({
+        "enabled": true,
+        "previous_max_concurrent": previous,
+        "max_concurrent": bucket.capacity(),
+        "in_flight": bucket.in_flight(),
+    }))
+    .into_response()
+}
+
 async fn flush_cache(State(state): State<Arc<AppState>>, _req: Request) -> Response {
     WorkerManager::flush_cache_all(&state.context.worker_registry, &state.context.client)
         .await
@@ -431,6 +780,41 @@ async fn get_worker(
     match state.context.worker_service.get_worker(&worker_id_raw) {
         Ok(result) => result.into_response(),
         Err(err) => err.into_response(),
+    }
+}
+
+async fn drain_worker(State(state): State<Arc<AppState>>, Path(raw): Path<String>) -> Response {
+    let id = crate::core::worker_registry::WorkerId::from_string(raw);
+    match state.context.worker_registry.begin_drain(&id) {
+        Some((url, active)) => Json(json!({"worker_id": id.as_str(), "url": url, "draining": true, "active_requests": active})).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn model_routes_status(State(state): State<Arc<AppState>>) -> Response {
+    Json(state.context.worker_registry.model_routes_status()).into_response()
+}
+
+async fn model_routes(State(state): State<Arc<AppState>>) -> Response {
+    Json(state.context.worker_registry.model_routes()).into_response()
+}
+
+async fn drain_worker_status(
+    State(state): State<Arc<AppState>>,
+    Path(raw): Path<String>,
+) -> Response {
+    let id = crate::core::worker_registry::WorkerId::from_string(raw);
+    match state.context.worker_registry.drain_status(&id) {
+        Some((url, active)) => Json(json!({"worker_id": id.as_str(), "url": url, "draining": true, "active_requests": active})).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+async fn resume_worker(State(state): State<Arc<AppState>>, Path(raw): Path<String>) -> Response {
+    let id = crate::core::worker_registry::WorkerId::from_string(raw);
+    if state.context.worker_registry.finish_drain(&id) {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        StatusCode::CONFLICT.into_response()
     }
 }
 
@@ -607,6 +991,7 @@ pub fn build_app(
     // Build admin routes with control plane auth if configured, otherwise use simple API key auth
     let admin_routes = Router::new()
         .route("/flush_cache", post(flush_cache))
+        .route("/admission", get(get_admission).post(set_admission))
         .route("/v1/loads", get(get_loads))
         // TODO: Remove `/get_loads` alias after one release-cycle deprecation window.
         .route("/get_loads", get(get_loads))
@@ -631,6 +1016,14 @@ pub fn build_app(
 
     // Build worker routes
     let worker_routes = Router::new()
+        .route("/model-routes", get(model_routes))
+        .route("/model-routes/status", get(model_routes_status))
+        .route(
+            "/workers/{worker_id}/drain",
+            post(drain_worker)
+                .get(drain_worker_status)
+                .delete(resume_worker),
+        )
         .route("/workers", post(create_worker).get(list_workers_rest))
         .route(
             "/workers/{worker_id}",
@@ -937,9 +1330,44 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         Duration::from_secs(config.router_config.queue_timeout_secs),
     );
 
-    if app_context.rate_limiter.is_none() {
-        info!("Rate limiting is disabled (max_concurrent_requests = -1)");
+    match &app_context.rate_limiter {
+        None => info!("Rate limiting is disabled (max_concurrent_requests = -1)"),
+        Some(bucket) => Metrics::set_admission_state(bucket.capacity(), bucket.in_flight()),
     }
+
+    let router_config = &config.router_config;
+    if router_config.reject_video {
+        info!("Video input is refused with 400 (reject_video)");
+    }
+    if router_config.max_images_per_request > 0 {
+        info!(
+            "Per-request image limit enabled (max_images_per_request = {})",
+            router_config.max_images_per_request
+        );
+    }
+    if router_config.max_inflight_images > 0 {
+        info!(
+            "Image admission limit enabled (max_inflight_images = {})",
+            router_config.max_inflight_images
+        );
+    }
+    if router_config.max_inflight_megapixels > 0 {
+        info!(
+            "Image area limit enabled (max_inflight_megapixels = {}, unmeasured images charged {:.1} MP)",
+            router_config.max_inflight_megapixels,
+            router_config.unmeasured_image_pixels() as f64 / 1e6
+        );
+    }
+    // Occupancy is published on every reserve and release; seeding it here
+    // makes an idle router report 0 rather than nothing.
+    Metrics::set_image_limits(
+        router_config.max_inflight_images,
+        router_config
+            .max_inflight_megapixels
+            .saturating_mul(1_000_000),
+    );
+    Metrics::set_image_inflight(IMAGE_INFLIGHT.load(Ordering::Acquire));
+    Metrics::set_image_pixels_inflight(IMAGE_PIXELS_INFLIGHT.load(Ordering::Acquire));
 
     match processor {
         Some(proc) => {
@@ -1147,4 +1575,145 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLaye
     };
 
     cors.max_age(Duration::from_secs(3600))
+}
+
+#[cfg(test)]
+mod image_admission_tests {
+    use super::*;
+
+    /// Reserve count-only slots and return the guard that releases them.
+    ///
+    /// `try_reserve` is now the bare CAS and builds no guard, so these tests
+    /// assemble the count half the way `admit_images` does. `pixels: 0` makes
+    /// the area half inert -- `ImageSlotGuard::drop` skips a zero.
+    fn reserve_slots(
+        counter: &'static AtomicI64,
+        images: i64,
+        limit: i64,
+    ) -> Result<ImageSlotGuard, i64> {
+        try_reserve(counter, images, limit).map(|total| {
+            Metrics::set_image_inflight(total);
+            ImageSlotGuard {
+                counter,
+                images,
+                pixel_counter: &IMAGE_PIXELS_INFLIGHT,
+                pixels: 0,
+            }
+        })
+    }
+
+    #[test]
+    fn slots_are_reserved_and_released_on_drop() {
+        static COUNTER: AtomicI64 = AtomicI64::new(0);
+
+        let first = reserve_slots(&COUNTER, 3, 4).unwrap();
+        assert_eq!(COUNTER.load(Ordering::Acquire), 3);
+
+        // One slot left: two do not fit, and the refusal reports what is free
+        // without consuming anything.
+        assert_eq!(reserve_slots(&COUNTER, 2, 4).unwrap_err(), 1);
+        assert_eq!(COUNTER.load(Ordering::Acquire), 3);
+
+        let second = reserve_slots(&COUNTER, 1, 4).unwrap();
+        assert_eq!(COUNTER.load(Ordering::Acquire), 4);
+        assert_eq!(reserve_slots(&COUNTER, 1, 4).unwrap_err(), 0);
+
+        drop(first);
+        assert_eq!(COUNTER.load(Ordering::Acquire), 1);
+        drop(second);
+        assert_eq!(COUNTER.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn a_request_larger_than_the_ceiling_never_fits() {
+        static COUNTER: AtomicI64 = AtomicI64::new(0);
+
+        assert_eq!(reserve_slots(&COUNTER, 3, 2).unwrap_err(), 2);
+        assert_eq!(COUNTER.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn admission_is_a_no_op_when_disabled_or_without_images() {
+        let disabled = RouterConfig {
+            max_inflight_images: 0,
+            ..RouterConfig::default()
+        };
+        assert!(admit_images(&disabled, 5, 0, "chat").unwrap().is_none());
+
+        let enabled = RouterConfig {
+            max_inflight_images: 2,
+            ..RouterConfig::default()
+        };
+        assert!(admit_images(&enabled, 0, 0, "chat").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn refusal_is_a_429_with_the_shared_error_shape() {
+        static COUNTER: AtomicI64 = AtomicI64::new(0);
+
+        // Fill the ceiling through the same reservation path the handlers use.
+        let _held = reserve_slots(&COUNTER, 3, 4).unwrap();
+        let free = reserve_slots(&COUNTER, 2, 4).unwrap_err();
+        assert_eq!(free, 1);
+
+        let rejected = ImageCapacityExceeded::Count {
+            images: 2,
+            free,
+            limit: 4,
+        }
+        .into_response();
+        assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            rejected
+                .headers()
+                .get(crate::routers::error::HEADER_X_SMG_ERROR_CODE)
+                .unwrap(),
+            "image_capacity_exceeded"
+        );
+        assert_eq!(
+            rejected.headers().get(http::header::RETRY_AFTER).unwrap(),
+            "2"
+        );
+
+        let body = http_body_util::BodyExt::collect(rejected.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["code"], "image_capacity_exceeded");
+        assert_eq!(
+            body["error"]["message"],
+            "request carries 2 image(s) but only 1 of 4 image slots are free on this endpoint; retry shortly"
+        );
+    }
+
+    #[tokio::test]
+    async fn slots_are_held_until_the_body_is_consumed() {
+        static COUNTER: AtomicI64 = AtomicI64::new(0);
+
+        let guard = reserve_slots(&COUNTER, 2, 8).unwrap();
+        let response =
+            hold_image_slots(Response::new(axum::body::Body::from("hello")), Some(guard));
+        // Returning the response is not the end of the request for a stream.
+        assert_eq!(COUNTER.load(Ordering::Acquire), 2);
+
+        let bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        assert_eq!(&bytes[..], b"hello");
+        assert_eq!(COUNTER.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn slots_are_released_when_the_body_is_dropped_unread() {
+        static COUNTER: AtomicI64 = AtomicI64::new(0);
+
+        let guard = reserve_slots(&COUNTER, 2, 8).unwrap();
+        let response =
+            hold_image_slots(Response::new(axum::body::Body::from("hello")), Some(guard));
+        assert_eq!(COUNTER.load(Ordering::Acquire), 2);
+        drop(response);
+        assert_eq!(COUNTER.load(Ordering::Acquire), 0);
+    }
 }

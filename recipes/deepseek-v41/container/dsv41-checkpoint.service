@@ -1,0 +1,18 @@
+# Assembles the checkpoint before the Engram holder starts; a no-op once complete
+# or when dsv41.env sets no DSV41_CHECKPOINT. The first run may download hundreds
+# of GiB, so it has no start timeout.
+[Unit]
+Description=DeepSeek-V4.1 checkpoint assembly (container)
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/home/ubuntu/sglang-private/recipes/deepseek-v41/container
+ExecStart=/usr/bin/docker compose -f compose.yaml --env-file dsv41.env run --rm --no-deps checkpoint
+TimeoutStartSec=infinity
+
+[Install]
+WantedBy=multi-user.target

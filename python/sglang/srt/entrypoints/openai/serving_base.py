@@ -52,6 +52,47 @@ class OpenAIServingBase(ABC):
 
         return base_model, adapter_name
 
+    def _validate_model_name(self, model: Optional[str]) -> Optional[str]:
+        """Reject a `model` this server does not serve.
+
+        Without this a typo'd or misrouted model name is served normally and
+        echoed back in the response, so a client that fails over to the wrong
+        deployment gets plausible output from the wrong model with no signal.
+        `/v1/models/{model}` already 404s on an unknown name; this applies the
+        same rule to the inference path.
+
+        Accepts the served name, the underlying model path, and any loaded
+        LoRA adapter, including through the `base-model:adapter` syntax.
+        Returns an error string, or None when the name is acceptable.
+        """
+        if not model or not model.strip():
+            # `model` has always been optional here, and tightening that is a
+            # separate decision from rejecting a name that is simply wrong.
+            return None
+
+        base_model, _adapter = self._parse_model_parameter(model.strip())
+        tm = self.tokenizer_manager
+
+        allowed = {
+            getattr(tm, "served_model_name", None),
+            getattr(tm, "model_path", None),
+        }
+        if getattr(tm.server_args, "enable_lora", False):
+            try:
+                allowed |= {
+                    ref.lora_name
+                    for ref in tm.lora_registry.get_all_adapters().values()
+                }
+            except Exception:
+                # A registry we cannot read is our fault, not the caller's.
+                # Never turn an internal fault into a 400 on a valid request.
+                return None
+        allowed.discard(None)
+
+        if base_model in allowed:
+            return None
+        return f"The model `{base_model}` does not exist."
+
     def _resolve_lora_path(
         self,
         request_model: str,

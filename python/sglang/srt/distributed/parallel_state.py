@@ -959,6 +959,11 @@ class GroupCoordinator:
         input_: torch.Tensor,
         should_use_pymscclpp_allreduce: Optional[bool] = None,
     ) -> Optional[str]:
+        # Checked before the size-threshold backends below: inside a captured
+        # graph every rank must pick the same implementation, and the choice
+        # cannot be renegotiated at replay.
+        if is_in_tc_piecewise_cuda_graph() and self.pynccl_comm is not None:
+            return "pynccl"
         if should_use_pymscclpp_allreduce is None:
             should_use_pymscclpp_allreduce = (
                 self.pymscclpp_comm is not None
@@ -995,9 +1000,6 @@ class GroupCoordinator:
             and self.torch_symm_mem_comm.should_torch_symm_mem_allreduce(input_)
         ):
             return "torch_symm_mem"
-        if is_in_tc_piecewise_cuda_graph() and self.pynccl_comm is not None:
-            # For piecewise cuda graph, we use pynccl outplace allreduce
-            return "pynccl"
         return None
 
     def _can_use_flashinfer_allreduce(self, input_: torch.Tensor) -> bool:
@@ -3271,6 +3273,19 @@ def destroy_model_parallel():
 
     global _SHARED_EXPERTS_TP
     global _ATTN_TP
+
+    # FlashInfer CUDA graphs retain raw workspace pointers. Destroy every
+    # communicator-scoped fusion workspace while its process groups are still
+    # alive.
+    try:
+        from sglang.srt.layers.flashinfer_comm_fusion import (
+            cleanup_flashinfer_workspace,
+        )
+
+        cleanup_flashinfer_workspace()
+    except Exception as e:
+        logger.warning("Failed to clean up FlashInfer fusion workspaces: %s", e)
+
     global _TP
     if (
         _SHARED_EXPERTS_TP is not None

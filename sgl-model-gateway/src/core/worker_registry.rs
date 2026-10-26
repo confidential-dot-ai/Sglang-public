@@ -11,12 +11,20 @@
 //! The ring is rebuilt only when workers are added/removed, not per-request.
 //! Uses virtual nodes (150 per worker) for even distribution and blake3 for stable hashing.
 
-use std::sync::{Arc, RwLock};
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex, RwLock,
+    },
+};
 
 use dashmap::DashMap;
+use notify::{RecursiveMode, Watcher};
 use smg_mesh::OptionalMeshSyncManager;
 use uuid::Uuid;
 
+use crate::core::model_routes::ModelRoutes;
 use crate::{
     core::{
         circuit_breaker::CircuitState,
@@ -175,9 +183,29 @@ impl Default for WorkerId {
 /// Updates create new snapshots (copy-on-write semantics).
 type ModelIndex = Arc<DashMap<String, Arc<[Arc<dyn Worker>]>>>;
 
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelRoutesStatus {
+    pub desired_revision: Option<u64>,
+    pub desired_sha256: Option<String>,
+    pub accepted_revision: u64,
+    pub accepted_sha256: String,
+    pub error: Option<String>,
+    pub watcher_error: bool,
+    pub watcher_active: bool,
+}
+
 /// Worker registry with model-based indexing
 #[derive(Debug)]
 pub struct WorkerRegistry {
+    model_routes: RwLock<ModelRoutes>,
+    model_routes_file: Option<std::path::PathBuf>,
+    model_routes_status: Mutex<ModelRoutesStatus>,
+    worker_generation: AtomicUsize,
+    alias_hash_rings: DashMap<Vec<String>, (usize, Arc<HashRing>)>,
+    /// Admission fences and response counters retained through withdrawal.
+    request_counts: DashMap<String, Arc<AtomicUsize>>,
+    maintenance: Mutex<HashMap<String, (WorkerId, Arc<dyn Worker>)>>,
     /// All workers indexed by ID
     workers: Arc<DashMap<WorkerId, Arc<dyn Worker>>>,
 
@@ -206,7 +234,29 @@ pub struct WorkerRegistry {
 impl WorkerRegistry {
     /// Create a new worker registry
     pub fn new() -> Self {
+        let model_routes_file =
+            std::env::var_os("CI_ROUTER_MODEL_ROUTES_FILE").map(std::path::PathBuf::from);
+        let (model_routes, model_routes_hash) = model_routes_file
+            .as_ref()
+            .map(|path| ModelRoutes::read(path).expect("invalid durable model route configuration"))
+            .unwrap_or_else(|| (ModelRoutes::default(), String::new()));
+        let revision = model_routes.revision;
         Self {
+            model_routes_status: Mutex::new(ModelRoutesStatus {
+                desired_revision: Some(revision),
+                desired_sha256: Some(model_routes_hash.clone()),
+                accepted_revision: revision,
+                accepted_sha256: model_routes_hash,
+                error: None,
+                watcher_error: false,
+                watcher_active: false,
+            }),
+            model_routes: RwLock::new(model_routes),
+            model_routes_file,
+            worker_generation: AtomicUsize::new(0),
+            alias_hash_rings: DashMap::new(),
+            request_counts: DashMap::new(),
+            maintenance: Mutex::new(HashMap::new()),
             workers: Arc::new(DashMap::new()),
             model_index: Arc::new(DashMap::new()),
             hash_rings: Arc::new(DashMap::new()),
@@ -215,6 +265,186 @@ impl WorkerRegistry {
             url_to_id: Arc::new(DashMap::new()),
             mesh_sync: Arc::new(RwLock::new(None)),
         }
+    }
+
+    pub fn model_routes(&self) -> ModelRoutes {
+        self.model_routes.read().unwrap().clone()
+    }
+
+    pub fn resolve_model_route(&self, model: Option<&str>) -> Option<Vec<String>> {
+        model.and_then(|name| self.model_routes.read().unwrap().routes.get(name).cloned())
+    }
+
+    pub fn reload_model_routes(
+        &self,
+        expected_revision: u64,
+        expected_sha256: &str,
+    ) -> Result<ModelRoutes, String> {
+        let path = self
+            .model_routes_file
+            .as_ref()
+            .ok_or("durable model routes are not configured")?;
+        let (future, hash) = ModelRoutes::read(path)?;
+        if hash != expected_sha256 {
+            return Err("model route file hash differs".into());
+        }
+        // Share the withdrawal lock so the readiness check and route commit
+        // cannot race with worker removal. Existing requests retain their copy.
+        let _maintenance = self.maintenance.lock().unwrap();
+        let mut current = self.model_routes.write().unwrap();
+        if *current == future {
+            let mut status = self.model_routes_status.lock().unwrap();
+            if !status.accepted_sha256.is_empty() && status.accepted_sha256 != hash {
+                return Err("model route bytes changed without a new revision".into());
+            }
+            status.error = None;
+            if expected_revision == current.revision
+                || current.revision.checked_sub(1) == Some(expected_revision)
+            {
+                return Ok(current.clone());
+            }
+            return Err("model route revision conflict".into());
+        }
+        if current.revision != expected_revision || future.revision <= current.revision {
+            return Err("model route revision conflict".into());
+        }
+        if future.routes.values().flatten().any(|model| {
+            !self.get_by_model(model).iter().any(|w| {
+                w.worker_type() == &WorkerType::Regular
+                    && w.connection_mode() == &ConnectionMode::Http
+                    && w.is_available()
+            })
+        }) {
+            return Err("model route has no ready regular HTTP worker".into());
+        }
+        // Rings are keyed by their backend list. Keep rings for unchanged
+        // routes; remove only cache keys that the new document no longer uses.
+        self.alias_hash_rings
+            .retain(|backends, _| future.routes.values().any(|value| value == backends));
+        *current = future;
+        let mut status = self.model_routes_status.lock().unwrap();
+        status.accepted_revision = current.revision;
+        status.accepted_sha256 = hash;
+        status.error = None;
+        Ok(current.clone())
+    }
+
+    pub fn model_routes_status(&self) -> ModelRoutesStatus {
+        self.model_routes_status.lock().unwrap().clone()
+    }
+
+    pub fn refresh_model_routes(&self) {
+        let Some(path) = &self.model_routes_file else {
+            return;
+        };
+        let desired = ModelRoutes::read(path);
+        {
+            let mut status = self.model_routes_status.lock().unwrap();
+            match &desired {
+                Ok((document, hash)) => {
+                    status.desired_revision = Some(document.revision);
+                    status.desired_sha256 = Some(hash.clone());
+                }
+                Err(error) => {
+                    status.desired_revision = None;
+                    status.desired_sha256 = None;
+                    status.error = Some(error.clone());
+                    return;
+                }
+            }
+        }
+        let (_, hash) = desired.unwrap();
+        let revision = self.model_routes.read().unwrap().revision;
+        if let Err(error) = self.reload_model_routes(revision, &hash) {
+            self.model_routes_status.lock().unwrap().error = Some(error);
+        }
+    }
+
+    pub fn watch_model_routes(self: &Arc<Self>) {
+        let Some(path) = &self.model_routes_file else {
+            return;
+        };
+        let directory = path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .to_owned();
+        let weak = Arc::downgrade(self);
+        std::thread::spawn(move || {
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            let mut watcher =
+                notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+                    let _ = sender.try_send(event.is_ok());
+                })
+                .ok();
+            let mut watching = watcher.as_mut().is_some_and(|watcher| {
+                watcher
+                    .watch(&directory, RecursiveMode::NonRecursive)
+                    .is_ok()
+            });
+            if let Some(registry) = weak.upgrade() {
+                let mut status = registry.model_routes_status.lock().unwrap();
+                status.watcher_error = !watching;
+                status.watcher_active = watching;
+            }
+            loop {
+                let event = if watching {
+                    receiver.recv_timeout(std::time::Duration::from_secs(5))
+                } else {
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                };
+                let Some(registry) = weak.upgrade() else {
+                    break;
+                };
+                if matches!(
+                    event,
+                    Ok(false) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+                ) {
+                    registry.model_routes_status.lock().unwrap().watcher_error = true;
+                    if matches!(event, Err(std::sync::mpsc::RecvTimeoutError::Disconnected)) {
+                        watching = false;
+                        registry.model_routes_status.lock().unwrap().watcher_active = false;
+                    }
+                }
+                if event.is_ok() {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                // Retry a valid pending file when backend readiness changes.
+                registry.refresh_model_routes();
+            }
+        });
+    }
+
+    pub fn workers_for_backends(&self, backends: &[String]) -> Vec<Arc<dyn Worker>> {
+        backends
+            .iter()
+            .flat_map(|model| {
+                self.get_workers_filtered(
+                    Some(model),
+                    Some(WorkerType::Regular),
+                    Some(ConnectionMode::Http),
+                    None,
+                    false,
+                )
+                .to_vec()
+            })
+            .collect()
+    }
+
+    pub fn hash_ring_for_backends(&self, backends: &[String]) -> Arc<HashRing> {
+        let generation = self.worker_generation.load(Ordering::Acquire);
+        if let Some(entry) = self.alias_hash_rings.get(backends) {
+            if entry.0 == generation {
+                return entry.1.clone();
+            }
+        }
+        let ring = Arc::new(HashRing::new(&self.workers_for_backends(backends)));
+        if self.alias_hash_rings.len() >= 2048 {
+            self.alias_hash_rings.clear();
+        }
+        self.alias_hash_rings
+            .insert(backends.to_vec(), (generation, ring.clone()));
+        ring
     }
 
     /// Rebuild the hash ring for a model based on current workers in the model index
@@ -240,12 +470,22 @@ impl WorkerRegistry {
 
     /// Register a new worker
     pub fn register(&self, worker: Arc<dyn Worker>) -> WorkerId {
+        let maintenance = self.maintenance.lock().unwrap();
+        if let Some((id, _)) = maintenance.get(worker.url()) {
+            return id.clone();
+        }
         let worker_id = if let Some(existing_id) = self.url_to_id.get(worker.url()) {
             // Worker with this URL already exists, update it
             existing_id.clone()
         } else {
             WorkerId::new()
         };
+
+        // Replace all indexes for an existing URL. Otherwise an old Arc can
+        // remain selectable after a metadata update and fail admission forever.
+        if self.workers.contains_key(&worker_id) {
+            self.remove(&worker_id);
+        }
 
         // Store worker
         self.workers.insert(worker_id.clone(), worker.clone());
@@ -269,6 +509,7 @@ impl WorkerRegistry {
 
         // Rebuild hash ring for this model
         self.rebuild_hash_ring(&model_id);
+        self.worker_generation.fetch_add(1, Ordering::Release);
 
         // Update type index (clone needed for DashMap key ownership)
         self.type_workers
@@ -294,6 +535,95 @@ impl WorkerRegistry {
         }
 
         worker_id
+    }
+
+    pub fn is_draining_url(&self, url: &str) -> bool {
+        self.maintenance.lock().unwrap().contains_key(url)
+    }
+
+    pub fn begin_drain(&self, id: &WorkerId) -> Option<(String, usize)> {
+        let mut maintenance = self.maintenance.lock().unwrap();
+        if let Some((url, (_, worker))) = maintenance.iter().find(|(_, (key, _))| key == id) {
+            return Some((
+                url.clone(),
+                self.request_counts
+                    .get(worker.url())
+                    .map(|count| count.load(Ordering::Acquire))
+                    .unwrap_or(0),
+            ));
+        }
+        let worker = self.get(id)?;
+        // The admission fence currently covers regular HTTP generation only.
+        if worker.worker_type() != &WorkerType::Regular
+            || worker.connection_mode() != &ConnectionMode::Http
+        {
+            return None;
+        }
+        let url = worker.url().to_string();
+        maintenance.insert(url.clone(), (id.clone(), worker.clone()));
+        self.remove(id);
+        Some((
+            url,
+            self.request_counts
+                .get(worker.url())
+                .map(|count| count.load(Ordering::Acquire))
+                .unwrap_or(0),
+        ))
+    }
+    pub fn drain_status(&self, id: &WorkerId) -> Option<(String, usize)> {
+        self.maintenance
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, (key, _))| key == id)
+            .map(|(url, (_, worker))| {
+                (
+                    url.clone(),
+                    self.request_counts
+                        .get(worker.url())
+                        .map(|count| count.load(Ordering::Acquire))
+                        .unwrap_or(0),
+                )
+            })
+    }
+    pub fn finish_drain(&self, id: &WorkerId) -> bool {
+        let mut maintenance = self.maintenance.lock().unwrap();
+        let url = maintenance
+            .iter()
+            .find(|(_, (key, worker))| {
+                key == id
+                    && self
+                        .request_counts
+                        .get(worker.url())
+                        .map(|count| count.load(Ordering::Acquire))
+                        .unwrap_or(0)
+                        == 0
+            })
+            .map(|(url, _)| url.clone());
+        url.map(|url| maintenance.remove(&url).is_some())
+            .unwrap_or(false)
+    }
+    pub fn admit_http_request(
+        &self,
+        worker: Arc<dyn Worker>,
+        headers: Option<&http::HeaderMap>,
+    ) -> Option<crate::core::WorkerLoadGuard> {
+        let maintenance = self.maintenance.lock().unwrap();
+        if maintenance.contains_key(worker.url())
+            || !self
+                .get_by_url(worker.url())
+                .is_some_and(|current| Arc::ptr_eq(&current, &worker))
+        {
+            return None;
+        }
+        let count = self
+            .request_counts
+            .entry(worker.url().to_string())
+            .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
+            .clone();
+        Some(crate::core::WorkerLoadGuard::with_request_counter(
+            worker, headers, count,
+        ))
     }
 
     /// Reserve (or retrieve) a stable UUID for a worker URL.
@@ -333,6 +663,7 @@ impl WorkerRegistry {
 
             // Rebuild hash ring for this model
             self.rebuild_hash_ring(&model_id);
+            self.worker_generation.fetch_add(1, Ordering::Release);
 
             // Remove from type index
             if let Some(mut type_workers) = self.type_workers.get_mut(worker.worker_type()) {
@@ -586,7 +917,11 @@ impl WorkerRegistry {
             if worker.is_healthy() {
                 healthy_count += 1;
             }
-            total_load += worker.load();
+            total_load += self
+                .request_counts
+                .get(worker.url())
+                .map(|count| count.load(Ordering::Acquire))
+                .unwrap_or(0);
 
             match worker.worker_type() {
                 WorkerType::Regular => regular_count += 1,
@@ -733,6 +1068,266 @@ mod tests {
 
     use super::*;
     use crate::core::{circuit_breaker::CircuitBreakerConfig, BasicWorkerBuilder};
+
+    #[cfg(unix)]
+    #[test]
+    fn model_route_directory_watcher_accepts_a_projection_swap_without_an_api_call() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        for (name, revision) in [("..first", 1), ("..second", 2)] {
+            std::fs::create_dir(directory.path().join(name)).unwrap();
+            std::fs::write(directory.path().join(name).join("routes.json"),
+                serde_json::json!({"schemaVersion":1,"revision":revision,"routes":{"public":["backend"]}}).to_string()).unwrap();
+        }
+        symlink("..first", directory.path().join("..data")).unwrap();
+        symlink("..data/routes.json", directory.path().join("routes.json")).unwrap();
+        let mut registry = WorkerRegistry::new();
+        registry.model_routes_file = Some(directory.path().join("routes.json"));
+        registry.register(Arc::new(
+            BasicWorkerBuilder::new("http://ready:30000")
+                .labels(HashMap::from([("model_id".into(), "backend".into())]))
+                .build(),
+        ));
+        registry.refresh_model_routes();
+        let registry = Arc::new(registry);
+        registry.watch_model_routes();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !registry.model_routes_status().watcher_active {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        symlink("..second", directory.path().join("..next")).unwrap();
+        std::fs::rename(
+            directory.path().join("..next"),
+            directory.path().join("..data"),
+        )
+        .unwrap();
+        while registry.model_routes_status().accepted_revision != 2 {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(registry.model_routes_status().error.is_none());
+    }
+
+    #[test]
+    fn model_route_refresh_retries_pending_data_and_preserves_unchanged_rings() {
+        let path = std::env::temp_dir().join(format!("ci-route-refresh-{}", Uuid::new_v4()));
+        let mut registry = WorkerRegistry::new();
+        registry.model_routes_file = Some(path.clone());
+        std::fs::write(
+            &path,
+            br#"{"schemaVersion":1,"revision":3,"routes":{"public":["backend"]}}"#,
+        )
+        .unwrap();
+        registry.refresh_model_routes();
+        assert_eq!(registry.model_routes_status().desired_revision, Some(3));
+        assert_eq!(registry.model_routes_status().accepted_revision, 0);
+        assert!(registry.model_routes_status().error.is_some());
+        registry.register(Arc::new(
+            BasicWorkerBuilder::new("http://ready:30000")
+                .labels(HashMap::from([("model_id".into(), "backend".into())]))
+                .build(),
+        ));
+        registry.refresh_model_routes();
+        assert_eq!(registry.model_routes_status().accepted_revision, 3);
+        assert!(registry.model_routes_status().error.is_none());
+        let ring = registry.hash_ring_for_backends(&["backend".into()]);
+        std::fs::write(
+            &path,
+            br#"{"schemaVersion":1,"revision":7,"routes":{"public":["backend"]}}"#,
+        )
+        .unwrap();
+        registry.refresh_model_routes();
+        assert_eq!(registry.model_routes_status().accepted_revision, 7);
+        assert!(Arc::ptr_eq(
+            &ring,
+            &registry.hash_ring_for_backends(&["backend".into()])
+        ));
+        std::fs::write(&path, b"invalid").unwrap();
+        registry.refresh_model_routes();
+        assert_eq!(registry.model_routes_status().accepted_revision, 7);
+        assert!(registry.model_routes_status().error.is_some());
+        // Restoring accepted bytes clears the failure without a route change.
+        std::fs::write(
+            &path,
+            br#"{"schemaVersion":1,"revision":7,"routes":{"public":["backend"]}}"#,
+        )
+        .unwrap();
+        registry.refresh_model_routes();
+        assert!(registry.model_routes_status().error.is_none());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_model_routes_commit_checks_hash_revision_and_ready_backends() {
+        use sha2::{Digest, Sha256};
+        let path = std::env::temp_dir().join(format!("ci-route-commit-{}", Uuid::new_v4()));
+        let mut registry = WorkerRegistry::new();
+        registry.model_routes_file = Some(path.clone());
+        let mut ids = Vec::new();
+        for (url, model) in [
+            ("http://old:30000", "model-old"),
+            ("http://new:30000", "model-new"),
+        ] {
+            ids.push(
+                registry.register(Arc::new(
+                    BasicWorkerBuilder::new(url)
+                        .labels(HashMap::from([("model_id".into(), model.into())]))
+                        .build(),
+                )),
+            );
+        }
+        let write = |revision: u64, backends: Vec<&str>| {
+            let bytes = serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 1, "revision": revision, "routes": {"public": backends}
+            }))
+            .unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            format!("{:x}", Sha256::digest(&bytes))
+        };
+        let hash = write(1, vec!["model-old", "model-new"]);
+        assert!(registry.reload_model_routes(0, "wrong-hash").is_err());
+        assert!(registry.reload_model_routes(1, &hash).is_err());
+        assert_eq!(registry.model_routes().revision, 0);
+        assert_eq!(registry.reload_model_routes(0, &hash).unwrap().revision, 1);
+        // An interrupted commit can be replayed without another route change.
+        assert_eq!(registry.reload_model_routes(0, &hash).unwrap().revision, 1);
+        assert!(registry.reload_model_routes(7, &hash).is_err());
+        let frozen = registry.resolve_model_route(Some("public")).unwrap();
+        assert_eq!(registry.workers_for_backends(&frozen).len(), 2);
+        let unknown = write(2, vec!["missing"]);
+        assert!(registry.reload_model_routes(1, &unknown).is_err());
+        assert_eq!(registry.model_routes().revision, 1);
+        let next = write(2, vec!["model-new"]);
+        assert_eq!(registry.reload_model_routes(1, &next).unwrap().revision, 2);
+        assert_eq!(
+            registry.resolve_model_route(Some("public")).unwrap(),
+            vec!["model-new"]
+        );
+        // Accepted requests keep their route snapshot when new requests change.
+        assert_eq!(frozen, vec!["model-old", "model-new"]);
+        // A restart obtains the committed model route from the same durable file.
+        assert_eq!(ModelRoutes::read(&path).unwrap().0, registry.model_routes());
+        registry.begin_drain(&ids[1]).unwrap();
+        let unavailable = write(3, vec!["model-new"]);
+        assert!(registry.reload_model_routes(2, &unavailable).is_err());
+        assert_eq!(registry.model_routes().revision, 2);
+        assert_eq!(registry.workers_for_backends(&frozen).len(), 1);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn test_drain_keeps_other_model_workers_and_never_falls_back() {
+        let registry = WorkerRegistry::new();
+        let old: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://old:30000")
+                .labels(HashMap::from([("model_id".into(), "model-old".into())]))
+                .build(),
+        );
+        let new: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://new:30000")
+                .labels(HashMap::from([("model_id".into(), "model-new".into())]))
+                .build(),
+        );
+        let old_id = registry.register(old);
+        registry.register(new);
+        registry.begin_drain(&old_id).unwrap();
+        assert!(registry
+            .get_workers_filtered(Some("model-old"), None, None, None, false)
+            .is_empty());
+        let workers = registry.get_workers_filtered(Some("model-new"), None, None, None, false);
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].url(), "http://new:30000");
+        assert!(registry
+            .get_workers_filtered(Some("unknown-model"), None, None, None, false)
+            .is_empty());
+    }
+
+    #[test]
+    fn test_admission_and_drain_share_a_fence() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let worker: Arc<dyn Worker> =
+            Arc::new(BasicWorkerBuilder::new("http://race:30000").build());
+        let id = registry.register(worker.clone());
+        let barrier = Arc::new(std::sync::Barrier::new(17));
+        let threads: Vec<_> = (0..16)
+            .map(|_| {
+                let registry = registry.clone();
+                let worker = worker.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    registry.admit_http_request(worker, None)
+                })
+            })
+            .collect();
+        barrier.wait();
+        registry.begin_drain(&id).unwrap();
+        let guards: Vec<_> = threads
+            .into_iter()
+            .filter_map(|thread| thread.join().unwrap())
+            .collect();
+        assert_eq!(registry.drain_status(&id).unwrap().1, guards.len());
+        assert!(registry.admit_http_request(worker.clone(), None).is_none());
+        drop(guards);
+        assert_eq!(registry.drain_status(&id).unwrap().1, 0);
+        assert!(registry.finish_drain(&id));
+        // An old selection cannot be admitted even after the URL fence is cleared.
+        assert!(registry.admit_http_request(worker, None).is_none());
+    }
+
+    #[test]
+    fn test_drain_fences_selection_and_queued_registration() {
+        let registry = WorkerRegistry::new();
+        let worker: Arc<dyn Worker> =
+            Arc::new(BasicWorkerBuilder::new("http://drain:30000").build());
+        let id = registry.register(worker.clone());
+        let guard = registry.admit_http_request(worker.clone(), None).unwrap();
+        assert_eq!(
+            registry.begin_drain(&id),
+            Some(("http://drain:30000".into(), 1))
+        );
+        assert!(registry.get(&id).is_none());
+        assert!(registry.admit_http_request(worker.clone(), None).is_none());
+        assert!(!registry.finish_drain(&id));
+        assert_eq!(
+            registry.register(Arc::new(
+                BasicWorkerBuilder::new("http://drain:30000").build()
+            )),
+            id
+        );
+        assert!(registry.get_by_url("http://drain:30000").is_none());
+        assert_eq!(registry.begin_drain(&id).unwrap().1, 1);
+        drop(guard);
+        assert_eq!(registry.drain_status(&id).unwrap().1, 0);
+        assert!(registry.finish_drain(&id));
+        assert!(registry.drain_status(&id).is_none());
+    }
+
+    #[test]
+    fn test_drain_counts_all_response_bodies_across_worker_instances() {
+        let registry = WorkerRegistry::new();
+        let old: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://drain:30000").build());
+        let id = registry.register(old.clone());
+        let guard = registry.admit_http_request(old, None).unwrap();
+        let replacement: Arc<dyn Worker> =
+            Arc::new(BasicWorkerBuilder::new("http://drain:30000").build());
+        registry.register(replacement);
+        assert_eq!(registry.get_all().len(), 1);
+        assert_eq!(
+            registry.get_by_model(crate::core::UNKNOWN_MODEL_ID).len(),
+            1
+        );
+        let response = crate::core::AttachedBody::wrap_response(
+            axum::response::Response::new(axum::body::Body::from("pending body")),
+            guard,
+        );
+        assert_eq!(registry.begin_drain(&id).unwrap().1, 1);
+        assert!(!registry.finish_drain(&id));
+        drop(response);
+        assert_eq!(registry.drain_status(&id).unwrap().1, 0);
+        assert!(registry.finish_drain(&id));
+    }
 
     #[test]
     fn test_worker_registry() {

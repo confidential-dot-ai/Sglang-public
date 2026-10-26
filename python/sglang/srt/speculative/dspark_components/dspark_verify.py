@@ -28,6 +28,7 @@ from sglang.kernels.ops.speculative.dspark.simulated_bonus import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.overlap_utils import consume_deferred_seq_lens_cpu
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -284,6 +285,7 @@ class TargetVerifyExecutor:
             kv_loc_plan=verify_window.kv_loc_plan,
         )
         batch.out_cache_loc = verify_cache_loc
+        consume_deferred_seq_lens_cpu(batch)
         seq_lens_cpu_backup = batch.seq_lens_cpu
         seq_lens_sum_backup = batch.seq_lens_sum
         if not self._verify_backend_self_adds_seq_lens():
@@ -407,6 +409,7 @@ class TargetVerifyExecutor:
             kv_loc_cols=ragged_window.window_index,
         )
         batch.out_cache_loc = ragged_window.verify_cache_loc
+        consume_deferred_seq_lens_cpu(batch)
         seq_lens_cpu_backup = batch.seq_lens_cpu
         seq_lens_sum_backup = batch.seq_lens_sum
         if seq_lens_cpu_backup is not None:

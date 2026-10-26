@@ -24,14 +24,10 @@ from sglang.kernels.ops.attention.dsv4.index_logits import (
     sparse_logits,
 )
 from sglang.kernels.ops.attention.dsv4.topk import (
-    topk_transform_paged_v2,
     topk_transform_ragged_v2,
     topk_transform_sparse,
 )
-from sglang.srt.layers.attention.dsv4.indexer import (
-    topk_transform_paged_bf16,
-    topk_transform_paged_from_metadata,
-)
+from sglang.srt.layers.attention.dsv4.indexer import topk_transform_paged_from_metadata
 from sglang.srt.layers.attention.dsv4.metadata import expand_index_page_table
 from sglang.srt.utils.common import async_h2d
 
@@ -192,23 +188,9 @@ class SparseTableBackend:
         # The block-selection chain reads logits after the main stream moves on.
         logits.record_stream(self.alt_stream)
         # TODO(candidate): one kernel for both selections below (dense logits read once)
-        if logits.dtype == torch.bfloat16:
-            topk_transform_paged_bf16(
-                logits,
-                seq_lens,
-                metadata.page_table,
-                inputs.out_page_indices,
-                metadata.compressed_page_size,
-            )
-        else:
-            topk_transform_paged_v2(
-                logits,
-                seq_lens,
-                metadata.page_table,
-                inputs.out_page_indices,
-                metadata.compressed_page_size,
-                metadata.topk_metadata,
-            )
+        topk_transform_paged_from_metadata(
+            logits, metadata, inputs.out_page_indices, None
+        )
         # per row: block count for the block top-k, sparse-row length for the consumers
         with torch.cuda.stream(self.alt_stream):
             nblocks, row_valid_lens = candidate_row_lens(seq_lens, self.topk_blocks)
@@ -434,6 +416,8 @@ def publish_prefill_table(
             out_offsets=zero_offsets[: logits.shape[0]],
             out_indices=blocks[tile],
         )
+        # Free this tile's logits before the generator scores the next one.
+        del logits, keys
     return _build_prefill_table(
         blocks=blocks,
         compress_lens=data.compress_lens,

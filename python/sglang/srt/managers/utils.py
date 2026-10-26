@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import re
+import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, List, Optional, Union
 
@@ -63,6 +64,8 @@ class GenerationBatchResult:
     accept_length_per_req_cpu: Optional[List[int]] = None
     dllm_algo_state: Optional[List[Any]] = None
     can_run_cuda_graph: bool = False
+    # CED boundary handoff: the prefill forward's captured last-window rows.
+    ced_boundary: Optional[Any] = None
 
     # PP skip output comm: True when output send/recv was skipped and
     # next_token_ids are placeholder zeros. Used by process_batch_result_prefill
@@ -75,6 +78,9 @@ class GenerationBatchResult:
 
     # For overlap scheduling
     copy_done: Optional[Union[torch.cuda.Event, HostCopyDone]] = None
+    # Set instead of copy_done when the D2H readback is offloaded to the async
+    # copy worker (confidential-compute path). worker-done => copy-done.
+    copy_ready_cpu: Optional[threading.Event] = None
     delay_sample_func: Optional[callable] = None
     future_indices: Optional[torch.Tensor] = None
     speculative_num_draft_tokens: Optional[int] = None
@@ -392,6 +398,9 @@ class EmbeddingBatchResult:
     embeddings: torch.Tensor
     pooled_hidden_states: Optional[torch.Tensor] = None
     copy_done: Optional[Union[torch.cuda.Event, HostCopyDone]] = None
+    # Set instead of copy_done when the D2H readback is offloaded to the async
+    # copy worker (confidential-compute path). worker-done => copy-done.
+    copy_ready_cpu: Optional[threading.Event] = None
     can_run_cuda_graph: bool = False
 
     @torch.profiler.record_function("copy_embedding_to_cpu")

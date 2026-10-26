@@ -360,6 +360,7 @@ class Envs:
     SGLANG_JIT_LOG_LEVEL = EnvStr("WARNING")
     SGLANG_ENABLE_RANK_CONSENSUS_CHECKER = EnvBool(False)
 
+
     # ===================================================================
     # IPC, broadcasters, and ports
     # ===================================================================
@@ -455,8 +456,12 @@ class Envs:
     # reaches this many requests (0 = first decode batch). Lets a batch-size bench
     # capture steady-state full-admission decode steps instead of the ramp-up.
     SGLANG_PROFILE_BY_STAGE_DECODE_MIN_BS = EnvInt(0)
-    SGLANG_ENABLE_NVTX_SCHEDULER = EnvBool(False)
-    SGLANG_ENABLE_NVTX_OPERATIONS = EnvBool(False)
+    SGLANG_ENABLE_NVTX_SCHEDULER = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_ENABLE_NVTX"
+    )
+    SGLANG_ENABLE_NVTX_OPERATIONS = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_OPERATIONS_ENABLE_PROFILE"
+    )
     SGLANG_RECORD_STEP_TIME = EnvBool(False)
     SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE = EnvBool(False)
     # Opt-in: emit one CUDA-graph capture trace per captured batch size (per-bs).
@@ -500,6 +505,12 @@ class Envs:
     SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK = EnvBool(_default_tree_cache_sanity_check)
     # Physical KV-page checks: committed<=allocated + no page alias.
     SGLANG_CHECK_KV_PAGE_INVARIANTS = EnvBool(False)
+    # PD: log checksums of each sent KV chunk and aux slot (prefill), the received
+    # aux slot and first token (decode); see disaggregation/divergence_debug.py.
+    SGLANG_DEBUG_PD_DIVERGENCE = EnvBool(False)
+    # PD: with the above, also hash each layer's input, indexer and attention
+    # tensors on PP prefill stages; adds kernels to every captured layer.
+    SGLANG_DEBUG_PD_DIVERGENCE_LAYERS = EnvBool(False)
     SGLANG_TBO_DEBUG = EnvBool(False)
     # Timing probe: run the swap-in fully but skip the host->device KV bytes,
     # measuring the "IO is free" floor. GARBAGE OUTPUT -- benchmarking only.
@@ -614,6 +625,10 @@ class Envs:
     SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION = EnvInt(4096)
     SGLANG_MAX_NEW_TOKENS_LIMIT = EnvInt(None)
     SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR = EnvFloat(0.75)
+    # HRRN ranks a waiting request by tokens waited / uncached**exponent. 1.0 is
+    # classic HRRN; above 1 leans toward shortest-first (warm turns ahead of cold
+    # prompts) while still aging every request.
+    SGLANG_HRRN_SIZE_EXPONENT = EnvFloat(1.0)
     # Window for the token-weighted recent cache-hit rate used to estimate
     # waiting-queue prefill load.
     SGLANG_CACHE_HIT_RATE_WINDOW_SECONDS = EnvFloat(15.0)
@@ -646,6 +661,14 @@ class Envs:
     SGLANG_SCHEDULER_SKIP_ALL_GATHER = EnvBool(False)
     SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE = EnvBool(False)
     SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION = EnvBool(False)
+    # TP ranks must agree on the decoded-token counter. Speculative decoding
+    # samples per rank, so a rank that accepts a different number of draft
+    # tokens drifts and the group deadlocks at a later collective; the drift is
+    # visible minutes earlier. 0 disables the check.
+    SGLANG_TP_DRIFT_CHECK_INTERVAL = EnvInt(1)
+    # Consecutive divergent checks before the rank takes itself down. >1 so a
+    # single racy read cannot kill a healthy worker.
+    SGLANG_TP_DRIFT_EXIT_AFTER = EnvInt(3)
     SGLANG_REQ_WAITING_TIMEOUT = EnvFloat(-1)  # in seconds
     SGLANG_REQ_RUNNING_TIMEOUT = EnvFloat(-1)  # in seconds
     # Non-streaming requests flush intermediate outputs every N decoded tokens.
@@ -677,6 +700,9 @@ class Envs:
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
     # Opt-in: keep receiving prefill requests while forward results are pending.
     SGLANG_ENABLE_DISAGG_PREFILL_CONTINUOUS_INPUT_POLLING = EnvBool(False)
+    # Opt-in: handle a finished prefill result (and send its KV) before the
+    # next launch, instead of after it.
+    SGLANG_ENABLE_DISAGG_PREFILL_EARLY_RESULT = EnvBool(False)
     # Override NVML Confidential Computing autodetection. None = autodetect.
     SGLANG_FORCE_CONFIDENTIAL_COMPUTE = EnvBool(None)
 
@@ -783,6 +809,11 @@ class Envs:
     # HiCache host<->device transfers use the TMA staging kernel when the GPU
     # (sm_90+), row size and page size allow; set to 0 to force the register kernel.
     SGLANG_HICACHE_TMA_TRANSFER = EnvBool(True)
+    # write_back: demote an internal node's SWA KV to host before an SWA-only
+    # tombstone. Off drops it, as without HiCache; only a match ending within a window
+    # below that node loses it. Under CC the synchronous D->H copy took 8% of DSV4.1
+    # PD prefill scheduler time while adding no cache hits (2026-10-18).
+    SGLANG_ENABLE_HICACHE_SWA_TOMBSTONE_BACKUP = EnvBool(True)
     # Base token count for each MLA/DSA dedup broadcast chunk.
     SGLANG_MLA_DEDUP_CHUNK_TOKENS = EnvInt(2048)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
@@ -836,6 +867,15 @@ class Envs:
     # ===================================================================
     SGLANG_HICACHE_MOONCAKE_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_MOONCAKE_REUSE_TE = EnvBool(True)
+    # Override the auto-detected hostname the MooncakeTransferEngine binds/
+    # advertises for inter-engine KV transfer. When all engines run as
+    # processes on the same host/kernel (single-node deployment), forcing
+    # this to 127.0.0.1 routes transfer traffic over loopback instead of
+    # whatever interface get_local_ip_auto() picks up -- avoids paying
+    # whatever cost/fragility that interface's networking backend has
+    # (e.g. a VM's usermode/SLIRP netdev) for traffic that never actually
+    # needs to leave the machine. Unset (None) preserves prior behavior.
+    SGLANG_MOONCAKE_HOSTNAME_OVERRIDE = EnvStr(None)
     MOONCAKE_MASTER = EnvStr(None)
     MOONCAKE_CLIENT = EnvStr(None)
     MOONCAKE_LOCAL_HOSTNAME = EnvStr("localhost")
@@ -1560,6 +1600,10 @@ class Envs:
     # Shorter prompts use the single-call encode; below this the gain is eaten
     # by rayon dispatch and the id merge.
     SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS = EnvInt(32768)
+    # Reuse a cached chat prompt's ids for the prefix a new prompt shares with it.
+    SGLANG_OPT_PREFIX_PROMPT_ENCODE = EnvBool(False)
+    # Per tokenizer process; one entry per active conversation (~0.5 MB at 38K tokens).
+    SGLANG_PREFIX_PROMPT_ENCODE_CACHE_MB = EnvInt(256)
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
     SGLANG_DEFAULT_THINKING = EnvBool(False)
 
@@ -1674,6 +1718,13 @@ class Envs:
     # DeepSeek-V4.1 engram host table: keep the tables in host memory (layout
     # below) and gather rows from the GPU instead of sharding them over HBM.
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
+    # Eager CPU lookup from shared checkpoint mappings; CUDA graphs must be off.
+    SGLANG_DSV41_ENGRAM_CPU_STAGING = EnvBool(False)
+    # CPU staging only: gather the rows of both Engram layers on a worker thread
+    # from one combined id copy at the start of each step (prefill, decode, verify).
+    SGLANG_OPT_DSV41_ENGRAM_STAGING_PREFETCH = EnvBool(False)
+    # OpenMP threads of that worker's gathers; 0 keeps the process-wide torch value.
+    SGLANG_DSV41_ENGRAM_GATHER_THREADS = EnvInt(0)
     SGLANG_OPT_ENGRAM_EXTEND_HASH = EnvBool(False)
     SGLANG_OPT_DSV41_MEGA_MHC_PREFILL = EnvBool(False)
     # "shared" is one buffer for the whole TP group, mapped by every rank, with no
@@ -1695,14 +1746,65 @@ class Envs:
     SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS = EnvInt(8192)
     SGLANG_OPT_USE_JIT_INDEXER_METADATA = EnvBool(True)
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
+    SGLANG_OPT_FUSE_C4_FP4_STORE = EnvBool(True)
     SGLANG_EXPERIMENTAL_ONLINE_C128_MTP = EnvBool(False)
     SGLANG_DSV4_COMPRESS_STATE_DTYPE = EnvStr("float32")
     # Run the DeepSeek-V4.1 ratio-1/2 prefill indexer on the torch path instead
     # of the DeepGEMM dense fp4 logits kernel (test oracle / fallback).
     SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
+    # DeepSeek-V4.1 breakable prefill graph: run the ratio-1/2 index layers as an eager
+    # break on the live rows so contexts past the 16K captured-indexer window replay, and
+    # leave an unset prefill max_seq_len uncapped. Not validated with bounded SWA replay;
+    # ignored under context parallelism.
+    SGLANG_OPT_DSV41_PREFILL_GRAPH_EAGER_INDEXER = EnvBool(False)
+    # DeepSeek-V4.1 CED split for PD (set on both workers): prefill builds and runs
+    # only the encoder layers (through the last kv_source layer) and hands their KV
+    # plus a wider SWA window to decode; decode replays each prompt's tail through
+    # every layer (decoder SWA bounded replay) to seed the late-layer windows, the
+    # first token and the DSpark draft ring.
+    SGLANG_OPT_DSV41_CED_SPLIT = EnvBool(False)
+    # CED-split prefill runs without DSpark; decode's DSpark verify window (gamma + 1)
+    # sizes its request-scoped compress rings so their PD items match decode's.
+    SGLANG_DSV41_CED_DECODE_DRAFT_TOKENS = EnvInt(0)
+    # DeepSeek-V4.1 prefill-side tail for PD (prefill only, exclusive with the CED
+    # split): a TP1 x PP2 prefill runs every layer, the layers after the last
+    # kv_source layer only over each request's bounded prompt tail, and DSpark on
+    # the last stage; decode takes the ordinary handoff.
+    SGLANG_OPT_DSV41_PREFILL_TAIL = EnvBool(False)
+    # CED tail graphs: a revision tag for captured graphs, opt-in encoder and late
+    # layer graphs (encoder graphs at exact live row counts by default), and eager
+    # cross-checks of graph outputs (first replay per shape, or every replay).
+    SGLANG_DSV41_CED_TAIL_GRAPH_REVISION = EnvInt(0)
+    SGLANG_DSV41_CED_TAIL_ENCODER_GRAPH = EnvBool(False)
+    SGLANG_DSV41_CED_TAIL_ENCODER_EXACT_ROWS = EnvBool(True)
+    SGLANG_DSV41_CED_TAIL_LATE_GRAPH = EnvBool(False)
+    SGLANG_DSV41_CED_TAIL_GRAPH_CHECK = EnvBool(False)
+    SGLANG_DSV41_CED_TAIL_GRAPH_CHECK_EVERY = EnvBool(False)
+    # A lazy CED graph capture needs this much free HBM on every TP rank; below
+    # it the tail stays eager.
+    SGLANG_DSV41_CED_GRAPH_MIN_FREE_GB = EnvFloat(20.0)
+    # Decode tail sizes (requests per tail) whose late-layer graphs are captured
+    # at startup. When set, no CED graph is captured once serving starts; other
+    # sizes run eagerly. A capture under load can fault the GSP on CC B300.
+    SGLANG_DSV41_CED_TAIL_GRAPH_PRECAPTURE_REQS = EnvTuple(())
+    # 1 preserves immediate dispatch. Larger values coalesce ready CED tails into
+    # one replay, waiting at most MAX_WAIT_MS for the batch to fill.
+    SGLANG_DSV41_CED_TAIL_BATCH_SIZE = EnvInt(1)
+    SGLANG_DSV41_CED_TAIL_MAX_WAIT_MS = EnvInt(1000)
+    # CED boundary handoff (set on both workers, with the CED split): prefill hands
+    # each prompt's last-window state at the last kv_source layer to decode through
+    # the PD metadata slot, and decode's tail replay starts at that layer instead
+    # of rerunning the encoder. CHECK also reruns the encoder and logs how far its
+    # recomputed boundary state is from the handed-off one.
+    SGLANG_OPT_DSV41_CED_BOUNDARY_HANDOFF = EnvBool(False)
+    SGLANG_DSV41_CED_BOUNDARY_CHECK = EnvBool(False)
     # DeepSeek-V4.1 ratio-1/2 index layers: the DeepGEMM fp4 logits kernels store bf16 instead
     # of fp32 (the reference ranks bf16 scores); every consumer of those logits must take bf16.
     SGLANG_OPT_DSV41_BF16_INDEX_LOGITS = EnvBool(False)
+    # DeepSeek-V4.1 prefill: GiB of the memory left after CUDA-graph capture that the
+    # index logits tile planning leaves to other eager transients and allocator
+    # fragmentation (the shipped chunk-12288 B200 TP2 prefill keeps ~9.7 GiB free).
+    SGLANG_DSV41_PREFILL_EAGER_RESERVE_GB = EnvFloat(4.0)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
@@ -1731,7 +1833,21 @@ class Envs:
     # 64-slot page), so a candidate consumer layer scores only its published blocks.
     SGLANG_HIP_DSV41_INDEX_K_PAGE8 = EnvBool(False)
 
-    # cache, GEMM, and distributed
+    # ===================================================================
+    # DeepSeek V4 - cache, GEMM, and distributed
+    # ===================================================================
+    # DeepGemm Mega MoE
+    SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE = EnvBool(False)
+
+    # Kill-switch for deferring the FutureMap's blocking exact seq-lens
+    # mirror pull (overlap scheduling + DSPARK) from run_batch entry to the
+    # tick's first exact consumer (the draft plan / verify prep), which lets
+    # host prep overlap the previous verify's GPU tail. Set to 1 to restore
+    # the eager blocking resolve.
+    SGLANG_OPT_DISABLE_SPEC_SEQ_LENS_DEFER = EnvBool(False)
+
+
+    # GEMM / kernel fusion
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
     # ROCm gfx950: fuse inverse-RoPE into the wo_a mxfp8 quant (aiter
     # inverse_rope_group_quant) instead of a separate fused_rope_inplace + Triton

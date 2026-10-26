@@ -108,6 +108,32 @@ def _jit_compress_module(
 
 
 @cache_once
+def _jit_compress_c4_fp4_store_module(
+    dtype_buffer: torch.dtype,
+    dtype_in: torch.dtype,
+    page_size: int,
+) -> Module:
+    args = make_cpp_args(
+        128,
+        dtype_buffer,
+        dtype_in,
+        page_size,
+        is_arch_support_pdl(),
+    )
+    kernel_class = f"FlashCompress4Fp4StoreKernel<{args}>"
+    return load_jit(
+        make_name("compress_4_fp4_store_v2"),
+        *args,
+        cuda_files=["deepseek_v4/c4_v2.cuh"],
+        cuda_wrappers=[
+            ("decode", f"{kernel_class}::run_decode"),
+            ("prefill", f"{kernel_class}::run_prefill"),
+        ],
+        extra_cuda_cflags=["-use_fast_math"],
+    )
+
+
+@cache_once
 def _jit_compress_128_online_module(
     head_dim: int, dtype_buffer: torch.dtype = torch.float32
 ) -> Module:
@@ -440,6 +466,59 @@ def compress_forward(
         ape = ape.to(dtype=kv_score_input.dtype)
     fn(kv_score_buffer, kv_score_input, out, ape, *plan[1:3])
     return out
+
+
+def compress_c4_norm_rope_store_fp4(
+    kv_score_buffer: torch.Tensor,
+    kv_score_input: torch.Tensor,
+    ape: torch.Tensor,
+    plan: Union[CompressorDecodePlan, CompressorPrefillPlan],
+    *,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    freq_cis: torch.Tensor,
+    out_loc: torch.Tensor,
+    kvcache: torch.Tensor,
+    page_size: int,
+) -> None:
+    """Fuse C4 compression, index normalization/rotation, and FP4 cache store."""
+    assert not _is_xpu
+    assert plan.compress_ratio == 4
+    assert kv_score_input.shape[-1] == 4 * 128
+    assert norm_weight.shape == (128,)
+    assert kv_score_input.dtype == norm_weight.dtype
+    assert kvcache.shape[1] == page_size * 68
+    freq_cis = torch.view_as_real(freq_cis).flatten(-2)
+    module = _jit_compress_c4_fp4_store_module(
+        kv_score_buffer.dtype,
+        kv_score_input.dtype,
+        page_size,
+    )
+    if plan.is_decode:
+        module.decode(
+            kv_score_buffer,
+            kv_score_input,
+            ape,
+            plan.plan_d,
+            norm_weight,
+            norm_eps,
+            freq_cis,
+            out_loc,
+            kvcache,
+        )
+    else:
+        module.prefill(
+            kv_score_buffer,
+            kv_score_input,
+            ape,
+            plan.plan_c,
+            plan.plan_w,
+            norm_weight,
+            norm_eps,
+            freq_cis,
+            out_loc,
+            kvcache,
+        )
 
 
 def compress_norm_rope_store(

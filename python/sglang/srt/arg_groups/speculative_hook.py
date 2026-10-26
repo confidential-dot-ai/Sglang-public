@@ -601,6 +601,24 @@ def _handle_uno(server_args: ServerArgs) -> None:
         )
 
 
+def draft_is_deepseek_v4_safe(server_args: ServerArgs) -> bool:
+    """draft_is_deepseek_v4, tolerating an unreadable/absent draft config
+    (the caller then applies the generic dense-draft handling)."""
+    from sglang.srt.speculative.dspark_components.dspark_config import (
+        draft_is_deepseek_v4_from_args,
+    )
+
+    try:
+        return draft_is_deepseek_v4_from_args(server_args)
+    except Exception as e:
+        logger.warning(
+            "Failed to read the DSpark draft config to detect a DeepSeek-V4 "
+            "draft; assuming a dense draft. Error: %s",
+            e,
+        )
+        return False
+
+
 def _target_checkpoint_bundles_dspark_draft(server_args: ServerArgs) -> bool:
     from sglang.srt.speculative.dspark_components.dspark_config import (
         checkpoint_bundles_dspark_draft,
@@ -620,10 +638,10 @@ def _handle_dspark(server_args: ServerArgs) -> None:
     if cfg.attn_dp_size > 1:
         if not cfg.enable_dp_lm_head:
             raise ValueError("DSpark with dp attention requires --enable-dp-lm-head.")
-        if not _is_npu and cfg.moe_a2a_backend not in ("none", "megamoe", "mori"):
+        if not _is_npu and cfg.moe_a2a_backend not in ("none", "megamoe", "mori", "flashinfer"):
             raise ValueError(
                 "DSpark with dp attention supports moe_a2a_backend 'none' "
-                "(built-in TP MoE), 'megamoe', or 'mori', got "
+                "(built-in TP MoE), 'megamoe', 'mori', or 'flashinfer', got "
                 f"{cfg.moe_a2a_backend!r}."
             )
         if not _is_npu and (
@@ -780,6 +798,15 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             "DSpark speculative_num_draft_tokens must be >= 2 (= gamma + 1), "
             f"got {cfg.speculative_num_draft_tokens}."
         )
+
+    # Resolve the draft attention backend now (same fallback the draft worker
+    # applies), so downstream config that keys off
+    # `speculative_draft_attention_backend` — the fa4 draft KV-dtype override
+    # in configure_kv_cache_dtype and the target-side draft-pool sizing in
+    # DefaultPoolConfigurator — sees the real value instead of None. The dsv4
+    # (self-drafting MoE) draft overrides this later in the worker.
+    if not draft_is_deepseek_v4_safe(server_args):
+        _resolve_dflash_draft_attention_backend(server_args)
 
     if cfg.max_running_requests is None:
         declare_resolution(

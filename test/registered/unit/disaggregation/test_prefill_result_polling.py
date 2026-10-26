@@ -2,6 +2,7 @@
 
 import multiprocessing
 import tempfile
+import threading
 import unittest
 from array import array
 from collections import Counter, deque
@@ -33,6 +34,9 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import NextBatchPlan, Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import SchedulePolicy
 from sglang.srt.managers.scheduler import Scheduler, _dispatch_event_loop_once
+from sglang.srt.managers.scheduler_components.batch_result_processor import (
+    SchedulerBatchResultProcessor,
+)
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
@@ -119,6 +123,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
 
     launch_batch_sample_if_needed = Scheduler.launch_batch_sample_if_needed
     _copy_result_to_cpu = Scheduler._copy_result_to_cpu
+    _issue_result_copy_to_cpu = Scheduler._issue_result_copy_to_cpu
     pause_generation = Scheduler.pause_generation
     continue_generation = Scheduler.continue_generation
 
@@ -171,6 +176,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.enable_staging = False
         self.enable_overlap = True
         self.enable_async_d2h_copy = False
+        self.enable_cc_async_copy = False
         self.enable_overlap_mlx = False
         self.disagg_prefill_bootstrap_queue = SimpleNamespace(
             pop_bootstrapped=lambda: []
@@ -186,7 +192,15 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self._relay_forward_payload = Mock()
         self.tree_cache = Mock(spec=["flush_pending_backups", "finish"])
         self.batch_result_processor = Mock(
-            spec=["snapshot_auxiliary_output_starts", "move_logprobs_to_cpu"]
+            spec=[
+                "_wait_result_copy",
+                "snapshot_auxiliary_output_starts",
+                "move_logprobs_to_cpu",
+            ]
+        )
+        # The real wait, so copy events count their synchronizations.
+        self.batch_result_processor._wait_result_copy = (
+            SchedulerBatchResultProcessor._wait_result_copy
         )
         self.metrics_reporter = Mock(
             spec=[
@@ -325,10 +339,11 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.actions.append((self.iteration, "idle", None))
 
 
-def _run_loop(scheduler, enabled=True, **topology):
+def _run_loop(scheduler, enabled=True, early_result=False, **topology):
     with (
         published_topology(**topology),
         envs.SGLANG_ENABLE_DISAGG_PREFILL_CONTINUOUS_INPUT_POLLING.override(enabled),
+        envs.SGLANG_ENABLE_DISAGG_PREFILL_EARLY_RESULT.override(early_result),
         patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache"),
     ):
         scheduler.tp_size = get_parallel().tp_size
@@ -441,6 +456,45 @@ def _rank_consensus_worker(rank, rendezvous):
                     raise AssertionError("An unsubmitted copy was polled")
     finally:
         dist.destroy_process_group()
+
+
+def _early_result_rank_worker(rank, rendezvous):
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{rendezvous}",
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=20),
+    )
+    try:
+        # Rank 0 finishes the first copy before the next launch, rank 1 does
+        # not: both must defer it past the launch, in the same order.
+        scheduler = _Scheduler(
+            [_batch(1), _batch(2), None, None],
+            {name: _result() for name in (1, 2)},
+            {1: (1, 2)[rank], 2: 2},
+        )
+        scheduler.tp_cpu_group = dist.group.WORLD
+        _run_loop(
+            scheduler,
+            enabled=False,
+            early_result=True,
+            tp_size=2,
+            ranks={"world_rank": rank},
+        )
+        order = [a for a in scheduler.actions if a[1] in ("launch", "result")]
+        assert order == [
+            (0, "launch", 1),
+            (1, "launch", 2),
+            (1, "result", 1),
+            (2, "result", 2),
+        ], order
+    finally:
+        dist.destroy_process_group()
+
+
+def _launch_and_result_order(scheduler):
+    return [a[1:] for a in scheduler.actions if a[1] in ("launch", "result")]
 
 
 class TestPrefillResultPolling(CustomTestCase):
@@ -1402,6 +1456,121 @@ class TestPrefillResultPolling(CustomTestCase):
                 scheduler.send_kv_chunk.assert_called_once_with(
                     other.reqs[0], last_chunk=True
                 )
+
+    def test_early_result_is_handled_before_the_next_launch(self):
+        for early_result in (False, True):
+            with self.subTest(early_result=early_result):
+                batches = [_batch(i) for i in (1, 2, 3)]
+                results = {i: _result(_Event(ready=True)) for i in (1, 2, 3)}
+                scheduler = _Scheduler(batches + [None] * 3, results, ready_at={})
+                _run_loop(scheduler, enabled=False, early_result=early_result)
+
+                if early_result:
+                    expected = [
+                        ("launch", 1),
+                        ("result", 1),
+                        ("launch", 2),
+                        ("result", 2),
+                        ("launch", 3),
+                        ("result", 3),
+                    ]
+                else:
+                    expected = [
+                        ("launch", 1),
+                        ("launch", 2),
+                        ("result", 1),
+                        ("launch", 3),
+                        ("result", 2),
+                        ("result", 3),
+                    ]
+                self.assertEqual(_launch_and_result_order(scheduler), expected)
+                # Same iteration either way: only the order inside it moves.
+                self.assertEqual(
+                    [a[0] for a in scheduler.actions if a[1] == "result"], [1, 2, 3]
+                )
+                self.assertEqual(scheduler.result_processes, {1: 1, 2: 1, 3: 1})
+                self.assertEqual(scheduler.send_kv_chunk.call_count, 3)
+                self.assertLessEqual(max(scheduler.depths), 1 + int(not early_result))
+                self.assertNotIn((3, "idle", None), scheduler.actions)
+                self.assertFalse(scheduler.result_queue)
+                for event in scheduler.copy_events.values():
+                    self.assertEqual(event.blocking_synchronizations, 0)
+
+    def test_early_result_waits_behind_the_launch_while_copy_runs(self):
+        # Result 1 finishes only after batch 2 launches: the regular order.
+        scheduler = _Scheduler(
+            [_batch(1), _batch(2), None, None],
+            {i: _result() for i in (1, 2)},
+            {1: 2, 2: 2},
+        )
+        _run_loop(scheduler, enabled=False, early_result=True)
+        self.assertEqual(
+            _launch_and_result_order(scheduler),
+            [("launch", 1), ("launch", 2), ("result", 1), ("result", 2)],
+        )
+        self.assertEqual(scheduler.copy_events[1].blocking_synchronizations, 1)
+        self.assertEqual(scheduler.copy_events[2].blocking_synchronizations, 0)
+
+    def test_early_result_after_delayed_sample_and_under_async_copy(self):
+        for copy_mode in ("delayed_sample", "async_copy"):
+            with self.subTest(copy_mode=copy_mode):
+                if copy_mode == "delayed_sample":
+                    results = {
+                        i: _result(_Event(recorded=False), delayed=True) for i in (1, 2)
+                    }
+                    ready_at = {1: 1, 2: 2}
+                else:
+                    # Confidential computing: the copy worker signals completion.
+                    results = {}
+                    for i in (1, 2):
+                        results[i] = _result(_Event(ready=True))
+                        results[i].copy_ready_cpu = threading.Event()
+                        results[i].copy_ready_cpu.set()
+                    ready_at = {}
+                scheduler = _Scheduler(
+                    [_batch(1), _batch(2), None, None], results, ready_at
+                )
+                _run_loop(scheduler, enabled=False, early_result=True)
+                self.assertEqual(
+                    _launch_and_result_order(scheduler),
+                    [("launch", 1), ("result", 1), ("launch", 2), ("result", 2)],
+                )
+                self.assertEqual(scheduler.result_processes, {1: 1, 2: 1})
+
+    def test_early_result_defers_to_continuous_input_polling(self):
+        scheduler = _Scheduler(
+            [_batch(1), _batch(2), None, None, None],
+            {i: _result() for i in (1, 2)},
+            {1: 3, 2: 4},
+        )
+        _run_loop(scheduler, enabled=True, early_result=True)
+        # Continuous polling's own wait decides; batch 2 still launches first.
+        order = _launch_and_result_order(scheduler)
+        self.assertLess(order.index(("launch", 2)), order.index(("result", 1)))
+        self.assertEqual(scheduler.result_processes, {1: 1, 2: 1})
+
+    @unittest.skipUnless(dist.is_gloo_available(), "requires Gloo")
+    def test_ranks_agree_on_early_result(self):
+        context = multiprocessing.get_context("spawn")
+        with tempfile.TemporaryDirectory() as directory:
+            rendezvous = str(Path(directory) / "rendezvous")
+            processes = [
+                context.Process(
+                    target=_early_result_rank_worker, args=(rank, rendezvous)
+                )
+                for rank in range(2)
+            ]
+            try:
+                for process in processes:
+                    process.start()
+                for process in processes:
+                    process.join(timeout=60)
+                self.assertEqual([process.exitcode for process in processes], [0, 0])
+            finally:
+                for process in processes:
+                    if process.is_alive():
+                        process.terminate()
+                        process.join(timeout=5)
 
     @unittest.skipUnless(dist.is_gloo_available(), "requires Gloo")
     def test_ranks_agree_on_fifo_completion_and_copy_submission(self):

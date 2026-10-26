@@ -39,9 +39,14 @@ from sglang.srt.disaggregation.checksum import (
     state_indices_for_request,
 )
 from sglang.srt.disaggregation.common.conn import CommonKVManager
+from sglang.srt.disaggregation.divergence_debug import log_metadata_slot
 from sglang.srt.disaggregation.common.staging_buffer import (
     compute_grid_segments,
     staging_grid_tokens,
+)
+from sglang.srt.disaggregation.ced_boundary import (
+    ced_boundary_enabled,
+    write_ced_boundary_slots,
 )
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
@@ -52,6 +57,8 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     build_kv_layer_ids,
     build_staging_slot_metadata,
+    ced_split_enabled,
+    disagg_swa_transfer_window,
     get_dsa_tail_state_indices,
     get_kv_class,
     get_kv_transfer_buf_infos,
@@ -737,6 +744,13 @@ class SchedulerDisaggregationPrefillMixin:
         self.enable_continuous_input_polling = (
             self._is_continuous_input_polling_enabled()
         )
+        # Launching a batch blocks the host (synchronous copies under CC), so a
+        # result that is already finished waits a full launch before its KV is
+        # sent. Handle it first instead; continuous polling has its own wait.
+        enable_early_result = (
+            envs.SGLANG_ENABLE_DISAGG_PREFILL_EARLY_RESULT.get()
+            and not self.enable_continuous_input_polling
+        )
         self.result_queue = deque()
         batch_result_completion_status = torch.empty(1, dtype=torch.int32, device="cpu")
         # True when intake repeats while the oldest batch result is unfinished.
@@ -764,6 +778,17 @@ class SchedulerDisaggregationPrefillMixin:
             # Resume batch creation on completion, new/ready requests, or an idle step.
             if not waiting_for_batch_result or received_inputs or bootstrapped_reqs:
                 skip_batch_creation = False
+
+            processed_early = (
+                enable_early_result
+                and len(self.result_queue) > 0
+                and self._is_disagg_prefill_result_done_on_all_ranks(
+                    self.result_queue[0][1], batch_result_completion_status
+                )
+            )
+            if processed_early:
+                oldest_batch, oldest_batch_result = self.result_queue.popleft()
+                self.process_batch_result(oldest_batch, oldest_batch_result)
 
             # Keep at most two batches in flight.
             if (
@@ -798,7 +823,11 @@ class SchedulerDisaggregationPrefillMixin:
                 else:
                     batch_result = None
 
-            if self.last_batch:
+            if processed_early:
+                # The previous result was handled before this launch; the queue
+                # now holds only the batch just launched.
+                pass
+            elif self.last_batch:
                 if self.enable_continuous_input_polling:
                     # Resume intake until the oldest result is ready on all TP ranks.
                     oldest_batch_result = self.result_queue[0][1]
@@ -855,6 +884,37 @@ class SchedulerDisaggregationPrefillMixin:
             raise RuntimeError("Prefill result copy must be submitted before polling")
         return state == 2
 
+    def _is_disagg_prefill_result_done_on_all_ranks(
+        self: Scheduler,
+        batch_result: GenerationBatchResult,
+        batch_result_completion_status: torch.Tensor,
+    ) -> bool:
+        """Whether the result's D2H copy has finished on every TP rank.
+
+        Unlike ``is_disagg_prefill_batch_result_ready`` this never raises: a
+        copy that is not submitted yet (or not tracked) just reads as not done.
+        Every rank calls it at the same loop point, so the reduction matches.
+        """
+        # 0: not submitted; 1: copy unfinished; 2: copy finished locally.
+        state = 0
+        if batch_result.copy_ready_cpu is not None:
+            # Confidential computing: the copy runs on the async copy worker.
+            state = 2 if batch_result.copy_ready_cpu.is_set() else 1
+        elif (
+            batch_result.copy_done is not None
+            and batch_result.delay_sample_func is None
+        ):
+            state = 2 if batch_result.copy_done.query() else 1
+        if self.tp_size > 1:
+            batch_result_completion_status.fill_(state)
+            torch.distributed.all_reduce(
+                batch_result_completion_status,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.tp_cpu_group,
+            )
+            state = batch_result_completion_status.item()
+        return state == 2
+
     def process_batch_result_disagg_prefill(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -869,17 +929,23 @@ class SchedulerDisaggregationPrefillMixin:
             next_token_ids,
             extend_input_len_per_req,
             extend_logprob_start_len_per_req,
-            copy_done,
         ) = (
             result.logits_output,
             result.next_token_ids,
             result.extend_input_len_per_req,
             result.extend_logprob_start_len_per_req,
-            result.copy_done,
         )
 
-        if copy_done is not None:
-            copy_done.synchronize()
+        self.batch_result_processor._wait_result_copy(result)
+        if ced_boundary_enabled() and (
+            (metadata_buffers := self.disagg_metadata_buffers).ced_boundary is not None
+        ):
+            write_ced_boundary_slots(
+                capture=result.ced_boundary,
+                reqs=batch.reqs,
+                slots=metadata_buffers.ced_boundary,
+                layout=metadata_buffers.ced_boundary_layout,
+            )
         auxiliary_output_starts = (
             self.batch_result_processor.snapshot_auxiliary_output_starts(batch, result)
         )
@@ -969,7 +1035,10 @@ class SchedulerDisaggregationPrefillMixin:
                     continue
 
                 req.output_ids.append(next_token_id)
-                if req.grammar is not None:
+                # A CED-split prefill's token is a placeholder that decode discards
+                # before sampling the first token itself, so it must not advance
+                # the grammar.
+                if req.grammar is not None and not ced_split_enabled():
                     try:
                         req.grammar.accept_token(next_token_id)
                     except ValueError as e:
@@ -1398,6 +1467,13 @@ class SchedulerDisaggregationPrefillMixin:
                     len(req.origin_input_ids),
                 )
             else:
+                if get_parallel().pp_size > 1:
+                    # The PP loop schedules the next microbatch while this chunk's
+                    # forward can still be queued; without the fence the transfer
+                    # copies the pages' previous contents.
+                    ev = torch.cuda.Event()
+                    ev.record(self.forward_stream)
+                    req.disagg_kv_sender._early_send_wait_event = ev
                 self.send_kv_chunk(req)
 
             if self.chunked_req is not None:
@@ -1511,6 +1587,13 @@ class SchedulerDisaggregationPrefillMixin:
         state_indices: Optional[List] = None
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
+            if envs.SGLANG_DEBUG_PD_DIVERGENCE.get():
+                log_metadata_slot(
+                    side=f"prefill-aux pp={get_parallel().pp_rank}",
+                    room=req.bootstrap_room,
+                    buffers=self.disagg_metadata_buffers.transfer_buffers(),
+                    index=req.metadata_buffer_index,
+                )
 
             # Most state payloads read token-pool rows and should match the KV
             # range actually materialized on prefill. C128 state is request
@@ -1535,10 +1618,13 @@ class SchedulerDisaggregationPrefillMixin:
                 request_window = kvcache.request_window
                 # Under encoder replay the scheduler is not hybrid SWA and keeps no
                 # window size; the pool holds it.
-                window_size = (
-                    self.sliding_window_size
-                    if request_window is None
-                    else kvcache.sliding_window
+                window_size = disagg_swa_transfer_window(
+                    (
+                        self.sliding_window_size
+                        if request_window is None
+                        else kvcache.sliding_window
+                    ),
+                    page_size,
                 )
                 window_start = max(req.disagg_decode_prefix_len, seq_len - window_size)
                 window_start = (window_start // page_size) * page_size

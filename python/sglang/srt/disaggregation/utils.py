@@ -33,6 +33,7 @@ from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.base.conn import KVArgs, StateType
+    from sglang.srt.disaggregation.ced_boundary import CedBoundaryLayout
     from sglang.srt.disaggregation.common.conn import (
         CommonKVBootstrapServer,
         CommonKVManager,
@@ -375,6 +376,7 @@ class MetadataBuffers:
         output_dsa_topk_indices_dim: int = 0,
         *,
         kv_checksum_enabled: bool = False,
+        ced_boundary_layout: Optional["CedBoundaryLayout"] = None,
     ):
         self.custom_mem_pool = custom_mem_pool
         self.output_dsa_topk_indices_dim = output_dsa_topk_indices_dim
@@ -469,6 +471,23 @@ class MetadataBuffers:
                     device=self.bootstrap_room.device,
                 )
 
+        # CED boundary handoff: one window state per slot. Registered last, so a
+        # pipeline stage that does not run the boundary layer (and registers no
+        # such buffer) never addresses it.
+        self.ced_boundary_layout = ced_boundary_layout
+        self.ced_boundary: torch.Tensor | None = None
+        if ced_boundary_layout is not None:
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.custom_mem_pool
+                else nullcontext()
+            ):
+                self.ced_boundary = torch.zeros(
+                    (self.output_ids.shape[0], ced_boundary_layout.nbytes),
+                    dtype=torch.uint8,
+                    device=self.bootstrap_room.device,
+                )
+
     def set_kv_checksum(self, req: Req, value: int) -> None:
         self.kv_checksum[req.metadata_buffer_index, 0] = value
 
@@ -476,6 +495,14 @@ class MetadataBuffers:
         return int(self.kv_checksum[idx, 0].item())
 
     def get_buf_infos(self):
+        bufs = self.transfer_buffers()
+        ptrs = [buf.data_ptr() for buf in bufs]
+        data_lens = [buf.nbytes for buf in bufs]
+        item_lens = [buf[0].nbytes for buf in bufs]
+        return ptrs, data_lens, item_lens
+
+    def transfer_buffers(self) -> List[torch.Tensor]:
+        """The buffers PD transfers, in aux-pointer order; row i is slot i."""
         bufs = [
             self.output_ids,
             self.cached_tokens,
@@ -495,11 +522,9 @@ class MetadataBuffers:
         bufs.append(self.bootstrap_room)
         if self.kv_checksum is not None:
             bufs.append(self.kv_checksum)
-        bufs = [buf for buf in bufs if buf is not None]
-        ptrs = [buf.data_ptr() for buf in bufs]
-        data_lens = [buf.nbytes for buf in bufs]
-        item_lens = [buf[0].nbytes for buf in bufs]
-        return ptrs, data_lens, item_lens
+        if self.ced_boundary is not None:
+            bufs.append(self.ced_boundary)
+        return [buf for buf in bufs if buf is not None]
 
     def get_buf(self, idx: int):
         return (
@@ -536,6 +561,15 @@ class MetadataBuffers:
         )
 
     def set_buf(self, req: Req):
+        from sglang.srt.disaggregation.ced_boundary import (
+            ced_boundary_enabled,
+            finalize_ced_boundary_slot,
+        )
+
+        if ced_boundary_enabled() and self.ced_boundary is not None:
+            finalize_ced_boundary_slot(
+                req=req, slots=self.ced_boundary, layout=self.ced_boundary_layout
+            )
 
         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
         # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token
@@ -1070,9 +1104,10 @@ def build_kv_layer_ids(
     Returns [] for pools that cannot report ids, leaving the peers on positional
     pairing.
     """
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
-    if not isinstance(token_to_kv_pool, HybridLinearKVPool):
+    if not isinstance(token_to_kv_pool, (HybridLinearKVPool, DeepSeekV4TokenToKVPool)):
         return []
     layer_ids = token_to_kv_pool.get_kv_layer_ids()
     if draft_token_to_kv_pool is None:
@@ -1090,9 +1125,10 @@ def _remap_draft_layer_ids(layer_ids: List[int], num_hidden_layers: int) -> List
 
 
 def _draft_entry_layer_ids(*, pool, num_entries: int) -> List[int]:
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
-    if isinstance(pool, HybridLinearKVPool):
+    if isinstance(pool, (HybridLinearKVPool, DeepSeekV4TokenToKVPool)):
         ids = pool.get_kv_layer_ids()
     else:
         # Pools register k0..k(L-1) then v0..v(L-1), so ids repeat once per
@@ -1475,9 +1511,17 @@ def setup_state_kv_args(
 
         # DeepSeekV4TokenToKVPool inherits BaseSWAKVPool; its heterogeneous
         # state list is described per-entry via get_state_buf_infos.
+        is_dsv4_pool = isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
         if isinstance(token_to_kv_pool, BaseSWAKVPool):
             append_state_component(
-                kv_args, StateType.SWA, data_ptrs, data_lens, item_lens
+                kv_args,
+                StateType.SWA,
+                data_ptrs,
+                data_lens,
+                item_lens,
+                layer_ids=(
+                    token_to_kv_pool.get_state_layer_ids() if is_dsv4_pool else None
+                ),
             )
             if isinstance(token_to_kv_pool, SWAKVPool) and isinstance(
                 token_to_kv_pool.swa_kv_pool, MHATokenToKVPool
@@ -1526,6 +1570,11 @@ def setup_state_kv_args(
                         c128_ptrs,
                         c128_lens,
                         c128_item_lens,
+                        layer_ids=(
+                            token_to_kv_pool.get_request_state_layer_ids()
+                            if is_dsv4_pool
+                            else None
+                        ),
                     )
         elif isinstance(token_to_kv_pool, HybridLinearKVPool):
             dim = (
@@ -1822,9 +1871,58 @@ def setup_state_kv_args(
             )
 
 
+def ced_split_enabled() -> bool:
+    return envs.SGLANG_OPT_DSV41_CED_SPLIT.get()
+
+
+def disagg_swa_transfer_window(sliding_window_size: int, page_size: int) -> int:
+    # Under the CED split decode replays the prompt from its tail start, and the
+    # replayed rows' encoder layers read one more window before it.
+    if ced_split_enabled():
+        return 2 * sliding_window_size + page_size
+    return sliding_window_size
+
+
+def ced_tail_start(seq_len: int, sliding_window_size: int, page_size: int) -> int:
+    # Page aligned so compressor groups and transferred pages split cleanly.
+    return max(0, seq_len - sliding_window_size) // page_size * page_size
+
+
 def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
     """Describe the positional transfer layout without pool capacities or pointers."""
     ratios = getattr(kv_args, "mla_compression_ratios", None) or []
+    if 2 in ratios and envs.SGLANG_OPT_DSV41_PREFILL_TAIL.get():
+        # MLA latent KV and draft SWA are replicated across TP ranks. Stage
+        # components are mapped by layer id; only the last PP stage owns draft.
+        if str(get_spec().speculative_algorithm).upper() != "DSPARK":
+            raise RuntimeError("Prefill-tail PD requires DSpark on both workers")
+        return {
+            "prefill_tail": True,
+            "num_draft_tokens": get_spec().speculative_num_draft_tokens,
+            "compression_ratios": list(ratios),
+            "page_size": kv_args.page_size,
+            # Full-page byte counts differ at the ratio-1 source (layer 20),
+            # which exists only on PP1. Compare bytes per compressed token.
+            "kv_token_item_sizes": sorted(
+                {
+                    size * ratios[layer] // kv_args.page_size
+                    for size, layer in zip(kv_args.kv_item_lens, kv_args.kv_layer_ids)
+                }
+            ),
+            "target_state_types": [state.value for state in kv_args.state_types[:2]],
+            "target_swa_item_size": kv_args.state_item_lens[0][0],
+        }
+    if 2 in ratios and ced_split_enabled():
+        from sglang.srt.disaggregation.base.conn import StateType
+
+        # The encoder-only prefill runs without DSpark; decode seeds its own
+        # draft ring, so only the target state (the first component) crosses.
+        # Per-layer lists are left out: a pipeline-parallel prefill stage
+        # registers only its own layers, which the transfer pairs by layer id.
+        return {
+            "ced_split": True,
+            "target_state_type": kv_args.state_types[0].value,
+        }
     if 2 not in ratios or str(get_spec().speculative_algorithm).upper() != "DSPARK":
         return None
 

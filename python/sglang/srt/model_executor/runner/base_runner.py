@@ -19,7 +19,7 @@ import inspect
 import logging
 from abc import ABC, abstractmethod
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Optional, Tuple
 
 import torch
 
@@ -459,6 +459,8 @@ class BaseRunner(ABC):
         *,
         buffers,
         extend_num_tokens_per_req: Optional[int] = None,
+        extend_prefix_len: int = 0,
+        prepare_forward_batch: Optional[Callable[[ForwardBatch], None]] = None,
     ):
         """Run a dummy forward pass for warmup/profiling.
 
@@ -496,7 +498,17 @@ class BaseRunner(ABC):
         _is_pd_prefill_target = (
             get_disagg().disaggregation_mode == "prefill" and not mr.is_draft_worker
         )
-        if mr.spec_algorithm.is_speculative() and not _is_pd_prefill_target:
+        # A PD decode target runs plain EXTEND forwards too (CED prompt-tail replay).
+        _is_pd_decode_extend = (
+            extend_num_tokens_per_req is not None
+            and get_disagg().disaggregation_mode == "decode"
+            and not mr.is_draft_worker
+        )
+        if (
+            mr.spec_algorithm.is_speculative()
+            and not _is_pd_prefill_target
+            and not _is_pd_decode_extend
+        ):
             if mr.is_draft_worker:
                 assert mr.spec_algorithm.supports_target_verify_for_draft(), (
                     "This should not happen"
@@ -505,10 +517,12 @@ class BaseRunner(ABC):
             num_tokens_per_req = mr.decode_num_tokens_per_req()
         if extend_num_tokens_per_req is not None:
             assert capture_forward_mode == ForwardMode.EXTEND and (
-                not mr.spec_algorithm.is_speculative() or _is_pd_prefill_target
+                not mr.spec_algorithm.is_speculative()
+                or _is_pd_prefill_target
+                or _is_pd_decode_extend
             ), (
-                "extend_num_tokens_per_req requires an ordinary or PD-prefill "
-                "target EXTEND dummy"
+                "extend_num_tokens_per_req requires an ordinary or PD-target "
+                "EXTEND dummy"
             )
             num_tokens_per_req = extend_num_tokens_per_req
 
@@ -579,16 +593,25 @@ class BaseRunner(ABC):
                 per_req_extend_len = mr.attn_backend.get_cuda_graph_seq_len_fill_value()
             else:
                 per_req_extend_len = extend_num_tokens_per_req
-                seq_lens.fill_(per_req_extend_len)
-                seq_lens_cpu.fill_(per_req_extend_len)
-            extend_prefix_lens_cpu = [0] * batch_size
+                seq_lens.fill_(extend_prefix_len + per_req_extend_len)
+                seq_lens_cpu.fill_(extend_prefix_len + per_req_extend_len)
+                if extend_prefix_len:
+                    positions.copy_(
+                        torch.arange(
+                            extend_prefix_len,
+                            extend_prefix_len + per_req_extend_len,
+                            dtype=positions.dtype,
+                            device=positions.device,
+                        ).repeat(batch_size)
+                    )
+            extend_prefix_lens_cpu = [extend_prefix_len] * batch_size
             extend_seq_lens_cpu = [per_req_extend_len] * batch_size
             extend_num_tokens = num_tokens
             extend_seq_lens = torch.full(
                 (batch_size,), per_req_extend_len, dtype=torch.int32, device=mr.device
             )
-            extend_prefix_lens = torch.zeros(
-                (batch_size,), dtype=torch.int32, device=mr.device
+            extend_prefix_lens = torch.full(
+                (batch_size,), extend_prefix_len, dtype=torch.int32, device=mr.device
             )
             extend_start_loc = torch.arange(
                 0, num_tokens, num_tokens_per_req, dtype=torch.int32, device=mr.device
@@ -639,11 +662,15 @@ class BaseRunner(ABC):
             global_num_tokens_cpu = None
 
         # Speculative metadata and hidden-state capture mode.
-        spec_info = create_dummy_verify_input(
-            mr.spec_algorithm,
-            buffers.custom_mask,
-            num_tokens_per_req,
-            mr.is_draft_worker,
+        spec_info = (
+            None
+            if _is_pd_decode_extend
+            else create_dummy_verify_input(
+                mr.spec_algorithm,
+                buffers.custom_mask,
+                num_tokens_per_req,
+                mr.is_draft_worker,
+            )
         )
         if spec_info is not None and (
             mr.spec_algorithm.is_eagle() or mr.spec_algorithm.is_standalone()
@@ -713,6 +740,8 @@ class BaseRunner(ABC):
             mr.lora_manager.prepare_lora_batch(forward_batch)
 
         forward_batch = mr.prepare_dummy_forward_batch(forward_batch)
+        if prepare_forward_batch is not None:
+            prepare_forward_batch(forward_batch)
         mr.attn_backend.init_forward_metadata(forward_batch)
         if get_exec().features.enable_encoder_swa_bounded_replay:
             mr.token_to_kv_pool.request_window.initialize_dummy_history()

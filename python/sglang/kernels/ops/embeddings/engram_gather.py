@@ -1,4 +1,5 @@
-"""Triton gather of DeepSeek-V4.1 engram rows: fp8 e4m3 payload, e8m0 block scales.
+"""Triton gather of DeepSeek-V4.1 engram rows: fp8 e4m3 or packed mxfp4 (e2m1)
+payload, e8m0 block scales.
 
 The table pointers arrive as raw addresses so one kernel serves a device table, a
 pinned host table, or (on Grace-Blackwell, through ATS) a plain host mapping. The
@@ -15,6 +16,17 @@ _E8M0_ZERO = 2.0**-127
 
 
 @triton.jit
+def _e2m1_to_f32(nib):
+    """e2m1 nibble (sign, 2 exponent bits, 1 mantissa bit) to its exact fp32 value."""
+    exp = (nib >> 1) & 3
+    man = nib & 1
+    # Normal values are (1 + man / 2) * 2**(exp - 1); exp 0 is the subnormal man / 2.
+    normal = (((exp + 126) << 23) | (man << 22)).to(tl.float32, bitcast=True)
+    mag = tl.where(exp == 0, man.to(tl.float32) * 0.5, normal)
+    return tl.where((nib & 8) != 0, -mag, mag)
+
+
+@triton.jit
 def _engram_gather_kernel(
     w_ptr,
     s_ptr,
@@ -24,6 +36,7 @@ def _engram_gather_kernel(
     row_hi,
     DIM: tl.constexpr,
     BLK: tl.constexpr,
+    FP4: tl.constexpr,
     E8M0_ZERO: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
@@ -32,10 +45,17 @@ def _engram_gather_kernel(
     # comes out as zeros, which is what the sharded all-reduce sums.
     owned = (idx >= row_lo) & (idx < row_hi)
     local = tl.where(owned, idx - row_lo, 0)
-    w = w_ptr.to(tl.int64).to(tl.pointer_type(tl.float8e4nv))
     s = s_ptr.to(tl.int64).to(tl.pointer_type(tl.uint8))
     offs = tl.arange(0, DIM)
-    vals = tl.load(w + local * DIM + offs, mask=owned, other=0.0).to(tl.float32)
+    if FP4:
+        # Two e2m1 values per byte, element 2i in the low nibble (ModelOpt export).
+        w = w_ptr.to(tl.int64).to(tl.pointer_type(tl.uint8))
+        packed = tl.load(w + local * (DIM // 2) + offs // 2, mask=owned, other=0)
+        nib = (packed.to(tl.int32) >> ((offs & 1) * 4)) & 15
+        vals = _e2m1_to_f32(nib)
+    else:
+        w = w_ptr.to(tl.int64).to(tl.pointer_type(tl.float8e4nv))
+        vals = tl.load(w + local * DIM + offs, mask=owned, other=0.0).to(tl.float32)
     exps = tl.load(s + local * (DIM // BLK) + offs // BLK, mask=owned, other=0).to(
         tl.int32
     )
@@ -55,12 +75,16 @@ def engram_gather(
     block_size: int,
     row_lo: int = 0,
     row_hi: int = 2**62,
+    *,
+    fp4: bool = False,
 ) -> torch.Tensor:
     """Gather rows ``ids`` ([N] int) into ``out`` ([N, dim] bf16, contiguous).
 
-    ``weight_ptr`` addresses [rows, dim] fp8 e4m3 bytes and ``scale_ptr``
-    [rows, dim // block_size] e8m0 bytes for global rows [row_lo, row_hi); both
-    may live in device or host memory. Ids outside the range produce zero rows.
+    ``weight_ptr`` addresses [rows, dim] fp8 e4m3 bytes, or with ``fp4``
+    [rows, dim // 2] bytes of e2m1 pairs (low nibble first); ``scale_ptr``
+    addresses [rows, dim // block_size] e8m0 bytes. Both cover global rows
+    [row_lo, row_hi) and may live in device or host memory. Ids outside the
+    range produce zero rows.
     """
     assert dim > 0 and dim & (dim - 1) == 0 and block_size > 0, (dim, block_size)
     assert dim % block_size == 0, (dim, block_size)
@@ -80,6 +104,7 @@ def engram_gather(
             row_hi,
             DIM=dim,
             BLK=block_size,
+            FP4=fp4,
             E8M0_ZERO=_E8M0_ZERO,
         )
     return out

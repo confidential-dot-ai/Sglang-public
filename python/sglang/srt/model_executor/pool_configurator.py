@@ -14,7 +14,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import torch
-
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import (
@@ -223,6 +222,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
     def __init__(self, kvc: KVCacheConfigurator):
         self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
+        # Reserved off the top of the KV budget below (see the DFLASH/DSPARK
+        # block) before dividing by cell_size. 0 unless that block sets it.
+        self._reserved_bytes = 0
         dcp_size = get_parallel().attn_dcp_size
         # Determine effective number of layers for KV cache
         if mambaish := mambaish_config(kvc.model_config):
@@ -325,6 +327,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 and int(draft_num_layers) > 0
                 and int(num_layers) > 0
             ):
+                # Exact draft-pool bytes/token, resolved from the draft's own
+                # attention geometry and actual KV dtype (kv heads / head_dim
+                # can differ from the target's -- MiniMax-M3 has 4 kv heads,
+                # its DSpark draft 8 -- and configure_kv_cache_dtype's draft
+                # override forces the dtype back to compute for fa4 drafts
+                # and FP4 targets). See _dflash_draft_cell_size's docstring;
+                # it falls back to None (pure layer-count scaling) if
+                # anything is unresolvable.
                 self._cell_size = scale_kv_cell_size_per_token_for_dflash(
                     target_cell_size_per_token=self._cell_size,
                     target_num_layers=int(num_layers),
@@ -332,6 +342,38 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     * get_parallel().attn_dcp_size,
                     draft_cell_size_per_token=_dflash_draft_cell_size(kvc) or None,
                 )
+
+                # Track H0 finding: logits_processor.py's
+                # _get_hidden_states_to_store does
+                # `torch.cat(aux_hidden_states, dim=-1)` once per prefill/
+                # extend forward under CaptureHiddenMode.FULL -- every
+                # DFlash-family (DSpark included) target forward that needs
+                # to feed the draft model. Its size is `chunked_prefill_size
+                # x hidden_size x draft_num_layers x dtype_size`
+                # (build_target_layer_ids returns exactly draft_num_layers
+                # target layer indices to capture) -- confirmed by an EXACT
+                # match to a live OOM this session: measured crash wanted
+                # precisely 2.25 GiB = 32768 x 6144 x 6 x 2 bytes (M3's
+                # chunked_prefill_size x hidden_size x DSpark's 6 draft
+                # layers x bf16), at a moment the auto-sized KV pool (4.03M
+                # tokens instead of the previously-capped 900k) had left
+                # only ~7 GB of headroom to begin with, and other
+                # concurrent-load growth had eaten most of that by the time
+                # this transient fired. This is a fixed, one-time-per-forward
+                # peak, not something that scales with concurrency itself --
+                # reserving it off the top of the KV budget (rather than
+                # leaving it to compete with whatever headroom happens to be
+                # left) lets the auto-sizer account for it honestly instead
+                # of the pool silently eating into the same margin this
+                # transient needs.
+                chunk_size = get_schedule().chunked_prefill_size
+                if chunk_size is not None and chunk_size > 0:
+                    self._reserved_bytes = (
+                        int(chunk_size)
+                        * int(kvc.model_config.hidden_size)
+                        * int(draft_num_layers)
+                        * torch._utils._element_size(kvc.model_dtype)
+                    )
 
     def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
         """Compute per-token KV cache cost in bytes."""
@@ -344,7 +386,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         effective_num_layers = (
             num_layers
-            if kvc.server_args.enable_hisparse
+            if get_memory().enable_hisparse
             else get_glm_dsa_layer_split_effective_num_layers(kvc, num_layers)
         )
 
@@ -570,7 +612,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         if (
             allocate_all_layers
-            or kvc.server_args.enable_hisparse
+            or get_memory().enable_hisparse
             or not _should_elide_dsa_index_k(is_draft_worker=kvc.is_draft_worker)
         ):
             num_indexer_layers = num_layers
@@ -616,11 +658,19 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
-        available_bytes = max(available_bytes - self._fixed_overhead_bytes, 0)
+        # Track H0: reserve the DFlash-family aux_hidden_states capture peak
+        # (self._reserved_bytes, 0 unless applicable) before dividing, so the
+        # auto-sizer doesn't hand out every free byte to the KV pool and
+        # leave nothing for a transient that's real but off this budget's
+        # books otherwise. Only applies to the auto-sizing path -- an
+        # explicit --max-total-tokens (calculate_pool_sizes_from_max_tokens
+        # below) means the operator already chose a number and validated it;
+        # this reservation must not second-guess that.
+        budget = max(
+            available_bytes - self._fixed_overhead_bytes - self._reserved_bytes, 0
+        )
         max_total_num_tokens = (
-            available_bytes // self._cell_size
-            if self._cell_size
-            else self._zero_kv_max_tokens
+            budget // self._cell_size if self._cell_size else self._zero_kv_max_tokens
         )
         max_total_num_tokens = max_total_num_tokens // page_size * page_size
         return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)

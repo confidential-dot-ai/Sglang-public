@@ -30,8 +30,31 @@ from sglang.srt.mem_cache.pool_host.mha import (
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+class TestHostRegistrationOwnership(CustomTestCase):
+    def test_torch_owned_cc_fallback_is_never_registered_or_unregistered(self):
+        from sglang.srt.mem_cache.pool_host.common import HostTensorAllocator, alloc_with_host_register
+
+        cudart = _FakeCudart()
+        buffer = torch.empty(16, dtype=torch.uint8)
+        allocator = HostTensorAllocator()
+        with (
+            mock.patch("torch.cuda.cudart", return_value=cudart),
+            mock.patch("torch.empty", return_value=buffer),
+            mock.patch(
+                "sglang.srt.mem_cache.pool_host.common.is_host_pinning_effective",
+                return_value=False,
+            ),
+        ):
+            result = alloc_with_host_register((16,), torch.uint8, "cpu", True, allocator)
+            _cuda_host_unregister(result)
+        self.assertIs(result, buffer)
+        self.assertEqual(cudart.registrations, [])
+        self.assertEqual(cudart.unregistrations, [])
 
 
 class _FakeBuffer:
@@ -70,6 +93,16 @@ class _FakeCudart:
 
 
 class TestHiCacheHostRegister(unittest.TestCase):
+    def setUp(self):
+        # These cover the registering path. Without a visible GPU the pinning
+        # probe reports False, which selects the confidential-compute fallback
+        # (TestHostRegistrationOwnership covers that one).
+        patcher = mock.patch.object(
+            host_common, "is_host_pinning_effective", return_value=True
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def _hip_non_userptr(self):
         return (
             mock.patch.object(host_common, "_is_hip", True),

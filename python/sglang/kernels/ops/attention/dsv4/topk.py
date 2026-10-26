@@ -93,10 +93,10 @@ def topk_transform_bf16_small(
     Row ``b`` selects the ``k = out_page_indices.shape[1]`` best of its first
     ``seq_lens[b]`` scores (``k`` at most 2048); a selected index ``i`` is
     written as ``page_table[b, i // page_size] * page_size + i % page_size``,
-    in no particular order, and ``-1`` fills the slots past
+    in ascending ``i`` order, and ``-1`` fills the slots past
     ``min(k, seq_lens[b])``. Selection is exact (two radix passes over the raw
-    bf16 bytes locate the k-th largest value); which of the elements equal to
-    it fill the last slots is arbitrary. NaN scores are not supported.
+    bf16 bytes locate the k-th largest value), and the elements equal to it at
+    the lowest indices fill the last slots. NaN scores are not supported.
     """
     _jit_topk_bf16_small_module().topk_transform(
         scores, seq_lens, page_table, out_page_indices, page_size
@@ -148,6 +148,28 @@ def topk_transform_paged_torch(
     out_page_indices.copy_(torch.where(reach, slots, -1).to(torch.int32))
     if out_raw_indices is not None:
         out_raw_indices.copy_(torch.where(reach, idx, -1).to(torch.int32))
+
+
+def sort_selection_(indices: torch.Tensor) -> None:
+    """Sort each row of a top-k selection ascending in place, ``-1`` padding last.
+
+    The radix top-k kernels claim output slots with shared-memory atomics, so a
+    row past ``topk`` candidates comes out in a different order every run, and
+    the sparse attention's rounding follows that order. Rows at or under
+    ``topk`` are already ascending."""
+    pad = torch.iinfo(indices.dtype).max
+    keys = indices.masked_fill(indices < 0, pad).sort(dim=-1).values
+    indices.copy_(keys.masked_fill(keys == pad, -1))
+
+
+def selection_page_indices(
+    raw_indices: torch.Tensor, page_tables: torch.Tensor, page_size: int
+) -> torch.Tensor:
+    """Pool slots of the positions ``raw_indices`` through ``page_tables``, as the
+    paged top-k kernels compute them; ``-1`` stays ``-1``."""
+    idx = raw_indices.clamp_min(0).to(torch.int64)
+    slots = page_tables.gather(-1, idx // page_size) * page_size + idx % page_size
+    return torch.where(raw_indices >= 0, slots, -1).to(torch.int32)
 
 
 # metadata is (batch+1, 2) int32: row 0 = {cluster_threshold, num_cluster_items};
@@ -410,7 +432,7 @@ def topk_transform_sparse(
     out_indices: torch.Tensor,
 ) -> None:
     """Top-``k`` (``k = out_indices.shape[1]``) of each row of the bf16 sparse
-    ``logits`` within its first ``valid_lens[b]`` columns, ``-1`` padded, unordered;
+    ``logits`` within its first ``valid_lens[b]`` columns, in column order, ``-1`` padded;
     column ``j`` is written as ``blocks[b, j // 8] * 8 + j % 8``: pool slots for the
     published blocks as pool slots / 8, compressed positions for logical ids."""
     topk_transform_bf16_small(

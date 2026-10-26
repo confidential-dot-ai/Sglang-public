@@ -2227,6 +2227,82 @@ mod upstream_cancel_tests {
         ctx.shutdown().await;
     }
 
+    /// A decode that rejects a request outright (e.g. logprobs its speculative
+    /// decoder can't serve) must reach the client at once, not after prefill's
+    /// bootstrap wait for that decode times out.
+    #[tokio::test]
+    async fn test_pd_decode_rejection_does_not_wait_for_prefill() {
+        let prefill_port = 20315;
+        let decode_port = 20316;
+        set_fail_status_code(decode_port, 400);
+
+        let config = RouterConfig::builder()
+            .prefill_decode_mode(
+                vec![(format!("http://127.0.0.1:{}", prefill_port), None)],
+                vec![format!("http://127.0.0.1:{}", decode_port)],
+            )
+            .round_robin_policy()
+            .host("127.0.0.1")
+            .port(4315)
+            .max_payload_size(256 * 1024 * 1024)
+            .request_timeout_secs(600)
+            .worker_startup_timeout_secs(5)
+            .worker_startup_check_interval_secs(1)
+            .max_concurrent_requests(64)
+            .queue_timeout_secs(60)
+            .build_unchecked();
+        let ctx = AppTestContext::new_with_config(
+            config,
+            vec![
+                {
+                    let mut w = TestWorkerConfig::prefill(prefill_port);
+                    w.response_delay_ms = 30_000;
+                    w
+                },
+                {
+                    let mut w = TestWorkerConfig::decode(decode_port);
+                    w.fail_rate = 1.0;
+                    w
+                },
+            ],
+        )
+        .await;
+        let app = ctx.create_app().await;
+        let prefill = pin_worker(&ctx, &format!("http://127.0.0.1:{}", prefill_port));
+        let (_, prefill_failures_before) = breaker_counts(&prefill);
+
+        for (stream, logprob) in [(false, true), (true, true), (true, false)] {
+            let payload = json!({ "text": "x", "stream": stream, "return_logprob": logprob });
+            let req = Request::builder()
+                .method("POST")
+                .uri("/generate")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_string(&payload).unwrap()))
+                .unwrap();
+            let resp = tokio::time::timeout(Duration::from_secs(5), app.clone().oneshot(req))
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("stream={stream} logprob={logprob}: waited for the hung prefill")
+                })
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "stream={stream} logprob={logprob}"
+            );
+            let _ = resp.into_body().collect().await;
+        }
+
+        let (_, prefill_failures_after) = breaker_counts(&prefill);
+        assert_eq!(
+            prefill_failures_after, prefill_failures_before,
+            "the cancelled prefill is not at fault"
+        );
+
+        clear_fail_status_code(decode_port);
+        ctx.shutdown().await;
+    }
+
     /// /v1/responses simple streaming 5xx must record `record_failure`,
     /// not success. Guards the `record_failure()` in the non-success status
     /// arm of `handle_simple_streaming_passthrough` and confirms the eager

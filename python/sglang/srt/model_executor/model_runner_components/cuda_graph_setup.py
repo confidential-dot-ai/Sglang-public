@@ -336,6 +336,49 @@ def refresh_deep_gemm_layout_memory_budget(
     )
 
 
+def plan_dsv41_index_logits_budget(model_runner: ModelRunner) -> None:
+    """Size the DeepSeek-V4.1 eager indexer's logits tiles from what capture left
+    free; refuse to start when they cannot fit."""
+    if (
+        model_runner.device != "cuda"
+        or get_disagg().disaggregation_mode == "decode"
+        or model_runner.model_config.hf_config.model_type != "deepseek_v41"
+    ):
+        return
+    from sglang.srt.layers.attention.dsv4.v41_indexer import (
+        has_dense_fp4_indexer,
+        is_sm100_or_newer,
+    )
+    from sglang.srt.layers.attention.dsv4.v41_indexer.memory_budget import (
+        plan_index_logits_budget,
+        set_planned_index_logits_budget,
+    )
+
+    if not (is_sm100_or_newer() and has_dense_fp4_indexer()):
+        return
+    schedule = get_schedule()
+    rows = max(schedule.chunked_prefill_size or 0, schedule.max_prefill_tokens or 0)
+    free_gib = get_available_gpu_memory(
+        model_runner.device,
+        model_runner.gpu_id,
+        distributed=get_parallel().launch_world_size > 1,
+        cpu_group=get_parallel().world_group.cpu_group,
+    )
+    budget_bytes = plan_index_logits_budget(
+        free_bytes=int(free_gib * (1 << 30)),
+        rows=rows,
+        context_len=model_runner.model_config.context_len,
+        reserve_bytes=int(envs.SGLANG_DSV41_PREFILL_EAGER_RESERVE_GB.get() * (1 << 30)),
+    )
+    set_planned_index_logits_budget(budget_bytes)
+    log_info_on_rank0(
+        logger,
+        f"DeepSeek-V4.1 index logits tiles: {budget_bytes / (1 << 30):.3f} GiB "
+        f"from {free_gib:.2f} GiB free (context_len="
+        f"{model_runner.model_config.context_len}, {rows} rows).",
+    )
+
+
 def recapture_elastic_cuda_graph(
     *,
     model_runner: ModelRunner,
@@ -411,6 +454,14 @@ def capture_cuda_graphs(
     if capture_decode_cuda_graph:
         if current_platform.capabilities.graph_capture:
             decode = capture_decode_graph(model_runner=model_runner)
+            if not model_runner.is_draft_worker:
+                from sglang.srt.model_executor.runner.ced_tail_graph import (
+                    precapture_ced_late_graphs,
+                )
+
+                precapture_ced_late_graphs(
+                    model_runner=model_runner, eager_runner=eager_runner
+                )
     else:
         decode = GraphCapture(
             runner=eager_runner,
@@ -440,6 +491,8 @@ def finalize_cuda_graph_capture(model_runner: ModelRunner) -> None:
         device=model_runner.device,
         forward_stream=model_runner.forward_stream,
     )
+
+    plan_dsv41_index_logits_budget(model_runner)
 
     if model_runner.canary_manager is not None and not model_runner.is_draft_worker:
         model_runner.canary_manager.mark_init_finished()
